@@ -1,0 +1,87 @@
+seed: 42
+runtime:
+  device: cuda
+
+output:
+  root_dir: outputs
+  run_name: chahua_eef_vision
+
+data:
+  root_dir: /mnt/workspace/zyj/data/processed/chahua/chahua_0630_1722
+  # window
+  window_size: 8
+  stride: 1
+  n_image_steps: 1
+  action_horizon: 32
+  # robot
+  action_type: eef
+  action_representation: relative
+  # load
+  use_tactile: true
+  image_size: 224
+  image_as_uint8: true
+  use_camera_latent: true
+  latent_cache_root_dir: ${data.root_dir}
+  camera_key: camera
+  tactile_key: tactile
+  state_key: state_30hz
+  action_key: action_30hz
+  norm:
+    output_range: [-1, 1]
+    max_windows: 50000
+
+models:
+  fm:
+    cond_dim: 256
+    # vision — DINOv2 (timm)
+    image_encoder_name: dinov2_small
+    dino_model_name: vit_small_patch14_dinov2.lvd142m
+    freeze_image_encoder: true
+    image_pretrained: true
+    image_feat_dim: 256
+    n_image_views: 3
+    # tactile CNN
+    use_tactile: false
+    tactile_feat_dim: 256
+    tactile_temporal_pool: conv1d   # mean | conv1d
+    state_feat_dim: 256
+    state_pool: flatten           
+    action_horizon: 32            
+    n_action_steps: 32          
+    diffusion_step_embed_dim: 256
+    down_dims: [256, 512, 1024]
+    kernel_size: 5
+    n_groups: 8
+    num_inference_steps: 16
+    solver: euler    
+
+train:
+  batch_size: 512
+  num_workers: 16
+  drop_last: true
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  epochs: 201
+  grad_clip: 1.0
+  use_amp: false
+  open_loop_test_every: 10
+  open_loop_test_max_batches: 16
+  plot_samples: 64
+  plot_dims: auto  
+  max_train_batches: null   
+  resume_path: null        
+  optimizer:
+    lr: 1.0e-4
+    min_lr: 1.0e-6
+    weight_decay: 1.0e-4
+
+checkpoint:
+  save_every: 100
+
+precompute:
+  batch_size: 512
+  device: cuda
+  max_windows: null
+  overwrite: true
+  output_path: null   # default: {data.latent_cache_root_dir}/policy_latent_cache.zarr
