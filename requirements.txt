@@ -1,0 +1,23 @@
+# Core training (train.py / policy_trainer / eval_open_loop)
+torch>=2.1.0
+numpy>=1.24.0,<2.0.0
+PyYAML>=6.0
+tqdm>=4.66.0
+
+# Zarr replay buffer (datasets/zarr_dataset.py)
+zarr>=3.0.10,<4
+numcodecs>=0.13.0
+
+# FM policy (DINO + diffusion UNet)
+timm>=0.9.12
+einops>=0.7.0
+
+# Logging
+tensorboard>=2.14.0
+
+# Visualization (eval_open_loop / vis_episode / data_check)
+matplotlib>=3.7.0
+opencv-python>=4.8.0
+
+# Optional: pytest for datasets/test, models/fm/tests
+# pytest>=7.4.0

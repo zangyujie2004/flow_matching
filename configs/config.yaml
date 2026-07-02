@@ -4,7 +4,7 @@ runtime:
 
 output:
   root_dir: outputs
-  run_name: chahua_eef_vision
+  run_name: chahua_joint_vision
 
 data:
   root_dir: /mnt/workspace/zyj/data/processed/chahua/chahua_0630_1722
@@ -14,10 +14,10 @@ data:
   n_image_steps: 1
   action_horizon: 32
   # robot
-  action_type: eef
+  action_type: joint
   action_representation: relative
   # load
-  use_tactile: true
+  use_tactile: false
   image_size: 224
   image_as_uint8: true
   use_camera_latent: true
@@ -84,4 +84,4 @@ precompute:
   device: cuda
   max_windows: null
   overwrite: true
-  output_path: null   # default: {data.latent_cache_root_dir}/policy_latent_cache.zarr
+  output_path: null  
