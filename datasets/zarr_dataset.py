@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Any, Dict, List, Mapping, Tuple
+from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -21,6 +21,52 @@ from tools.tactile_feat import TACTILE_FEATURE_DIM, extract_tactile_deformation
 _ACTION_TYPES = ("joint", "eef")
 _ROBOT_SLICES = {"joint": slice(0, 14), "eef": slice(14, 34)}
 _ROBOT_DIMS = {"joint": 14, "eef": 20}
+CAMERA_BUNDLE_ORDER = ("base_0", "left_wrist_0", "right_wrist_0")
+
+
+def resolve_camera_views(
+    camera_views: Sequence[str] | None,
+    *,
+    n_zarr_views: int,
+) -> tuple[str, ...]:
+    if n_zarr_views <= 0 or n_zarr_views * 3 > 256:
+        raise ValueError(f"invalid zarr camera view count: {n_zarr_views}")
+    available = CAMERA_BUNDLE_ORDER[:n_zarr_views]
+    if camera_views is None:
+        return available
+    selected = tuple(str(name) for name in camera_views)
+    if not selected:
+        raise ValueError("camera_views must be non-empty when provided")
+    unknown = [name for name in selected if name not in CAMERA_BUNDLE_ORDER]
+    if unknown:
+        raise ValueError(
+            f"unknown camera_views={unknown}; expected subset of {CAMERA_BUNDLE_ORDER}"
+        )
+    missing = [name for name in selected if name not in available]
+    if missing:
+        raise ValueError(
+            f"camera_views={list(selected)} not available in zarr "
+            f"(available={list(available)})"
+        )
+    if len(set(selected)) != len(selected):
+        raise ValueError(f"camera_views must be unique, got {list(selected)}")
+    return selected
+
+
+def camera_view_indices(views: Sequence[str]) -> tuple[int, ...]:
+    return tuple(CAMERA_BUNDLE_ORDER.index(str(name)) for name in views)
+
+
+def camera_channel_indices(views: Sequence[str]) -> tuple[int, ...]:
+    channels: list[int] = []
+    for view_idx in camera_view_indices(views):
+        start = view_idx * 3
+        channels.extend(range(start, start + 3))
+    return tuple(channels)
+
+
+def parse_cache_camera_views(cache_views: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in str(cache_views).split(",") if part.strip())
 
 class ZarrDataset(Dataset):
     def __init__(
@@ -42,6 +88,7 @@ class ZarrDataset(Dataset):
         tactile_key: str = "tactile",
         state_key: str = "state_30hz",
         action_key: str = "action_30hz",
+        camera_views: Sequence[str] | None = None,
         norm_output_range: Tuple[float, float] = (-1.0, 1.0),
         normalizer_max_windows: int | None = None,
     ):
@@ -90,6 +137,15 @@ class ZarrDataset(Dataset):
         self.episode_starts = np.concatenate([np.array([0], dtype=np.int64), self.episode_ends[:-1]])
 
         self._preload_to_ram()
+        n_zarr_views = int(self.ram_data[self.camera_key].shape[-1] // 3)
+        self.camera_views = resolve_camera_views(camera_views, n_zarr_views=n_zarr_views)
+        self._camera_channel_indices = camera_channel_indices(self.camera_views)
+        self._latent_view_indices = camera_view_indices(self.camera_views)
+        self.n_image_views = len(self.camera_views)
+        print(
+            f"[ZarrDataset] camera_views={list(self.camera_views)} "
+            f"(n_image_views={self.n_image_views}, zarr_views={n_zarr_views})"
+        )
 
         self.windows = self._build_windows()
         if len(self.windows) == 0:
@@ -249,7 +305,33 @@ class ZarrDataset(Dataset):
                     f"Latent cache attr mismatch for {key}: cache={actual}, dataset={expected_value}"
                 )
 
+        cache_views = cache_attrs.get("camera_views")
+        if cache_views is not None:
+            cache_view_list = parse_cache_camera_views(str(cache_views))
+            missing = [name for name in self.camera_views if name not in cache_view_list]
+            if missing:
+                raise ValueError(
+                    "Latent cache camera_views missing requested views: "
+                    f"cache={list(cache_view_list)!r}, requested={list(self.camera_views)!r}. "
+                    "Rebuild with ./scripts/precompute.sh"
+                )
+            if cache_view_list != self.camera_views:
+                print(
+                    "[ZarrDataset] latent cache camera_views superset: "
+                    f"cache={list(cache_view_list)!r}, using={list(self.camera_views)!r}"
+                )
+
         self.cached_image_backbone_feat = self.latent_cache_group["image_backbone_feat"]
+        cache_n_views = int(cache_attrs.get("n_image_views", self.cached_image_backbone_feat.shape[-2]))
+        if cache_n_views < self.n_image_views:
+            raise ValueError(
+                f"Latent cache has fewer views ({cache_n_views}) than requested "
+                f"({self.n_image_views}). Rebuild cache."
+            )
+        if cache_n_views != self.n_image_views:
+            print(
+                f"[ZarrDataset] slicing latent cache views {cache_n_views} -> {self.n_image_views}"
+            )
         self.image_backbone_dim = int(cache_attrs.get("image_backbone_dim", self.cached_image_backbone_feat.shape[-1]))
         print(
             f"[ZarrDataset] preloading latent cache into RAM: {cache_path}, "
@@ -257,6 +339,8 @@ class ZarrDataset(Dataset):
             f"backbone_dim={self.image_backbone_dim}"
         )
         feat_arr = np.asarray(self.cached_image_backbone_feat[:], dtype=np.float32)
+        if cache_n_views != self.n_image_views:
+            feat_arr = feat_arr[:, :, self._latent_view_indices, :]
         feat_gb = feat_arr.nbytes / (1024**3)
         self.cached_image_backbone_feat = feat_arr
         self.latent_cache_zarr = None
@@ -371,7 +455,13 @@ class ZarrDataset(Dataset):
         return self._slice_robot(self._read_array(self.action_key, slice(t0, t1), dtype=np.float32))
 
     def get_camera(self, t0: int, t1: int) -> np.ndarray:
-        return self._read_array(self.camera_key, slice(t0, t1))
+        camera = self._read_array(self.camera_key, slice(t0, t1))
+        return self._select_camera_channels(camera)
+
+    def _select_camera_channels(self, camera: np.ndarray) -> np.ndarray:
+        if len(self._camera_channel_indices) == camera.shape[-1]:
+            return camera
+        return np.asarray(camera[..., self._camera_channel_indices])
 
     def get_camera_latent(self, idx: int) -> np.ndarray:
         if self.cached_image_backbone_feat is None:
@@ -382,6 +472,10 @@ class ZarrDataset(Dataset):
         if feat.shape[0] != self.n_image_steps:
             raise ValueError(
                 f"camera latent time mismatch: {feat.shape[0]} != {self.n_image_steps}"
+            )
+        if feat.shape[1] != self.n_image_views:
+            raise ValueError(
+                f"camera latent view mismatch: {feat.shape[1]} != {self.n_image_views}"
             )
         return feat
 
@@ -495,7 +589,13 @@ class ZarrDataset(Dataset):
                 raise ValueError(
                     f"image length mismatch: {camera.shape[0]} != {self.n_image_steps}"
                 )
-            obs["image"] = self._process_image(camera)
+            image = self._process_image(camera)
+            if image.shape[0] != self.n_image_steps or image.shape[1] != self.n_image_views:
+                raise ValueError(
+                    f"image shape {tuple(image.shape)} != "
+                    f"(n_image_steps={self.n_image_steps}, n_image_views={self.n_image_views}, 3, H, W)"
+                )
+            obs["image"] = image
 
         if self.use_tactile:
             tactile = self.normalizer.normalize_tactile_np(self.get_tactile(s0, s1))

@@ -52,6 +52,14 @@ def build_policy(cfg: dict, device: torch.device, dataset: ZarrDataset) -> FlowM
     use_tactile = bool(data_cfg.get("use_tactile", True))
     fm_cfg["use_tactile"] = use_tactile
 
+    model_n_views = int(fm_cfg.get("n_image_views", dataset.n_image_views))
+    if model_n_views != dataset.n_image_views:
+        raise ValueError(
+            f"models.fm.n_image_views={model_n_views} does not match "
+            f"data.camera_views (n_image_views={dataset.n_image_views})"
+        )
+    fm_cfg["n_image_views"] = model_n_views
+
     if dataset.use_camera_latent and not bool(fm_cfg.get("freeze_image_encoder", True)):
         raise ValueError("use_camera_latent=True requires models.fm.freeze_image_encoder=true.")
 

@@ -100,6 +100,7 @@ def precompute_image_latents(cfg: dict) -> str:
     out_root.attrs["stride"] = int(dataset.stride)
     out_root.attrs["image_selection"] = "anchor"
     out_root.attrs["dino_model_name"] = str(fm_cfg.get("dino_model_name", ""))
+    out_root.attrs["camera_views"] = ",".join(dataset.camera_views)
 
     data_group = out_root.create_group("data")
     meta_group = out_root.create_group("meta")

@@ -4,10 +4,10 @@ runtime:
 
 output:
   root_dir: outputs
-  run_name: chahua_joint_vision
+  run_name: chahua_joint_vision_view_2
 
 data:
-  root_dir: /mnt/workspace/zyj/data/processed/chahua/chahua_0630_1722
+  root_dir: /mnt/workspace/zyj/data/processed/zhibei/zhibei_0702_1443
   # window
   window_size: 8
   stride: 1
@@ -16,12 +16,15 @@ data:
   # robot
   action_type: joint
   action_representation: relative
-  # load
+  # tatile
   use_tactile: false
+  # camera
+  camera_views: ['left_wrist_0', 'right_wrist_0'] #['base_0', 'left_wrist_0', 'right_wrist_0']
   image_size: 224
   image_as_uint8: true
   use_camera_latent: true
   latent_cache_root_dir: ${data.root_dir}
+  # keys
   camera_key: camera
   tactile_key: tactile
   state_key: state_30hz
@@ -34,12 +37,12 @@ models:
   fm:
     cond_dim: 256
     # vision — DINOv2 (timm)
+    n_image_views: 2
     image_encoder_name: dinov2_small
     dino_model_name: vit_small_patch14_dinov2.lvd142m
     freeze_image_encoder: true
     image_pretrained: true
     image_feat_dim: 256
-    n_image_views: 3
     # tactile CNN
     use_tactile: false
     tactile_feat_dim: 256
@@ -85,3 +88,7 @@ precompute:
   max_windows: null
   overwrite: true
   output_path: null  
+
+deploy:
+  action_process: abs_qpos
+  action_hz: 30.0

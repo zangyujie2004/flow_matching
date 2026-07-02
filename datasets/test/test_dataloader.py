@@ -36,7 +36,7 @@ def _check_sample(sample: dict, ds: ZarrDataset) -> None:
     assert action.dtype == torch.float32
 
     img = obs["image"]
-    n_views = 3
+    n_views = ds.n_image_views
     assert img.shape == (ds.n_image_steps, n_views, 3, ds.image_size, ds.image_size)
     assert img.dtype == torch.uint8 if ds.image_as_uint8 else torch.float32
 
@@ -57,7 +57,7 @@ def _check_batch(batch: dict, ds: ZarrDataset, batch_size: int) -> None:
     assert obs["state"].shape == (batch_size, ds.window_size, ds.action_dim)
     assert action.shape == (batch_size, ds.action_horizon, ds.action_dim)
 
-    n_views = 3
+    n_views = ds.n_image_views
     assert obs["image"].shape == (
         batch_size,
         ds.n_image_steps,
