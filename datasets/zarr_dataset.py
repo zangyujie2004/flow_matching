@@ -57,6 +57,20 @@ def camera_view_indices(views: Sequence[str]) -> tuple[int, ...]:
     return tuple(CAMERA_BUNDLE_ORDER.index(str(name)) for name in views)
 
 
+def cache_view_indices(
+    requested_views: Sequence[str],
+    cache_views: Sequence[str],
+) -> tuple[int, ...]:
+    cache_view_list = tuple(str(name) for name in cache_views)
+    missing = [name for name in requested_views if str(name) not in cache_view_list]
+    if missing:
+        raise ValueError(
+            "Latent cache camera_views missing requested views: "
+            f"cache={list(cache_view_list)!r}, requested={list(requested_views)!r}"
+        )
+    return tuple(cache_view_list.index(str(name)) for name in requested_views)
+
+
 def camera_channel_indices(views: Sequence[str]) -> tuple[int, ...]:
     channels: list[int] = []
     for view_idx in camera_view_indices(views):
@@ -137,10 +151,9 @@ class ZarrDataset(Dataset):
         self.episode_starts = np.concatenate([np.array([0], dtype=np.int64), self.episode_ends[:-1]])
 
         self._preload_to_ram()
-        n_zarr_views = int(self.ram_data[self.camera_key].shape[-1] // 3)
+        n_zarr_views = self._zarr_camera_view_count()
         self.camera_views = resolve_camera_views(camera_views, n_zarr_views=n_zarr_views)
         self._camera_channel_indices = camera_channel_indices(self.camera_views)
-        self._latent_view_indices = camera_view_indices(self.camera_views)
         self.n_image_views = len(self.camera_views)
         print(
             f"[ZarrDataset] camera_views={list(self.camera_views)} "
@@ -232,13 +245,18 @@ class ZarrDataset(Dataset):
             keys.append(self.tactile_key)
         return keys
 
+    def _zarr_camera_view_count(self) -> int:
+        if self.camera_key not in self.data_group:
+            raise KeyError(f"Missing key in zarr data group: {self.camera_key}")
+        return int(self.data_group[self.camera_key].shape[-1] // 3)
+
     def _validate_required_keys(self) -> None:
         for key in self._data_keys_to_load():
             if key not in self.data_group:
                 raise KeyError(f"Missing key in zarr data group: {key}")
         if "episode_ends" not in self.meta_group:
             raise KeyError("Missing key in zarr meta group: episode_ends")
-        if not self.use_camera_latent and self.camera_key not in self.data_group:
+        if self.camera_key not in self.data_group:
             raise KeyError(f"Missing key in zarr data group: {self.camera_key}")
 
     def _resolve_latent_cache_path(self, *, require_exists: bool = True) -> str | None:
@@ -308,18 +326,14 @@ class ZarrDataset(Dataset):
         cache_views = cache_attrs.get("camera_views")
         if cache_views is not None:
             cache_view_list = parse_cache_camera_views(str(cache_views))
-            missing = [name for name in self.camera_views if name not in cache_view_list]
-            if missing:
-                raise ValueError(
-                    "Latent cache camera_views missing requested views: "
-                    f"cache={list(cache_view_list)!r}, requested={list(self.camera_views)!r}. "
-                    "Rebuild with ./scripts/precompute.sh"
-                )
+            latent_view_indices = cache_view_indices(self.camera_views, cache_view_list)
             if cache_view_list != self.camera_views:
                 print(
                     "[ZarrDataset] latent cache camera_views superset: "
                     f"cache={list(cache_view_list)!r}, using={list(self.camera_views)!r}"
                 )
+        else:
+            latent_view_indices = camera_view_indices(self.camera_views)
 
         self.cached_image_backbone_feat = self.latent_cache_group["image_backbone_feat"]
         cache_n_views = int(cache_attrs.get("n_image_views", self.cached_image_backbone_feat.shape[-2]))
@@ -340,7 +354,7 @@ class ZarrDataset(Dataset):
         )
         feat_arr = np.asarray(self.cached_image_backbone_feat[:], dtype=np.float32)
         if cache_n_views != self.n_image_views:
-            feat_arr = feat_arr[:, :, self._latent_view_indices, :]
+            feat_arr = feat_arr[:, :, latent_view_indices, :]
         feat_gb = feat_arr.nbytes / (1024**3)
         self.cached_image_backbone_feat = feat_arr
         self.latent_cache_zarr = None

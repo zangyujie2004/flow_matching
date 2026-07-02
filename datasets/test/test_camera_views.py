@@ -5,6 +5,7 @@ import pytest
 
 from datasets.zarr_dataset import (
     CAMERA_BUNDLE_ORDER,
+    cache_view_indices,
     camera_channel_indices,
     camera_view_indices,
     parse_cache_camera_views,
@@ -43,6 +44,22 @@ def test_resolve_camera_views_rejects_missing_bundle_in_zarr():
 
 def test_parse_cache_camera_views():
     assert parse_cache_camera_views("base_0,left_wrist_0,right_wrist_0") == CAMERA_BUNDLE_ORDER
+
+
+def test_cache_view_indices_from_full_cache():
+    cache_views = CAMERA_BUNDLE_ORDER
+    assert cache_view_indices(["left_wrist_0", "right_wrist_0"], cache_views) == (1, 2)
+    assert cache_view_indices(CAMERA_BUNDLE_ORDER, cache_views) == (0, 1, 2)
+
+
+def test_cache_view_indices_from_wrist_only_cache():
+    cache_views = ("left_wrist_0", "right_wrist_0")
+    assert cache_view_indices(cache_views, cache_views) == (0, 1)
+
+
+def test_cache_view_indices_rejects_missing_view():
+    with pytest.raises(ValueError, match="missing requested views"):
+        cache_view_indices(["base_0"], ("left_wrist_0", "right_wrist_0"))
 
 
 def test_slice_wrist_channels_from_zarr_camera():

@@ -26,6 +26,8 @@ def build_dataset(cfg: dict) -> ZarrDataset:
     data_cfg["use_camera_latent"] = False
     data_cfg["latent_cache_root_dir"] = None
     data_cfg["fit_normalizer"] = False
+    # Precompute is decoupled from training camera_views: always encode all zarr views.
+    data_cfg.pop("camera_views", None)
     return ZarrDataset.from_config(data_cfg)
 
 
