@@ -267,6 +267,48 @@ def evaluate_open_loop(
     solver: str | None = None,
 ) -> Dict[str, float]:
     policy.eval()
+    was_training = bool(getattr(dataset, "training", True))
+    dataset.set_training(False)
+    try:
+        return _evaluate_open_loop_impl(
+            policy,
+            dataset,
+            normalizer,
+            device,
+            epoch=epoch,
+            seed=seed,
+            max_batches=max_batches,
+            batch_size=batch_size,
+            plot_samples=plot_samples,
+            plot_dims=plot_dims,
+            out_dir=out_dir,
+            writer=writer,
+            num_inference_steps=num_inference_steps,
+            solver=solver,
+        )
+    finally:
+        dataset.set_training(was_training)
+
+
+@torch.no_grad()
+def _evaluate_open_loop_impl(
+    policy: torch.nn.Module,
+    dataset: ZarrDataset,
+    normalizer: DatasetNormalizer,
+    device: torch.device,
+    *,
+    epoch: int,
+    seed: int,
+    max_batches: int,
+    batch_size: int,
+    plot_samples: int,
+    plot_dims: str,
+    out_dir: Path | None,
+    writer=None,
+    num_inference_steps: int | None = None,
+    solver: str | None = None,
+) -> Dict[str, float]:
+    policy.eval()
     rng = np.random.default_rng(int(seed) + int(epoch))
     eval_batch_size = max(1, int(batch_size))
     total_windows = max(1, int(max_batches)) * eval_batch_size

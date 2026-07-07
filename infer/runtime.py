@@ -59,6 +59,10 @@ class FMInferenceRuntime:
         self.policy.load_state_dict(ckpt_state["policy_state_dict"])
         self.policy.eval()
         self.use_tactile = bool(self.policy.use_tactile)
+        if self.use_tactile and self.normalizer.tactile is None:
+            raise RuntimeError(
+                "checkpoint use_tactile=true but normalizer_state_dict has no tactile stats"
+            )
 
         data_cfg = self.policy_cfg["data"]
         fm_cfg = self.policy_cfg["models"]["fm"]
@@ -183,6 +187,11 @@ class FMInferenceRuntime:
                 "preprocess camera_views count does not match model n_image_views: "
                 f"{len(preprocess_cfg.camera_views)} != {self.n_image_views}. "
                 "Check run_dir resolved_config (data.camera_views / models.fm.n_image_views)."
+            )
+        if bool(self.use_tactile) != bool(preprocess_cfg.use_tactile):
+            raise ValueError(
+                "runtime.use_tactile does not match resolved_config data.use_tactile: "
+                f"{self.use_tactile} != {preprocess_cfg.use_tactile}"
             )
         obs, state_raw = build_obs_from_frames(
             frames,

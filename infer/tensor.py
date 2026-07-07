@@ -83,14 +83,10 @@ def numpy_obs_to_torch(
         "state": state_to_batched_float(obs["state"]),
     }
     if use_tactile:
-        if "tactile" in obs:
-            tactile = as_float32_array(obs["tactile"], name="obs.tactile")
-            if tactile.ndim == 4:
-                tactile = tactile[None]
-            obs_torch["tactile"] = torch.from_numpy(tactile)
-        else:
-            if normalizer is None:
-                raise ValueError("use_tactile model requires normalizer to synthesize zero tactile")
-            tactile = default_tactile_norm(normalizer, window_size)
-            obs_torch["tactile"] = torch.from_numpy(tactile[None])
+        if "tactile" not in obs:
+            raise KeyError("use_tactile model requires obs['tactile']")
+        tactile = as_float32_array(obs["tactile"], name="obs.tactile")
+        if tactile.ndim == 4:
+            tactile = tactile[None]
+        obs_torch["tactile"] = torch.from_numpy(tactile)
     return move_to_device(obs_torch, device)

@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from infer.tensor import as_float32_array
-from infer.types import DEFAULT_JOINT_NAMES, PreprocessConfig
+from infer.types import (
+    DEFAULT_JOINT_NAMES,
+    DEFAULT_TACTILE_POINTCLOUD_SHAPE,
+    DEFAULT_TACTILE_STREAMS,
+    PreprocessConfig,
+    tactile_flow_stream_name,
+)
 from tools.normalizer import DatasetNormalizer
+from tools.tactile_feat import TACTILE_BUNDLE_ORDER, extract_tactile_deformation
 
 
 def _bundle_to_color_stream_name(name: Any) -> str:
@@ -32,6 +40,36 @@ def _resolve_camera_views(
     return tuple(PreprocessConfig().camera_views)
 
 
+def _resolve_tactile_streams(
+    data_cfg: Mapping[str, Any],
+    preprocess_cfg: Mapping[str, Any],
+) -> tuple[bool, tuple[str, ...]]:
+    use_tactile = bool(preprocess_cfg.get("use_tactile", data_cfg.get("use_tactile", False)))
+    if not use_tactile:
+        return False, ()
+
+    bundles = preprocess_cfg.get("tactile_bundles")
+    if bundles is None:
+        bundles = TACTILE_BUNDLE_ORDER
+    streams = preprocess_cfg.get("tactile_streams")
+    if streams is not None:
+        return True, tuple(str(name) for name in streams)
+    return True, tuple(tactile_flow_stream_name(str(bundle)) for bundle in bundles)
+
+
+def _resolve_pointcloud_shape(
+    data_cfg: Mapping[str, Any],
+    preprocess_cfg: Mapping[str, Any],
+) -> tuple[int, int, int]:
+    shape = preprocess_cfg.get("tactile_pointcloud_shape", data_cfg.get("tactile_pointcloud_shape"))
+    if shape is None:
+        return DEFAULT_TACTILE_POINTCLOUD_SHAPE
+    values = tuple(int(v) for v in shape)
+    if len(values) != 3:
+        raise ValueError(f"tactile_pointcloud_shape must have 3 dims, got {shape!r}")
+    return values
+
+
 def parse_preprocess_config(
     cfg: Mapping[str, Any],
     *,
@@ -51,6 +89,8 @@ def parse_preprocess_config(
     if joint_names is None:
         joint_names = DEFAULT_JOINT_NAMES
 
+    use_tactile, tactile_streams = _resolve_tactile_streams(data_cfg, preprocess_cfg)
+
     return PreprocessConfig(
         action_type=action_type,
         camera_views=camera_views,
@@ -63,6 +103,9 @@ def parse_preprocess_config(
                 robot_cfg.get("gripper_width_m", PreprocessConfig.gripper_width_m),
             )
         ),
+        use_tactile=use_tactile,
+        tactile_streams=tactile_streams if tactile_streams else DEFAULT_TACTILE_STREAMS,
+        tactile_pointcloud_shape=_resolve_pointcloud_shape(data_cfg, preprocess_cfg),
     )
 
 
@@ -137,29 +180,157 @@ def build_arm_eef10(pose_msg: Any, gripper_m: float) -> np.ndarray:
     gripper = np.asarray([gripper_m], dtype=np.float32)
     return np.concatenate([xyz, rot6d, gripper], axis=0).astype(np.float32, copy=False)
 
-def build_state_frame(frame: Any, cfg: PreprocessConfig) -> np.ndarray:
+
+def _frame_samples(frame: Any) -> Mapping[str, Any]:
     samples = getattr(frame, "samples", frame)
     if not isinstance(samples, Mapping):
         raise TypeError("frame must expose a mapping-like samples attribute")
+    return samples
+
+
+def _robot_state_values(sample: Any) -> tuple[list[str], list[float]]:
+    if hasattr(sample, "msg"):
+        msg = sample.msg
+        return list(getattr(msg, "name", [])), list(getattr(msg, "position", []))
+    if hasattr(sample, "data"):
+        data = sample.data
+        if isinstance(data, Mapping):
+            names = [str(item) for item in np.asarray(data["name"], dtype=object).tolist()]
+            positions = np.asarray(data["position"], dtype=np.float32).tolist()
+            return names, [float(v) for v in positions]
+    raise TypeError("robot_state sample must expose msg or mapping data")
+
+
+def _eef_values(sample: Any) -> Any:
+    if hasattr(sample, "msg"):
+        return sample.msg
+    if hasattr(sample, "data"):
+        return sample.data
+    raise TypeError("eef sample must expose msg or data")
+
+
+def pointcloud2_to_numpy(msg: Any) -> np.ndarray:
+    field_names = tuple(field.name for field in getattr(msg, "fields", ()))
+    selected = tuple(name for name in ("x", "y", "z", "dx", "dy", "dz") if name in field_names)
+    if not selected:
+        raise ValueError("PointCloud2 has no supported tactile fields")
+    import sensor_msgs_py.point_cloud2 as pc2
+
+    points = pc2.read_points(msg, field_names=selected, skip_nans=False)
+    if isinstance(points, np.ndarray) and points.dtype.fields:
+        array = np.column_stack([points[field] for field in selected]).astype(np.float32)
+    else:
+        array = np.asarray(points if isinstance(points, np.ndarray) else list(points), dtype=np.float32)
+    if array.ndim == 1:
+        array = array.reshape(0, len(selected)) if array.size == 0 else array.reshape(-1, len(selected))
+    return np.ascontiguousarray(array, dtype=np.float32)
+
+
+def sample_pointcloud_array(sample: Any) -> np.ndarray:
+    if hasattr(sample, "data"):
+        return as_float32_array(sample.data, name="tactile_pointcloud")
+    if hasattr(sample, "msg"):
+        return pointcloud2_to_numpy(sample.msg)
+    raise TypeError("tactile sample must expose data or msg")
+
+
+def reshape_pointcloud(flat: np.ndarray, shape: tuple[int, int, int]) -> np.ndarray:
+    height, width, channels = shape
+    arr = as_float32_array(flat, name="tactile_pointcloud")
+    expected_points = height * width
+    if arr.ndim == 1 and arr.size == expected_points * channels:
+        arr = arr.reshape(expected_points, channels)
+    if arr.shape != (expected_points, channels):
+        raise ValueError(
+            f"tactile pointcloud shape {arr.shape} != ({expected_points}, {channels})"
+        )
+    return arr.reshape(height, width, channels)
+
+
+def build_tactile_frame(samples: Mapping[str, Any], cfg: PreprocessConfig) -> np.ndarray:
+    bundles: list[np.ndarray] = []
+    for stream_name in cfg.tactile_streams:
+        if stream_name not in samples:
+            raise KeyError(f"frame missing tactile stream {stream_name!r}")
+        pointcloud = reshape_pointcloud(
+            sample_pointcloud_array(samples[stream_name]),
+            cfg.tactile_pointcloud_shape,
+        )
+        bundles.append(pointcloud)
+    merged = np.concatenate(bundles, axis=-1)
+    return extract_tactile_deformation(merged[np.newaxis, ...])[0]
+
+
+def build_tactile_window(
+    frames: Sequence[Any],
+    cfg: PreprocessConfig,
+    normalizer: DatasetNormalizer,
+) -> np.ndarray:
+    if not cfg.use_tactile:
+        raise RuntimeError("build_tactile_window called with use_tactile=False")
+    tactile = np.stack(
+        [build_tactile_frame(_frame_samples(frame), cfg) for frame in frames],
+        axis=0,
+    )
+    tactile = as_float32_array(tactile, name="tactile_window")
+    expected = (len(frames), *cfg.tactile_feature_shape)
+    if tactile.shape != expected:
+        raise ValueError(f"tactile window shape {tactile.shape} != expected {expected}")
+    return as_float32_array(normalizer.normalize_tactile_np(tactile), name="tactile_norm")
+
+
+def timestamp_dict(frames: Sequence[Any]) -> dict[str, Any]:
+    names = tuple(_frame_samples(frames[0]))
+    return {
+        "frame": np.asarray([int(frame.stamp_ns) for frame in frames], dtype=np.int64),
+        "samples": {
+            name: np.asarray([int(_frame_samples(frame)[name].stamp_ns) for frame in frames], dtype=np.int64)
+            for name in names
+        },
+        "recv": {
+            name: np.asarray([int(_frame_samples(frame)[name].recv_ns) for frame in frames], dtype=np.int64)
+            for name in names
+        },
+        "skew_ms": {
+            name: np.asarray([float(frame.skew_ms[name]) for frame in frames], dtype=np.float32)
+            for name in names
+        },
+    }
+
+
+def build_state_frame(frame: Any, cfg: PreprocessConfig) -> np.ndarray:
+    samples = _frame_samples(frame)
 
     if cfg.action_type == "joint":
-        robot_state = samples["robot_state"].msg
+        names, positions = _robot_state_values(samples["robot_state"])
         return joint_qpos_from_robot_state(
-            robot_state,
+            SimpleNamespace(name=names, position=positions),
             cfg.joint_names,
             gripper_width_m=cfg.gripper_width_m,
         )
 
-    robot_state = samples["robot_state"].msg
-    left = build_arm_eef10(
-        samples["left_eef"].msg,
+    names, positions = _robot_state_values(samples["robot_state"])
+    robot_state = SimpleNamespace(name=names, position=positions)
+    left = build_arm_eef10_from_values(
+        _eef_values(samples["left_eef"]),
         gripper_opening_m(robot_state, cfg.gripper_names["left"], cfg.gripper_width_m),
     )
-    right = build_arm_eef10(
-        samples["right_eef"].msg,
+    right = build_arm_eef10_from_values(
+        _eef_values(samples["right_eef"]),
         gripper_opening_m(robot_state, cfg.gripper_names["right"], cfg.gripper_width_m),
     )
     return np.concatenate([left, right], axis=0).astype(np.float32, copy=False)
+
+
+def build_arm_eef10_from_values(eef_values: Any, gripper_m: float) -> np.ndarray:
+    if hasattr(eef_values, "pose"):
+        return build_arm_eef10(eef_values, gripper_m)
+    eef7 = np.asarray(eef_values, dtype=np.float32)
+    xyz = eef7[:3]
+    rot6d = quat_wxyz_to_rot6d(eef7[3:7])
+    return np.concatenate([xyz, rot6d, np.asarray([gripper_m], dtype=np.float32)], axis=0).astype(
+        np.float32, copy=False
+    )
 
 def ros_image_to_rgb(msg: Any) -> np.ndarray:
     image = _image_to_array(msg)
@@ -181,6 +352,29 @@ def build_obs_from_frames(
     *,
     window_size: int | None = None,
 ) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    obs, state_raw = _build_core_obs(frames, cfg, normalizer, window_size=window_size)
+    return obs, state_raw
+
+
+def build_obs_from_numpy_frames(
+    frames: Sequence[Any],
+    cfg: PreprocessConfig,
+    normalizer: DatasetNormalizer,
+    *,
+    window_size: int | None = None,
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    obs, state_raw = _build_core_obs(frames, cfg, normalizer, window_size=window_size)
+    obs["timestamp"] = timestamp_dict(frames)
+    return obs, state_raw
+
+
+def _build_core_obs(
+    frames: Sequence[Any],
+    cfg: PreprocessConfig,
+    normalizer: DatasetNormalizer,
+    *,
+    window_size: int | None,
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
     if not frames:
         raise ValueError("frames must be non-empty")
     expected = window_size if window_size is not None else len(frames)
@@ -198,21 +392,28 @@ def build_obs_from_frames(
     state_norm = as_float32_array(normalizer.normalize_state_np(state_raw), name="state_norm")
 
     anchor = frames[-1]
-    samples = getattr(anchor, "samples", anchor)
+    samples = _frame_samples(anchor)
     views: list[np.ndarray] = []
     for stream_name in cfg.camera_views:
         if stream_name not in samples:
             raise KeyError(f"anchor frame missing camera stream {stream_name!r}")
-        rgb = ros_image_to_rgb(samples[stream_name].msg)
+        sample = samples[stream_name]
+        if hasattr(sample, "data"):
+            rgb = np.asarray(sample.data, dtype=np.uint8)
+            if rgb.ndim != 3 or rgb.shape[2] != 3:
+                raise ValueError(f"camera image must be HxWx3 RGB uint8, got {rgb.shape}")
+        else:
+            rgb = ros_image_to_rgb(sample.msg)
         resized = resize_rgb_like_training(rgb, cfg.image_size)
         views.append(np.transpose(resized, (2, 0, 1)).astype(np.uint8, copy=False))
 
     image_views = np.stack(views, axis=0)
-    image = image_views[None, None, ...]
-    obs = {
-        "image": np.asarray(image, dtype=np.uint8),
+    obs: dict[str, np.ndarray] = {
+        "image": np.asarray(image_views[None, None, ...], dtype=np.uint8),
         "state": state_norm,
     }
+    if cfg.use_tactile:
+        obs["tactile"] = build_tactile_window(frames, cfg, normalizer)
     return obs, state_raw
 
 

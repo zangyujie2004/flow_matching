@@ -17,3 +17,5 @@ _reference/**/.git/
 .vscode/
 *.swp
 outputs/**/*.pt
+.DS_Store
+./workload/

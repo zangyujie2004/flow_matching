@@ -30,9 +30,12 @@ def get_autocast_context(device: torch.device, use_amp: bool):
 
 
 def build_dataset_and_loader(cfg: dict) -> tuple[ZarrDataset, DataLoader]:
-    data_cfg = dict(cfg["data"])
+    from datasets.zarr_dataset import resolve_camera_data_config
+
+    data_cfg = resolve_camera_data_config(cfg["data"])
     train_cfg = cfg["train"]
     dataset = ZarrDataset.from_config(data_cfg)
+    dataset.set_training(True)
     loader = build_dataloader(
         dataset,
         batch_size=int(train_cfg.get("batch_size", 32)),

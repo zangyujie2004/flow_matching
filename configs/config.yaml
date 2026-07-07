@@ -24,6 +24,7 @@ data:
   image_as_uint8: true
   use_camera_latent: true
   latent_cache_root_dir: ${data.root_dir}
+  camera_augmentation: false   # true = photometric aug; forces use_camera_latent=false
   # keys
   camera_key: camera
   tactile_key: tactile
@@ -90,5 +91,5 @@ precompute:
   output_path: null  
 
 deploy:
-  action_process: abs_eef #abs_eef
+  action_process: abs_eef #abs_qpos
   action_hz: 30.0

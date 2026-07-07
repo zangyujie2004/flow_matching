@@ -18,6 +18,8 @@ if _POLICY_ROOT not in sys.path:
 from tools.normalizer import DatasetNormalizer
 from tools.tactile_feat import TACTILE_FEATURE_DIM, extract_tactile_deformation
 
+from .image_augment import apply_photometric_augment
+
 _ACTION_TYPES = ("joint", "eef")
 _ROBOT_SLICES = {"joint": slice(0, 14), "eef": slice(14, 34)}
 _ROBOT_DIMS = {"joint": 14, "eef": 20}
@@ -82,6 +84,17 @@ def camera_channel_indices(views: Sequence[str]) -> tuple[int, ...]:
 def parse_cache_camera_views(cache_views: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in str(cache_views).split(",") if part.strip())
 
+
+def resolve_camera_data_config(data_cfg: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply camera_augmentation ↔ use_camera_latent rules from workload."""
+    cfg = dict(data_cfg)
+    if bool(cfg.get("camera_augmentation", False)):
+        if bool(cfg.get("use_camera_latent", False)):
+            print("[ZarrDataset] camera_augmentation=true; forcing use_camera_latent=false")
+        cfg["use_camera_latent"] = False
+    return cfg
+
+
 class ZarrDataset(Dataset):
     def __init__(
         self,
@@ -103,6 +116,7 @@ class ZarrDataset(Dataset):
         state_key: str = "state_30hz",
         action_key: str = "action_30hz",
         camera_views: Sequence[str] | None = None,
+        camera_augmentation: bool = False,
         norm_output_range: Tuple[float, float] = (-1.0, 1.0),
         normalizer_max_windows: int | None = None,
     ):
@@ -123,8 +137,16 @@ class ZarrDataset(Dataset):
         self.tactile_dim = TACTILE_FEATURE_DIM
         self.image_as_uint8 = bool(image_as_uint8)
         self.use_camera_latent = bool(use_camera_latent)
+        self.camera_augmentation = bool(camera_augmentation)
         self.latent_cache_root_dir = latent_cache_root_dir
         self.fit_normalizer = bool(fit_normalizer)
+        self.training = True
+
+        if self.camera_augmentation and self.use_camera_latent:
+            raise ValueError(
+                "camera_augmentation=true is incompatible with use_camera_latent=true. "
+                "Set use_camera_latent=false or disable camera_augmentation."
+            )
 
         self.latent_cache_zarr = None
         self.latent_cache_group = None
@@ -197,7 +219,8 @@ class ZarrDataset(Dataset):
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "ZarrDataset":
         """Build dataset from policy/configs/config.yaml data section."""
-        cfg = dict(config)
+        cfg = resolve_camera_data_config(config)
+        cfg = dict(cfg)
         norm = cfg.pop("norm", None) or {}
         if "output_range" in norm:
             out = norm["output_range"]
@@ -207,6 +230,15 @@ class ZarrDataset(Dataset):
         if "fit_normalizer" in cfg:
             cfg["fit_normalizer"] = bool(cfg["fit_normalizer"])
         return cls(**cfg)
+
+    def set_training(self, training: bool) -> None:
+        self.training = bool(training)
+
+    def _maybe_augment_camera(self, camera: np.ndarray) -> np.ndarray:
+        if not self.camera_augmentation or not self.training:
+            return camera
+        rng = np.random.default_rng()
+        return apply_photometric_augment(camera, rng)
 
     @staticmethod
     def _resolve_action_type(value: str) -> str:
@@ -603,6 +635,7 @@ class ZarrDataset(Dataset):
                 raise ValueError(
                     f"image length mismatch: {camera.shape[0]} != {self.n_image_steps}"
                 )
+            camera = self._maybe_augment_camera(camera)
             image = self._process_image(camera)
             if image.shape[0] != self.n_image_steps or image.shape[1] != self.n_image_views:
                 raise ValueError(
