@@ -18,4 +18,4 @@ _reference/**/.git/
 *.swp
 outputs/**/*.pt
 .DS_Store
-./workload/
+/workload/
