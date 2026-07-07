@@ -1,20 +1,20 @@
+# chahua_vq | eef | view2 | relative | tactile=False
 seed: 42
 runtime:
   device: cuda
-
 output:
-  root_dir: outputs
-  run_name: smoke_train
-
+  root_dir: outputs/tasks_0707
+  run_name: chahua_vq_eef_v2_rel
 data:
-  root_dir: /mnt/workspace/zyj/data/processed/peel/peel_0630_1656
+  root_dir: /mnt/workspace/zyj/data/processed/chahua/chahua_0706_2323
   window_size: 8
   stride: 1
   n_image_steps: 1
   action_horizon: 32
   action_type: eef
   action_representation: relative
-  use_tactile: true
+  use_tactile: false
+  camera_views: ['left_wrist_0', 'right_wrist_0']
   image_size: 224
   image_as_uint8: true
   use_camera_latent: true
@@ -25,18 +25,17 @@ data:
   action_key: action_30hz
   norm:
     output_range: [-1, 1]
-    max_windows: 100
-
+    max_windows: 50000
 models:
   fm:
     cond_dim: 256
+    n_image_views: 2
     image_encoder_name: dinov2_small
     dino_model_name: vit_small_patch14_dinov2.lvd142m
     freeze_image_encoder: true
-    image_pretrained: false
+    image_pretrained: true
     image_feat_dim: 256
-    n_image_views: 3
-    use_tactile: true
+    use_tactile: false
     tactile_feat_dim: 256
     tactile_temporal_pool: conv1d
     state_feat_dim: 256
@@ -49,34 +48,34 @@ models:
     n_groups: 8
     num_inference_steps: 16
     solver: euler
-
 train:
-  batch_size: 2
-  num_workers: 0
+  batch_size: 512
+  num_workers: 16
   drop_last: true
   pin_memory: true
-  persistent_workers: false
-  prefetch_factor: 2
-  epochs: 1
+  persistent_workers: true
+  prefetch_factor: 4
+  epochs: 256
   grad_clip: 1.0
   use_amp: false
-  max_train_batches: 8
-  open_loop_test_every: 1
-  open_loop_test_max_batches: 2
-  plot_samples: 4
+  open_loop_test_every: 300
+  open_loop_test_max_batches: 16
+  plot_samples: 64
   plot_dims: auto
+  max_train_batches: null
   resume_path: null
   optimizer:
     lr: 1.0e-4
-    min_lr: 1.0e-6
+    min_lr: 1.0e-06
     weight_decay: 1.0e-4
-
 checkpoint:
-  save_every: 100
-
+  save_every: 200
 precompute:
-  batch_size: 64
+  batch_size: 512
   device: cuda
-  max_windows: null   # debug only; full run must cover all windows
+  max_windows: null
   overwrite: true
   output_path: null
+deploy:
+  action_process: abs_eef
+  action_hz: 30.0

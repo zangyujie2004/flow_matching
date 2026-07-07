@@ -1,30 +1,24 @@
+# chahua_all | joint | view2 | absolute | tactile=False
 seed: 42
 runtime:
   device: cuda
-
 output:
-  root_dir: outputs/chahua_all
-  run_name: chahua_eef_vision_view_2
-
+  root_dir: outputs/tasks_0707
+  run_name: chahua_all_joint_v2_abs
 data:
-  root_dir: /mnt/workspace/zyj/data/processed/chahua/chahua_0702_2028
-  # window
+  root_dir: /mnt/workspace/zyj/data/processed/chahua/chahua_0706_1611
   window_size: 8
   stride: 1
   n_image_steps: 1
   action_horizon: 32
-  # robot
-  action_type: eef
-  action_representation: relative
-  # tatile
+  action_type: joint
+  action_representation: absolute
   use_tactile: false
-  # camera
-  camera_views: ['left_wrist_0', 'right_wrist_0'] # ['base_0', 'left_wrist_0', 'right_wrist_0']
+  camera_views: ['left_wrist_0', 'right_wrist_0']
   image_size: 224
   image_as_uint8: true
   use_camera_latent: true
   latent_cache_root_dir: ${data.root_dir}
-  # keys
   camera_key: camera
   tactile_key: tactile
   state_key: state_30hz
@@ -32,32 +26,28 @@ data:
   norm:
     output_range: [-1, 1]
     max_windows: 50000
-
 models:
   fm:
     cond_dim: 256
-    # vision — DINOv2 (timm)
     n_image_views: 2
     image_encoder_name: dinov2_small
     dino_model_name: vit_small_patch14_dinov2.lvd142m
     freeze_image_encoder: true
     image_pretrained: true
     image_feat_dim: 256
-    # tactile CNN
     use_tactile: false
     tactile_feat_dim: 256
-    tactile_temporal_pool: conv1d   # mean | conv1d
+    tactile_temporal_pool: conv1d
     state_feat_dim: 256
-    state_pool: flatten           
-    action_horizon: 32            
-    n_action_steps: 32          
+    state_pool: flatten
+    action_horizon: 32
+    n_action_steps: 32
     diffusion_step_embed_dim: 256
     down_dims: [256, 512, 1024]
     kernel_size: 5
     n_groups: 8
     num_inference_steps: 16
-    solver: euler    
-
+    solver: euler
 train:
   batch_size: 512
   num_workers: 16
@@ -71,24 +61,21 @@ train:
   open_loop_test_every: 300
   open_loop_test_max_batches: 16
   plot_samples: 64
-  plot_dims: auto  
-  max_train_batches: null   
-  resume_path: null        
+  plot_dims: auto
+  max_train_batches: null
+  resume_path: null
   optimizer:
     lr: 1.0e-4
-    min_lr: 1.0e-6
+    min_lr: 1.0e-06
     weight_decay: 1.0e-4
-
 checkpoint:
   save_every: 200
-
 precompute:
   batch_size: 512
   device: cuda
   max_windows: null
   overwrite: true
-  output_path: null  
-
+  output_path: null
 deploy:
-  action_process: abs_eef #abs_eef
+  action_process: abs_dpos
   action_hz: 30.0

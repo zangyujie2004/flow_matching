@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-CONFIG="configs/config.yaml"
-GPUS="${CUDA_VISIBLE_DEVICES:-2}"
+CONFIG="configs/config_peel.yaml"
+GPUS="${CUDA_VISIBLE_DEVICES:-3}"
 PYTHON_BIN="${PYTHON:-python}"
 
 usage() {
