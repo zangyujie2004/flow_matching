@@ -50,7 +50,7 @@ models:
     state_feat_dim: 256
     state_pool: flatten           
     action_horizon: 32            
-    n_action_steps: 32          
+    n_action_steps: 32        
     diffusion_step_embed_dim: 256
     down_dims: [256, 512, 1024]
     kernel_size: 5

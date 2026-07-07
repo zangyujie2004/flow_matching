@@ -2,11 +2,34 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
-import cv2
 import numpy as np
+import torch
+import torch.nn.functional as F
 from infer.tensor import as_float32_array
 from infer.types import DEFAULT_JOINT_NAMES, PreprocessConfig
 from tools.normalizer import DatasetNormalizer
+
+
+def _bundle_to_color_stream_name(name: Any) -> str:
+    stream = str(name)
+    return stream if stream.endswith("_color") else f"{stream}_color"
+
+
+def _resolve_camera_views(
+    data_cfg: Mapping[str, Any],
+    preprocess_cfg: Mapping[str, Any],
+) -> tuple[str, ...]:
+    # Prefer data.camera_views so deployment behavior follows the run_dir config.
+    data_views = data_cfg.get("camera_views")
+    if data_views is not None:
+        return tuple(_bundle_to_color_stream_name(name) for name in data_views)
+
+    # Fallback to explicit deploy.preprocess override when data.camera_views is absent.
+    camera_views = preprocess_cfg.get("camera_views")
+    if camera_views is not None:
+        return tuple(str(name) for name in camera_views)
+
+    return tuple(PreprocessConfig().camera_views)
 
 
 def parse_preprocess_config(
@@ -20,9 +43,7 @@ def parse_preprocess_config(
     robot_cfg = dict(robot or {})
     action_type = str(preprocess_cfg.get("action_type", data_cfg.get("action_type", "eef")))
 
-    camera_views = preprocess_cfg.get("camera_views")
-    if camera_views is None:
-        camera_views = PreprocessConfig().camera_views
+    camera_views = _resolve_camera_views(data_cfg, preprocess_cfg)
     gripper_names = preprocess_cfg.get("gripper_names")
     if gripper_names is None:
         gripper_names = robot_cfg.get("gripper_names", PreprocessConfig().gripper_names)
@@ -32,7 +53,7 @@ def parse_preprocess_config(
 
     return PreprocessConfig(
         action_type=action_type,
-        camera_views=tuple(str(name) for name in camera_views),
+        camera_views=camera_views,
         gripper_names={str(k): str(v) for k, v in dict(gripper_names).items()},
         joint_names=tuple(str(name) for name in joint_names),
         image_size=int(preprocess_cfg.get("image_size", data_cfg.get("image_size", 224))),
@@ -183,11 +204,7 @@ def build_obs_from_frames(
         if stream_name not in samples:
             raise KeyError(f"anchor frame missing camera stream {stream_name!r}")
         rgb = ros_image_to_rgb(samples[stream_name].msg)
-        resized = cv2.resize(
-            rgb,
-            (cfg.image_size, cfg.image_size),
-            interpolation=cv2.INTER_AREA,
-        )
+        resized = resize_rgb_like_training(rgb, cfg.image_size)
         views.append(np.transpose(resized, (2, 0, 1)).astype(np.uint8, copy=False))
 
     image_views = np.stack(views, axis=0)
@@ -197,6 +214,24 @@ def build_obs_from_frames(
         "state": state_norm,
     }
     return obs, state_raw
+
+
+def resize_rgb_like_training(rgb: np.ndarray, image_size: int) -> np.ndarray:
+    arr = np.asarray(rgb, dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError(f"expected RGB image shape (H, W, 3), got {arr.shape}")
+    if arr.shape[0] == image_size and arr.shape[1] == image_size:
+        return arr
+
+    tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).float()
+    resized = F.interpolate(
+        tensor,
+        size=(image_size, image_size),
+        mode="bilinear",
+        align_corners=False,
+    )
+    out = resized.round().clamp_(0.0, 255.0).to(torch.uint8)
+    return out.squeeze(0).permute(1, 2, 0).cpu().numpy()
 
 def _image_to_array(msg: Any) -> np.ndarray:
     dtype, channels = _image_layout(str(msg.encoding).lower())

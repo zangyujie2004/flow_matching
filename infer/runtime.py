@@ -64,6 +64,7 @@ class FMInferenceRuntime:
         fm_cfg = self.policy_cfg["models"]["fm"]
         self.window_size = int(data_cfg["window_size"])
         self.action_horizon = int(fm_cfg["action_horizon"])
+        self.n_image_views = int(fm_cfg.get("n_image_views", 3))
         self.num_inference_steps = int(fm_cfg.get("num_inference_steps", DEFAULT_NUM_INFERENCE_STEPS))
         self.solver = str(fm_cfg.get("solver", DEFAULT_SOLVER))
 
@@ -76,7 +77,7 @@ class FMInferenceRuntime:
 
     def _warmup(self) -> None:
         image_size = int(cfg_get(self.policy_cfg, "data.image_size", 224))
-        n_views = int(cfg_get(self.policy_cfg, "models.fm.n_image_views", 3))
+        n_views = self.n_image_views
         dummy_obs = {
             "image": np.zeros((1, 1, n_views, 3, image_size, image_size), dtype=np.uint8),
             "state": np.zeros((self.window_size, self.action_dim), dtype=np.float32),
@@ -177,6 +178,12 @@ class FMInferenceRuntime:
     ) -> InferenceChunk:
         """ROS window -> preprocess -> predict -> deploy action_process -> InferenceChunk."""
         preprocess_cfg = preprocess or parse_preprocess_config(self.cfg, robot=robot)
+        if len(preprocess_cfg.camera_views) != self.n_image_views:
+            raise ValueError(
+                "preprocess camera_views count does not match model n_image_views: "
+                f"{len(preprocess_cfg.camera_views)} != {self.n_image_views}. "
+                "Check run_dir resolved_config (data.camera_views / models.fm.n_image_views)."
+            )
         obs, state_raw = build_obs_from_frames(
             frames,
             preprocess_cfg,
@@ -214,7 +221,7 @@ def random_smoke_obs(
     window_size = runtime.window_size
     action_dim = runtime.action_dim
     image_size = int(cfg_get(runtime.policy_cfg, "data.image_size", 224))
-    n_views = int(cfg_get(runtime.policy_cfg, "models.fm.n_image_views", 3))
+    n_views = runtime.n_image_views
 
     state_raw = np.zeros((window_size, action_dim), dtype=np.float32)
     if action_dim == 14:
