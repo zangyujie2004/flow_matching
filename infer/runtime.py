@@ -18,7 +18,7 @@ from infer.config import (
 )
 from infer.postprocess import apply_action_process
 from infer.preprocess import build_obs_from_frames, parse_preprocess_config
-from infer.tensor import as_float32_array, numpy_obs_to_torch
+from infer.tensor import as_float32_array, default_tactile_norm, numpy_obs_to_torch
 from infer.types import InferenceChunk, PreprocessConfig
 from tools.normalizer import DatasetNormalizer
 from utils.train_utils import cfg_get
@@ -86,6 +86,11 @@ class FMInferenceRuntime:
             "image": np.zeros((1, 1, n_views, 3, image_size, image_size), dtype=np.uint8),
             "state": np.zeros((self.window_size, self.action_dim), dtype=np.float32),
         }
+        if self.use_tactile:
+            dummy_obs["tactile"] = default_tactile_norm(
+                self.normalizer,
+                self.window_size,
+            )
         obs_torch = numpy_obs_to_torch(
             dummy_obs,
             self.device,
@@ -248,6 +253,11 @@ def random_smoke_obs(
     state_norm = runtime.normalizer.normalize_state_np(state_raw)
     image = rng.integers(0, 256, size=(1, 1, n_views, 3, image_size, image_size), dtype=np.uint8)
     obs = {"image": image, "state": state_norm.astype(np.float32, copy=False)}
+    if runtime.use_tactile:
+        obs["tactile"] = default_tactile_norm(
+            runtime.normalizer,
+            runtime.window_size,
+        )
     return obs, state_raw
 
 
