@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-CONFIG="configs/test3/chahua_all_eef_v2_rel_tac.yaml"
+CONFIG="configs/config.yaml"
 GPUS="${CUDA_VISIBLE_DEVICES:-0}"
 PYTHON_BIN="${PYTHON:-python}"
 
