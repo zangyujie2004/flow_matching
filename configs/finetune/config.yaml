@@ -1,0 +1,20 @@
+finetune:
+  base_run_dir: /mnt/workspace/zyj/policy/outputs/chahua/chahua_joint_vision_view_2_base
+  base_checkpoint: ${finetune.base_run_dir}/checkpoints/latest.pt
+  normalizer_mode: keep_base  # keep_base | refit
+  partial_ft: true
+  partial_ft_preset: action_head  # action_head | full
+  reset_optimizer: true
+  reset_epoch_counter: true
+
+output:
+  run_name: finetune_partial
+
+data:
+  root_dir: /mnt/workspace/zyj/data/processed/chahua/chahua_dagger
+
+train:
+  epochs: 64
+  optimizer:
+    lr: 1.0e-5
+  open_loop_test_every: 8

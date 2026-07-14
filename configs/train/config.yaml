@@ -3,18 +3,18 @@ runtime:
   device: cuda
 
 output:
-  root_dir: outputs/chahua_all
-  run_name: chahua_eef_vision_view_2
+  root_dir: outputs/chahua
+  run_name: chahua_joint_rel_vision_view_2
 
 data:
-  root_dir: /mnt/workspace/zyj/data/processed/chahua/chahua_0702_2028
+  root_dir: /mnt/workspace/zyj/data/processed/chahua/chahua_all
   # window
   window_size: 8
   stride: 1
   n_image_steps: 1
   action_horizon: 32
   # robot
-  action_type: eef
+  action_type: joint
   action_representation: relative
   # tatile
   use_tactile: false
@@ -33,7 +33,6 @@ data:
   norm:
     output_range: [-1, 1]
     max_windows: 50000
-
 models:
   fm:
     cond_dim: 256
@@ -58,10 +57,9 @@ models:
     n_groups: 8
     num_inference_steps: 16
     solver: euler    
-
 train:
   batch_size: 512
-  num_workers: 16
+  num_workers: 32
   drop_last: true
   pin_memory: true
   persistent_workers: true
@@ -91,5 +89,5 @@ precompute:
   output_path: null  
 
 deploy:
-  action_process: abs_eef #abs_qpos
+  action_process: abs_qpos #abs_qpos
   action_hz: 30.0

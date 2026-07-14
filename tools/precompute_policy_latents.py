@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
 import zarr
 from tqdm import tqdm
 
@@ -31,6 +32,15 @@ def build_dataset(cfg: dict) -> ZarrDataset:
     # Precompute is decoupled from training camera_views: always encode all zarr views.
     data_cfg.pop("camera_views", None)
     return ZarrDataset.from_config(data_cfg)
+
+
+def resolve_output_path_from_cfg(cfg: dict, output_path: str | None = None) -> str:
+    if output_path:
+        return str(output_path)
+    root = cfg_get(cfg, "data.latent_cache_root_dir", None) or cfg_get(cfg, "data.root_dir")
+    if root is None:
+        raise KeyError("data.root_dir is required to resolve precompute output path")
+    return os.path.join(str(root), "policy_latent_cache.zarr")
 
 
 def resolve_output_path(dataset: ZarrDataset, cfg: dict, output_path: str | None) -> str:
@@ -63,9 +73,14 @@ def write_window_metadata(meta_group, dataset: ZarrDataset, total_windows: int) 
 
 def precompute_image_latents(cfg: dict) -> str:
     pre_cfg = dict(cfg.get("precompute", {}))
-    dataset = build_dataset(cfg)
-    output_path = resolve_output_path(dataset, cfg, pre_cfg.get("output_path"))
+    output_path = resolve_output_path_from_cfg(cfg, pre_cfg.get("output_path"))
     overwrite = bool(pre_cfg.get("overwrite", False))
+
+    if os.path.isdir(output_path) and not overwrite:
+        print(f"[precompute] cache already exists, skipping: {output_path}")
+        return output_path
+
+    dataset = build_dataset(cfg)
     batch_size = max(1, int(pre_cfg.get("batch_size", 256)))
     device = torch.device(str(pre_cfg.get("device", cfg_get(cfg, "runtime.device", "cuda"))))
     max_windows = pre_cfg.get("max_windows")
@@ -74,11 +89,6 @@ def precompute_image_latents(cfg: dict) -> str:
         total_windows = max(1, min(int(max_windows), len(dataset)))
 
     if os.path.isdir(output_path):
-        if not overwrite:
-            raise FileExistsError(
-                f"Output zarr already exists: {output_path}. "
-                "Set precompute.overwrite=true in config to rebuild."
-            )
         shutil.rmtree(output_path)
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -161,7 +171,14 @@ def main() -> None:
     if not config_path.is_absolute():
         config_path = _POLICY_ROOT / config_path
 
-    cfg = load_config(str(config_path))
+    with open(config_path, encoding="utf-8") as handle:
+        peek = yaml.safe_load(handle)
+    if isinstance(peek, dict) and peek.get("finetune"):
+        from utils.finetune_config import resolve_full_config
+
+        cfg = resolve_full_config(config_path, policy_root=_POLICY_ROOT)
+    else:
+        cfg = load_config(str(config_path))
     precompute_image_latents(cfg)
 
 

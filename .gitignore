@@ -17,5 +17,9 @@ _reference/**/.git/
 .vscode/
 *.swp
 outputs/**/*.pt
+<<<<<<< Updated upstream
 .DS_Store
 /workload/
+=======
+./workload/
+>>>>>>> Stashed changes
