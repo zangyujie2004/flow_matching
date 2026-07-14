@@ -262,7 +262,16 @@ def random_smoke_obs(
 
 
 if __name__ == "__main__":
-    run_dir = Path("/mnt/workspace/zyj/deploy/PrometheusV2/third_party/flow_matching/outputs/chahua_eef_vision")
+    import os
+    import sys
+
+    # Prefer CLI / env; otherwise a repo-local outputs example (no absolute machine path).
+    if len(sys.argv) > 1:
+        run_dir = Path(sys.argv[1])
+    elif os.environ.get("FM_RUN_DIR"):
+        run_dir = Path(os.environ["FM_RUN_DIR"])
+    else:
+        run_dir = Path(__file__).resolve().parents[1] / "outputs" / "chahua_eef_vision"
     runtime = FMInferenceRuntime(run_dir, warmup=True)
     obs, state_raw = random_smoke_obs(runtime, seed=42)
     out = runtime.predict_rot6d_abs(obs, state_raw=state_raw)

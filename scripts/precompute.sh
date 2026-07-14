@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-CONFIG="configs/config.yaml"
+CONFIG="configs/train/config.yaml"
 GPUS="${CUDA_VISIBLE_DEVICES:-0}"
 PYTHON_BIN="${PYTHON:-python}"
 
@@ -21,8 +21,7 @@ Options:
 Writes:
   {data.latent_cache_root_dir}/policy_latent_cache.zarr
 
-Then set in config:
-  data.use_camera_latent: true
+If the cache already exists and precompute.overwrite is false, the step is skipped.
 
 Edit precompute.* settings in the config yaml (batch_size, overwrite, max_windows).
 EOF
