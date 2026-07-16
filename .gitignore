@@ -1,5 +1,4 @@
 /vis/
-/_reference/
 /outputs/
 __pycache__/
 .pytest_cache/
@@ -12,14 +11,11 @@ venv/
 *.pth
 *.ckpt
 **/events.out.tfevents.*
-_reference/**/.git/
 .idea/
 .vscode/
 *.swp
 outputs/**/*.pt
-<<<<<<< Updated upstream
 .DS_Store
 /workload/
-=======
-./workload/
->>>>>>> Stashed changes
+/pretrained_weights/
+_reference/
