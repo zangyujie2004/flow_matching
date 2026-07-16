@@ -42,8 +42,8 @@ def apply_partial_ft(policy: FlowMatchingPolicy, preset: str) -> list[nn.Paramet
         trainable = [param for param in policy.parameters() if param.requires_grad]
         frozen = _count_params(param for param in policy.parameters() if not param.requires_grad)
         print("[partial_ft] preset=action_head")
-        print("[partial_ft] frozen: condition_encoder + non-UNet modules")
-        print("[partial_ft] trainable: model (ConditionalUnet1D)")
+        print("[partial_ft] frozen: condition_encoder + non-velocity modules")
+        print(f"[partial_ft] trainable: model ({policy.velocity_model})")
         print(f"[partial_ft] trainable params: {len(trainable):,} tensors, {_count_params(trainable):,} values")
         print(f"[partial_ft] frozen params: {frozen:,} values")
         return trainable

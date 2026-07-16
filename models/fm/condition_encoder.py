@@ -21,7 +21,7 @@ class ConditionEncoder(nn.Module):
         cond_steps: int = 8,
         use_tactile: bool = True,
         tactile_channels: int = 12,
-        image_encoder_name: str = "dinov2_small",
+        image_encoder_name: str = "dinov2",
         dino_model_name: str = "vit_small_patch14_dinov2.lvd142m",
         freeze_image_encoder: bool = True,
         image_pretrained: bool = True,

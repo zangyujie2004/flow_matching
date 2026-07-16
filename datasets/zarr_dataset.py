@@ -15,7 +15,10 @@ _POLICY_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _POLICY_ROOT not in sys.path:
     sys.path.insert(0, _POLICY_ROOT)
 
-from tools.normalizer import DatasetNormalizer
+from tools.latent_cache import (
+    resolve_latent_cache_zarr_path,
+    validate_latent_cache_identity,
+)
 from tools.tactile_feat import TACTILE_FEATURE_DIM, extract_tactile_deformation
 
 from .image_augment import apply_photometric_augment
@@ -110,6 +113,8 @@ class ZarrDataset(Dataset):
         image_as_uint8: bool = True,
         use_camera_latent: bool = False,
         latent_cache_root_dir: str | None = None,
+        latent_cache_image_encoder_name: str | None = None,
+        latent_cache_image_model_name: str | None = None,
         fit_normalizer: bool = True,
         camera_key: str = "camera",
         tactile_key: str = "tactile",
@@ -139,6 +144,8 @@ class ZarrDataset(Dataset):
         self.use_camera_latent = bool(use_camera_latent)
         self.camera_augmentation = bool(camera_augmentation)
         self.latent_cache_root_dir = latent_cache_root_dir
+        self.latent_cache_image_encoder_name = latent_cache_image_encoder_name
+        self.latent_cache_image_model_name = latent_cache_image_model_name
         self.fit_normalizer = bool(fit_normalizer)
         self.training = True
 
@@ -293,7 +300,7 @@ class ZarrDataset(Dataset):
 
     def _resolve_latent_cache_path(self, *, require_exists: bool = True) -> str | None:
         root = self.latent_cache_root_dir or self.root_dir
-        path = os.path.join(str(root), "policy_latent_cache.zarr")
+        path = resolve_latent_cache_zarr_path(str(root))
         if require_exists and not os.path.isdir(path):
             raise FileNotFoundError(
                 f"Latent cache not found: {path}. "
@@ -302,6 +309,23 @@ class ZarrDataset(Dataset):
         if not os.path.isdir(path):
             return None
         return path
+
+    def _validate_latent_cache_identity(self, cache_path: str, cache_attrs: Mapping[str, Any]) -> None:
+        if not self.use_camera_latent:
+            return
+        if self.latent_cache_image_encoder_name is None or self.latent_cache_image_model_name is None:
+            raise ValueError(
+                "use_camera_latent=true requires latent_cache_image_encoder_name and "
+                "latent_cache_image_model_name. Pass models.fm vision settings when building the dataset."
+            )
+        validate_latent_cache_identity(
+            cache_attrs,
+            {
+                "image_encoder_name": self.latent_cache_image_encoder_name,
+                "dino_model_name": self.latent_cache_image_model_name,
+            },
+            cache_path=cache_path,
+        )
 
     def _maybe_open_latent_cache(self) -> None:
         cache_path = self._resolve_latent_cache_path(require_exists=True)
@@ -342,6 +366,8 @@ class ZarrDataset(Dataset):
             )
 
         cache_attrs = dict(getattr(self.latent_cache_zarr, "attrs", {}))
+        self._validate_latent_cache_identity(cache_path, cache_attrs)
+
         expected = {
             "window_size": self.window_size,
             "action_horizon": self.action_horizon,

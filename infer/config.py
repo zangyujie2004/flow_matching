@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -14,12 +15,51 @@ from utils.train_utils import cfg_get
 ACTION_DIMS = {"joint": 14, "eef": 20}
 DEFAULT_NUM_INFERENCE_STEPS = 16
 DEFAULT_SOLVER = "euler"
+DEFAULT_VELOCITY_MODEL = "unet"
 
 
 @dataclass(frozen=True)
 class DeployConfig:
     action_process: str = "abs_eef"
     action_hz: float = 30.0
+
+
+def infer_velocity_model_from_state_dict(state_dict: Mapping[str, Any]) -> str | None:
+    has_dit = any(str(key).startswith("model.blocks.") for key in state_dict)
+    has_unet = any(str(key).startswith("model.down_modules.") for key in state_dict)
+    if has_dit and has_unet:
+        raise ValueError("ambiguous checkpoint: contains both DiT and UNet weight keys")
+    if has_dit:
+        return "dit"
+    if has_unet:
+        return "unet"
+    return None
+
+
+def resolve_fm_cfg_for_inference(
+    fm_cfg: Mapping[str, Any],
+    policy_state_dict: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    resolved = dict(fm_cfg)
+    inferred = (
+        infer_velocity_model_from_state_dict(policy_state_dict)
+        if policy_state_dict is not None
+        else None
+    )
+    configured = str(resolved.get("velocity_model", "")).strip().lower()
+
+    if inferred is not None:
+        if not configured:
+            resolved["velocity_model"] = inferred
+        elif configured != inferred:
+            raise ValueError(
+                "velocity_model mismatch between config and checkpoint: "
+                f"config={configured!r}, checkpoint={inferred!r}. "
+                "Use resolved_config / checkpoint from the same training run."
+            )
+    else:
+        resolved.setdefault("velocity_model", DEFAULT_VELOCITY_MODEL)
+    return resolved
 
 
 def load_run_config(run_dir: Path | str) -> dict[str, Any]:
@@ -62,11 +102,13 @@ def build_policy_from_cfg(
     cfg: Mapping[str, Any],
     *,
     match_training: bool = True,
+    policy_state_dict: Mapping[str, Any] | None = None,
 ) -> FlowMatchingPolicy:
     data_cfg = cfg["data"]
     fm_cfg = dict(cfg["models"]["fm"])
     if match_training:
         fm_cfg["use_tactile"] = bool(data_cfg.get("use_tactile", fm_cfg.get("use_tactile", True)))
+    fm_cfg = resolve_fm_cfg_for_inference(fm_cfg, policy_state_dict)
     return build_flow_policy(
         {"models": {"fm": fm_cfg}},
         action_dim=action_dim_for_config(cfg),
@@ -78,15 +120,45 @@ def build_policy_from_cfg(
 def policy_config_from_checkpoint_state(state: Mapping[str, Any], fallback: Mapping[str, Any]) -> dict[str, Any]:
     ckpt_cfg = state.get("config")
     if isinstance(ckpt_cfg, dict) and ckpt_cfg:
-        return dict(ckpt_cfg)
+        merged = deepcopy(dict(fallback))
+        merged.update(ckpt_cfg)
+        if isinstance(fallback.get("models"), dict) and isinstance(ckpt_cfg.get("models"), dict):
+            merged_models = deepcopy(dict(fallback["models"]))
+            for key, value in ckpt_cfg["models"].items():
+                if isinstance(value, dict) and isinstance(merged_models.get(key), dict):
+                    merged_section = dict(merged_models[key])
+                    merged_section.update(value)
+                    merged_models[key] = merged_section
+                else:
+                    merged_models[key] = value
+            merged["models"] = merged_models
+        if isinstance(fallback.get("data"), dict) and isinstance(ckpt_cfg.get("data"), dict):
+            merged_data = deepcopy(dict(fallback["data"]))
+            merged_data.update(ckpt_cfg["data"])
+            merged["data"] = merged_data
+        return merged
     return dict(fallback)
 
 
 def load_runtime_checkpoint(
     path: Path | str,
-    policy: FlowMatchingPolicy,
-) -> tuple[DatasetNormalizer, dict[str, Any]]:
+    cfg: Mapping[str, Any],
+    *,
+    match_training: bool = True,
+) -> tuple[FlowMatchingPolicy, DatasetNormalizer, dict[str, Any]]:
     state = torch.load(path, map_location="cpu", weights_only=False)
-    policy.load_state_dict(state["policy_state_dict"])
+    policy_cfg = policy_config_from_checkpoint_state(state, cfg)
+    policy = build_policy_from_cfg(
+        policy_cfg,
+        match_training=match_training,
+        policy_state_dict=state.get("policy_state_dict"),
+    )
+    try:
+        policy.load_state_dict(state["policy_state_dict"])
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Failed to load checkpoint into {policy.velocity_model} backbone: {path}"
+        ) from exc
     normalizer = DatasetNormalizer.load_state_dict(state["normalizer_state_dict"])
-    return normalizer, state
+    policy.eval()
+    return policy, normalizer, state

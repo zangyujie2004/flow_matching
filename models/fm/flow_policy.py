@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from models.diffusion.conditional_unet1d import ConditionalUnet1D
 from models.diffusion.mask_generator import LowdimMaskGenerator
 
+from .action_dit import ActionDiT
 from .condition_encoder import ConditionEncoder
 
 
@@ -24,7 +25,7 @@ class FlowMatchingPolicy(nn.Module):
         tactile_channels: int = 12,
         action_horizon: int = 32,
         n_action_steps: int = 32,
-        image_encoder_name: str = "dinov2_small",
+        image_encoder_name: str = "dinov2",
         dino_model_name: str = "vit_small_patch14_dinov2.lvd142m",
         freeze_image_encoder: bool = True,
         image_pretrained: bool = True,
@@ -38,6 +39,12 @@ class FlowMatchingPolicy(nn.Module):
         down_dims=(256, 512, 1024),
         kernel_size: int = 5,
         n_groups: int = 8,
+        velocity_model: str = "unet",
+        dit_hidden_dim: int = 512,
+        dit_depth: int = 14,
+        dit_num_heads: int = 8,
+        dit_mlp_ratio: float = 4.0,
+        dit_dropout: float = 0.1,
         num_inference_steps: int = 16,
         solver: str = "euler",
     ):
@@ -72,16 +79,32 @@ class FlowMatchingPolicy(nn.Module):
             state_pool=state_pool,
         )
 
-        self.model = ConditionalUnet1D(
-            input_dim=self.action_dim,
-            local_cond_dim=None,
-            global_cond_dim=self.cond_dim,
-            diffusion_step_embed_dim=diffusion_step_embed_dim,
-            down_dims=tuple(down_dims),
-            kernel_size=kernel_size,
-            n_groups=n_groups,
-            cond_predict_scale=True,
-        )
+        self.velocity_model = str(velocity_model).lower()
+        if self.velocity_model == "unet":
+            self.model = ConditionalUnet1D(
+                input_dim=self.action_dim,
+                local_cond_dim=None,
+                global_cond_dim=self.cond_dim,
+                diffusion_step_embed_dim=diffusion_step_embed_dim,
+                down_dims=tuple(down_dims),
+                kernel_size=kernel_size,
+                n_groups=n_groups,
+                cond_predict_scale=True,
+            )
+        elif self.velocity_model == "dit":
+            self.model = ActionDiT(
+                input_dim=self.action_dim,
+                action_horizon=self.action_horizon,
+                global_cond_dim=self.cond_dim,
+                diffusion_step_embed_dim=diffusion_step_embed_dim,
+                hidden_dim=dit_hidden_dim,
+                depth=dit_depth,
+                num_heads=dit_num_heads,
+                mlp_ratio=dit_mlp_ratio,
+                dropout=dit_dropout,
+            )
+        else:
+            raise ValueError(f"unsupported velocity_model={velocity_model!r}")
 
         self.mask_generator = LowdimMaskGenerator(
             action_dim=self.action_dim,

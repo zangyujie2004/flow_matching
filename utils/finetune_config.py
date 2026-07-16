@@ -192,7 +192,9 @@ def _apply_finetune_data_defaults(
         return
 
     data = dict(merged.get("data") or {})
-    data["latent_cache_root_dir"] = data["root_dir"]
+    from tools.latent_cache import default_latent_cache_root_dir
+
+    data["latent_cache_root_dir"] = default_latent_cache_root_dir(data["root_dir"])
 
     finetune_mode = str((merged.get("finetune") or {}).get("normalizer_mode", "keep_base"))
     if finetune_mode != "refit":

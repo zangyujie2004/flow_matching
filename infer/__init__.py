@@ -13,13 +13,16 @@ from infer.config import (
     ACTION_DIMS,
     DEFAULT_NUM_INFERENCE_STEPS,
     DEFAULT_SOLVER,
+    DEFAULT_VELOCITY_MODEL,
     DeployConfig,
     action_dim_for_config,
     build_policy_from_cfg,
+    infer_velocity_model_from_state_dict,
     load_run_config,
     load_runtime_checkpoint,
     parse_deploy_config,
     policy_config_from_checkpoint_state,
+    resolve_fm_cfg_for_inference,
 )
 from infer.postprocess import apply_action_process, eef_rot6d_abs_to_rpy_abs, rot6d_to_rpy
 from infer.preprocess import build_obs_from_frames, parse_preprocess_config
@@ -32,6 +35,7 @@ __all__ = [
     "ACTION_DIMS",
     "DEFAULT_NUM_INFERENCE_STEPS",
     "DEFAULT_SOLVER",
+    "DEFAULT_VELOCITY_MODEL",
     "DeployConfig",
     "FMInferenceRuntime",
     "InferenceChunk",
@@ -41,6 +45,7 @@ __all__ = [
     "build_obs_from_frames",
     "build_policy_from_cfg",
     "eef_rot6d_abs_to_rpy_abs",
+    "infer_velocity_model_from_state_dict",
     "load_run_config",
     "load_runtime_checkpoint",
     "numpy_obs_to_torch",
@@ -49,5 +54,6 @@ __all__ = [
     "parse_preprocess_config",
     "policy_config_from_checkpoint_state",
     "random_smoke_obs",
+    "resolve_fm_cfg_for_inference",
     "rot6d_to_rpy",
 ]

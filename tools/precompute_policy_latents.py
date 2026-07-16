@@ -19,6 +19,7 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 from datasets import ZarrDataset  # noqa: E402
 from models.fm.encoders.dino_v2 import DinoV2SmallEncoder  # noqa: E402
+from tools.latent_cache import resolve_latent_cache_zarr_path, write_latent_cache_identity_attrs  # noqa: E402
 from utils.train_utils import cfg_get, load_config  # noqa: E402
 
 
@@ -40,14 +41,14 @@ def resolve_output_path_from_cfg(cfg: dict, output_path: str | None = None) -> s
     root = cfg_get(cfg, "data.latent_cache_root_dir", None) or cfg_get(cfg, "data.root_dir")
     if root is None:
         raise KeyError("data.root_dir is required to resolve precompute output path")
-    return os.path.join(str(root), "policy_latent_cache.zarr")
+    return resolve_latent_cache_zarr_path(str(root))
 
 
 def resolve_output_path(dataset: ZarrDataset, cfg: dict, output_path: str | None) -> str:
     if output_path:
         return str(output_path)
     root = cfg_get(cfg, "data.latent_cache_root_dir", None) or dataset.root_dir
-    return os.path.join(str(root), "policy_latent_cache.zarr")
+    return resolve_latent_cache_zarr_path(str(root))
 
 
 def build_image_batch(dataset: ZarrDataset, indices: list[int]) -> torch.Tensor:
@@ -113,7 +114,7 @@ def precompute_image_latents(cfg: dict) -> str:
     out_root.attrs["n_image_steps"] = int(dataset.n_image_steps)
     out_root.attrs["stride"] = int(dataset.stride)
     out_root.attrs["image_selection"] = "anchor"
-    out_root.attrs["dino_model_name"] = str(fm_cfg.get("dino_model_name", ""))
+    write_latent_cache_identity_attrs(out_root, fm_cfg)
     out_root.attrs["camera_views"] = ",".join(dataset.camera_views)
 
     data_group = out_root.create_group("data")

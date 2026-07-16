@@ -54,9 +54,18 @@ class FMInferenceRuntime:
         ckpt_state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         policy_cfg = policy_config_from_checkpoint_state(ckpt_state, self.cfg)
         self.policy_cfg = policy_cfg
-        self.policy = build_policy_from_cfg(policy_cfg, match_training=True).to(self.device)
+        self.policy = build_policy_from_cfg(
+            policy_cfg,
+            match_training=True,
+            policy_state_dict=ckpt_state.get("policy_state_dict"),
+        ).to(self.device)
         self.normalizer = DatasetNormalizer.load_state_dict(ckpt_state["normalizer_state_dict"])
-        self.policy.load_state_dict(ckpt_state["policy_state_dict"])
+        try:
+            self.policy.load_state_dict(ckpt_state["policy_state_dict"])
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Failed to load checkpoint into {self.policy.velocity_model} backbone: {checkpoint_path}"
+            ) from exc
         self.policy.eval()
         self.use_tactile = bool(self.policy.use_tactile)
         if self.use_tactile and self.normalizer.tactile is None:
@@ -71,6 +80,7 @@ class FMInferenceRuntime:
         self.n_image_views = int(fm_cfg.get("n_image_views", 3))
         self.num_inference_steps = int(fm_cfg.get("num_inference_steps", DEFAULT_NUM_INFERENCE_STEPS))
         self.solver = str(fm_cfg.get("solver", DEFAULT_SOLVER))
+        self.velocity_model = str(self.policy.velocity_model)
 
         if warmup:
             self._warmup()

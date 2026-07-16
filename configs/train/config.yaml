@@ -23,7 +23,7 @@ data:
   image_size: 224
   image_as_uint8: true
   use_camera_latent: true
-  latent_cache_root_dir: ${data.root_dir}
+  latent_cache_root_dir: ${data.root_dir}/latent_cache/dinov2_s14
   camera_augmentation: false   # true = photometric aug; forces use_camera_latent=false
   # keys
   camera_key: camera
@@ -38,7 +38,7 @@ models:
     cond_dim: 256
     # vision — DINOv2 (timm)
     n_image_views: 2
-    image_encoder_name: dinov2_small
+    image_encoder_name: dinov2
     dino_model_name: vit_small_patch14_dinov2.lvd142m
     freeze_image_encoder: true
     image_pretrained: true
@@ -52,11 +52,21 @@ models:
     action_horizon: 32            
     n_action_steps: 32        
     diffusion_step_embed_dim: 256
+    velocity_model: unet  # unet | dit
+    # unet config
     down_dims: [256, 512, 1024]
     kernel_size: 5
     n_groups: 8
+    # dit config
+    dit_hidden_dim: 512
+    dit_depth: 14
+    dit_num_heads: 8
+    dit_mlp_ratio: 4.0
+    dit_dropout: 0.1
+    # common config
     num_inference_steps: 16
     solver: euler    
+
 train:
   batch_size: 512
   num_workers: 32
