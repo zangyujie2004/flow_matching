@@ -19,6 +19,7 @@ from tools.latent_cache import (
     resolve_latent_cache_zarr_path,
     validate_latent_cache_identity,
 )
+from tools.normalizer import DatasetNormalizer
 from tools.tactile_feat import TACTILE_FEATURE_DIM, extract_tactile_deformation
 
 from .image_augment import apply_photometric_augment
