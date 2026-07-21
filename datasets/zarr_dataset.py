@@ -403,23 +403,22 @@ class ZarrDataset(Dataset):
             )
 
         self.image_backbone_dim = int(cache_attrs.get("image_backbone_dim", frame_src.shape[-1]))
-        # Keep zarr group alive for on-demand gather (avoid full T×V×D RAM materialization).
-        self._frame_latent_view_indices = tuple(int(i) for i in latent_view_indices)
-        self.cached_frame_image_backbone_feat = frame_src
+        # Materialize full frame cache into RAM so DataLoader workers avoid zarr I/O.
+        frame = np.asarray(frame_src[:], dtype=np.float32)
+        view_idx = [int(i) for i in latent_view_indices]
+        if view_idx != list(range(int(frame.shape[1]))):
+            frame = np.ascontiguousarray(frame[:, view_idx, :])
+        self._frame_latent_view_indices = tuple(range(int(frame.shape[1])))
+        self.cached_frame_image_backbone_feat = frame
         self.cached_image_backbone_feat = None
-        approx_gb = (
-            int(frame_src.shape[0])
-            * int(self.n_image_views)
-            * int(self.image_backbone_dim)
-            * 4
-            / (1024**3)
-        )
+        frame_gb = frame.nbytes / (1024**3)
         print(
-            f"[ZarrDataset] frame latent cache mapped: {cache_path}, "
-            f"shape={tuple(frame_src.shape)}, using_views={self.n_image_views}, "
-            f"backbone_dim={self.image_backbone_dim}, approx_active_gb={approx_gb:.3f}"
+            f"[ZarrDataset] frame latent cache loaded: {cache_path}, "
+            f"shape={tuple(frame.shape)}, using_views={self.n_image_views}, "
+            f"backbone_dim={self.image_backbone_dim}, size={frame_gb:.3f} GB"
         )
         self.latent_cache_group = None
+        self.latent_cache_zarr = None
 
     def _gather_frame_latent(self, indices) -> np.ndarray:
         if self.cached_frame_image_backbone_feat is None:
@@ -427,12 +426,7 @@ class ZarrDataset(Dataset):
                 "frame camera latent cache is not loaded; run ./scripts/precompute.sh"
             )
         idx = np.asarray(indices, dtype=np.int64)
-        feat = np.asarray(self.cached_frame_image_backbone_feat[idx], dtype=np.float32)
-        view_idx = getattr(self, "_frame_latent_view_indices", None)
-        if view_idx is None:
-            raise RuntimeError("frame latent view indices are not configured")
-        feat = feat[:, list(view_idx), :]
-        return feat
+        return self.cached_frame_image_backbone_feat[idx]
 
     def get_camera_latent(self, idx: int) -> np.ndarray:
         i0, i1 = self.image_range(idx)

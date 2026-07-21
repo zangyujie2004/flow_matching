@@ -33,7 +33,7 @@ data:
   # norm
   norm:
     output_range: [-1, 1]
-    max_windows: 50000
+    max_windows: 100000
   # memory
   memory:
     enabled: true
@@ -90,7 +90,7 @@ models:
     state_mem_dim: 64
 
 train:
-  batch_size: 512
+  batch_size: 1024
   num_workers: 32
   drop_last: true
   pin_memory: true
@@ -106,7 +106,7 @@ train:
   max_train_batches: null   
   resume_path: null        
   optimizer:
-    lr: 1.0e-4
+    lr: 3.0e-4
     min_lr: 1.0e-6
     weight_decay: 1.0e-4
 
