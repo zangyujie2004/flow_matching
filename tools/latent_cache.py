@@ -3,17 +3,33 @@ from __future__ import annotations
 import os
 from typing import Any, Mapping
 
-LATENT_CACHE_BASENAME = "policy_latent_cache.zarr"
+FRAME_CACHE_BASENAME = "frame_backbone.zarr"
+LEGACY_CACHE_BASENAME = "policy_latent_cache.zarr"
+LATENT_CACHE_BASENAME = FRAME_CACHE_BASENAME  # preferred write/read name
 DEFAULT_CACHE_SUBDIR = os.path.join("latent_cache", "dinov2_s14")
 DEFAULT_DINOV2_MODEL = "vit_small_patch14_dinov2.lvd142m"
+FRAME_CACHE_VERSION = 2
 
 
 def default_latent_cache_root_dir(data_root: str) -> str:
     return os.path.join(str(data_root), "latent_cache", "dinov2_s14")
 
 
+def resolve_frame_backbone_zarr_path(cache_root_dir: str) -> str:
+    """Canonical write path for frame-only cache (scheme A)."""
+    return os.path.join(str(cache_root_dir), FRAME_CACHE_BASENAME)
+
+
 def resolve_latent_cache_zarr_path(cache_root_dir: str) -> str:
-    return os.path.join(str(cache_root_dir), LATENT_CACHE_BASENAME)
+    """Resolve existing cache for reading; prefer frame_backbone, else legacy."""
+    root = str(cache_root_dir)
+    frame_path = os.path.join(root, FRAME_CACHE_BASENAME)
+    if os.path.isdir(frame_path):
+        return frame_path
+    legacy = os.path.join(root, LEGACY_CACHE_BASENAME)
+    if os.path.isdir(legacy):
+        return legacy
+    return frame_path
 
 
 def normalize_image_encoder_name(name: str | None) -> str:
@@ -82,3 +98,53 @@ def write_latent_cache_identity_attrs(root_group: Any, fm_cfg: Mapping[str, Any]
     # Backward compatibility for older readers.
     root_group.attrs["dino_model_name"] = identity["image_model_name"]
     return identity
+
+
+def frame_cache_matches(
+    cache_path: str,
+    *,
+    fm_cfg: Mapping[str, Any],
+    source_zarr_path: str,
+    image_size: int,
+    camera_views: tuple[str, ...] | list[str],
+    total_frames: int,
+    color_order: str = "rgb",
+) -> bool:
+    """True if existing frame cache can be reused (scheme A skip)."""
+    if not os.path.isdir(cache_path):
+        return False
+    try:
+        import zarr
+
+        root = zarr.open_group(cache_path, mode="r")
+    except Exception:
+        return False
+    if "data" not in root or "frame_image_backbone_feat" not in root["data"]:
+        return False
+    attrs = dict(getattr(root, "attrs", {}) or {})
+    try:
+        version = int(attrs.get("cache_version", 0))
+    except (TypeError, ValueError):
+        return False
+    if version < int(FRAME_CACHE_VERSION):
+        return False
+    try:
+        validate_latent_cache_identity(attrs, fm_cfg, cache_path=cache_path)
+    except ValueError:
+        return False
+    if str(attrs.get("source_zarr_path", "")) != str(source_zarr_path):
+        return False
+    if attrs.get("image_size") is None or int(attrs["image_size"]) != int(image_size):
+        return False
+    if attrs.get("color_order") is None or str(attrs["color_order"]).lower() != str(color_order).lower():
+        return False
+    cache_views = str(attrs.get("camera_views", "")).strip()
+    if not cache_views:
+        return False
+    expected_views = ",".join(camera_views)
+    if cache_views != expected_views:
+        return False
+    feat = root["data"]["frame_image_backbone_feat"]
+    if int(feat.shape[0]) != int(total_frames):
+        return False
+    return True

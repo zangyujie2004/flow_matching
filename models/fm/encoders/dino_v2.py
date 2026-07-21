@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 try:
     import timm
 except ImportError:
@@ -7,6 +9,28 @@ except ImportError:
 
 import torch
 import torch.nn as nn
+
+_PRETRAINED_DIR = Path(__file__).resolve().parents[3] / "pretrained_weights"
+_LOCAL_WEIGHTS = {
+    "vit_small_patch14_dinov2.lvd142m": _PRETRAINED_DIR / "dinov2_small.safetensors",
+}
+
+
+def _create_timm_backbone(model_name: str, *, pretrained: bool):
+    if timm is None:
+        raise ImportError("DINOv2 encoder requires timm. Install with: pip install timm")
+
+    local_path = _LOCAL_WEIGHTS.get(model_name)
+    create_kwargs = {
+        "model_name": model_name,
+        "pretrained": bool(pretrained),
+        "num_classes": 0,
+        "img_size": 224,
+    }
+    if pretrained and local_path is not None and local_path.is_file():
+        # Prefer local weights under policy/pretrained_weights (works with HF_HUB_OFFLINE=1).
+        create_kwargs["pretrained_cfg_overlay"] = {"file": str(local_path)}
+    return timm.create_model(**create_kwargs)
 
 
 class DinoV2SmallEncoder(nn.Module):
@@ -24,12 +48,7 @@ class DinoV2SmallEncoder(nn.Module):
             raise ImportError("DINOv2 encoder requires timm. Install with: pip install timm")
 
         self.freeze = bool(freeze)
-        self.backbone = timm.create_model(
-            model_name,
-            pretrained=pretrained,
-            num_classes=0,
-            img_size=224,
-        )
+        self.backbone = _create_timm_backbone(model_name, pretrained=pretrained)
         backbone_dim = getattr(self.backbone, "num_features", None)
         if backbone_dim is None:
             raise RuntimeError("Cannot infer DINOv2 output dim from timm model.")
@@ -126,17 +145,22 @@ class DinoV2Encoder(nn.Module):
             return feats.mean(dim=1)
         raise ValueError(f"unsupported view_pool={self.view_pool!r}")
 
-    def encode_from_backbone_feat(self, feat: torch.Tensor) -> torch.Tensor:
-        """feat: (B, T, V, D_backbone) or (B, V, D_backbone)."""
+    def encode_all_from_backbone_feat(self, feat: torch.Tensor) -> torch.Tensor:
+        """feat: (B, T, V, D_backbone) or (B, V, D_backbone) -> (B, T, out_dim)."""
         if feat.ndim == 3:
             feat = feat.unsqueeze(1)
         if feat.ndim != 4:
             raise ValueError(f"expected backbone feat (B,T,V,D), got {feat.shape}")
-        x = feat[:, -1]
-        b, v, d = x.shape
-        projected = self.encoder.forward_from_backbone_feat(x.reshape(b * v, d)).reshape(b, v, -1)
+        b, t, v, d = feat.shape
+        projected = self.encoder.forward_from_backbone_feat(feat.reshape(b * t * v, d)).reshape(
+            b, t, v, -1
+        )
         if self.view_pool == "concat":
-            return self.view_proj(projected.flatten(1))
+            return self.view_proj(projected.flatten(2))
         if self.view_pool == "mean":
-            return projected.mean(dim=1)
+            return projected.mean(dim=2)
         raise ValueError(f"unsupported view_pool={self.view_pool!r}")
+
+    def encode_from_backbone_feat(self, feat: torch.Tensor) -> torch.Tensor:
+        """feat: (B, T, V, D_backbone) or (B, V, D_backbone)."""
+        return self.encode_all_from_backbone_feat(feat)[:, -1]

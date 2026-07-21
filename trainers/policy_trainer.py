@@ -19,7 +19,7 @@ from models.fm import FlowMatchingPolicy, build_flow_policy
 from tools.normalizer import DatasetNormalizer
 from trainers.eval_open_loop import evaluate_open_loop
 from utils.tensor import move_to_device
-from utils.train_utils import cfg_get, detach_scalar_dict, log_hparams_to_tensorboard, set_seed
+from utils.train_utils import cfg_get, detach_scalar_dict, log_hparams_to_tensorboard, set_seed, sync_fm_action_horizon_from_data
 
 
 def get_autocast_context(device: torch.device, use_amp: bool):
@@ -58,7 +58,7 @@ def build_dataset_and_loader(cfg: dict) -> tuple[ZarrDataset, DataLoader]:
 
 def build_policy(cfg: dict, device: torch.device, dataset: ZarrDataset) -> FlowMatchingPolicy:
     data_cfg = cfg["data"]
-    fm_cfg = dict(cfg["models"]["fm"])
+    fm_cfg = sync_fm_action_horizon_from_data(cfg["models"]["fm"], data_cfg)
     use_tactile = bool(data_cfg.get("use_tactile", True))
     fm_cfg["use_tactile"] = use_tactile
 
@@ -73,8 +73,11 @@ def build_policy(cfg: dict, device: torch.device, dataset: ZarrDataset) -> FlowM
     if dataset.use_camera_latent and not bool(fm_cfg.get("freeze_image_encoder", True)):
         raise ValueError("use_camera_latent=True requires models.fm.freeze_image_encoder=true.")
 
+    cfg_for_build = dict(cfg)
+    cfg_for_build["models"] = dict(cfg["models"])
+    cfg_for_build["models"]["fm"] = fm_cfg
     policy = build_flow_policy(
-        {"models": {"fm": fm_cfg}},
+        cfg_for_build,
         action_dim=dataset.action_dim,
         state_dim=dataset.action_dim,
         cond_steps=dataset.window_size,
@@ -191,6 +194,14 @@ def main(cfg: dict) -> None:
 
     dataset, train_loader = build_dataset_and_loader(cfg)
     print(f"Train windows: {len(dataset)}")
+
+    # Persist data→fm action horizon into resolved_config for deploy/infer.
+    cfg = dict(cfg)
+    cfg["models"] = dict(cfg.get("models") or {})
+    cfg["models"]["fm"] = sync_fm_action_horizon_from_data(
+        cfg["models"].get("fm") or {},
+        cfg["data"],
+    )
 
     policy = build_policy(cfg, device, dataset)
     trainable_params = [param for param in policy.parameters() if param.requires_grad]

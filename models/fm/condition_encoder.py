@@ -92,6 +92,9 @@ class ConditionEncoder(nn.Module):
             raise ValueError("image is required when image_backbone_feat is None")
         return self.image_encoder(image)
 
+    def encode_image_sequence_from_backbone_feat(self, image_backbone_feat: torch.Tensor) -> torch.Tensor:
+        return self.image_encoder.encode_all_from_backbone_feat(image_backbone_feat)
+
     def forward(
         self,
         state: torch.Tensor,

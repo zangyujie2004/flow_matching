@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -11,6 +11,7 @@ from models.diffusion.mask_generator import LowdimMaskGenerator
 
 from .action_dit import ActionDiT
 from .condition_encoder import ConditionEncoder
+from .memory import build_memory_encoder
 
 
 class FlowMatchingPolicy(nn.Module):
@@ -45,6 +46,22 @@ class FlowMatchingPolicy(nn.Module):
         dit_num_heads: int = 8,
         dit_mlp_ratio: float = 4.0,
         dit_dropout: float = 0.1,
+        memory_enabled: bool = False,
+        memory_method: str = "fusion",
+        memory_injection: str = "cross_attn",
+        memory_dim: int = 256,
+        memory_history_frames: int = 64,
+        memory_recent_frame: int = 2,
+        memory_visual_layers: int = 2,
+        memory_visual_heads: int = 4,
+        memory_state_channels: int = 128,
+        memory_state_layers: int = 2,
+        memory_state_mem_dim: int = 64,
+        memory_num_queries: int = 3,
+        memory_state_hidden_dim: int = 64,
+        memory_state_heads: int = 4,
+        memory_dropout: float = 0.1,
+        memory_cross_attn_layers: Sequence[int] = (3, 7, 11),
         num_inference_steps: int = 16,
         solver: str = "euler",
     ):
@@ -57,6 +74,22 @@ class FlowMatchingPolicy(nn.Module):
         self.action_horizon = int(action_horizon)
         self.n_action_steps = int(n_action_steps)
         self.num_inference_steps = int(num_inference_steps)
+        self.memory_enabled = bool(memory_enabled)
+        self.memory_method = str(memory_method)
+        self.memory_history_frames = int(memory_history_frames)
+        self.memory_recent_frame = int(memory_recent_frame)
+        self.memory_injection = str(memory_injection).lower()
+        if self.memory_injection not in {"cross_attn", "concat_global_cond"}:
+            raise ValueError(
+                "memory_injection must be one of ['cross_attn', 'concat_global_cond'], "
+                f"got {memory_injection!r}"
+            )
+        self.velocity_model = str(velocity_model).lower()
+        if self.memory_enabled and self.memory_injection == "cross_attn" and self.velocity_model != "dit":
+            raise ValueError(
+                "memory_injection='cross_attn' requires velocity_model='dit'. "
+                "Use memory_injection='concat_global_cond' for UNet."
+            )
         self.solver = str(solver).lower()
         if self.solver not in {"euler", "heun"}:
             raise ValueError(f"unsupported solver={solver!r}")
@@ -79,7 +112,41 @@ class FlowMatchingPolicy(nn.Module):
             state_pool=state_pool,
         )
 
-        self.velocity_model = str(velocity_model).lower()
+        self.memory_encoder = None
+        self.memory_token_proj = None
+        self.memory_cond_fusion = None
+        if self.memory_enabled:
+            self.memory_encoder = build_memory_encoder(
+                self.memory_method,
+                state_dim=self.state_dim,
+                visual_dim=image_feat_dim,
+                memory_dim=int(memory_dim),
+                history_frames=self.memory_history_frames,
+                recent_frame=self.memory_recent_frame,
+                visual_layers=memory_visual_layers,
+                visual_heads=memory_visual_heads,
+                state_channels=memory_state_channels,
+                state_layers=memory_state_layers,
+                state_mem_dim=memory_state_mem_dim,
+                num_queries=memory_num_queries,
+                state_hidden_dim=memory_state_hidden_dim,
+                state_heads=memory_state_heads,
+                dropout=memory_dropout,
+            )
+            self.memory_token_proj = (
+                nn.Identity()
+                if int(memory_dim) == self.cond_dim
+                else nn.Linear(int(memory_dim), self.cond_dim)
+            )
+            if self.memory_injection == "concat_global_cond":
+                self.memory_cond_fusion = nn.Sequential(
+                    nn.LayerNorm(self.cond_dim * 2),
+                    nn.Linear(self.cond_dim * 2, self.cond_dim),
+                    nn.SiLU(),
+                    nn.Dropout(memory_dropout),
+                    nn.Linear(self.cond_dim, self.cond_dim),
+                )
+
         if self.velocity_model == "unet":
             self.model = ConditionalUnet1D(
                 input_dim=self.action_dim,
@@ -102,6 +169,16 @@ class FlowMatchingPolicy(nn.Module):
                 num_heads=dit_num_heads,
                 mlp_ratio=dit_mlp_ratio,
                 dropout=dit_dropout,
+                condition_token_dim=(
+                    self.cond_dim
+                    if self.memory_enabled and self.memory_injection == "cross_attn"
+                    else None
+                ),
+                cross_attn_layers=(
+                    tuple(int(x) for x in memory_cross_attn_layers)
+                    if self.memory_enabled and self.memory_injection == "cross_attn"
+                    else None
+                ),
             )
         else:
             raise ValueError(f"unsupported velocity_model={velocity_model!r}")
@@ -124,13 +201,64 @@ class FlowMatchingPolicy(nn.Module):
         cond_steps: int,
         tactile_channels: int = 12,
     ) -> "FlowMatchingPolicy":
-        fm_cfg = dict(cfg.get("models", {}).get("fm", cfg))
+        models = cfg.get("models", {})
+        if not isinstance(models, Mapping):
+            models = {}
+        fm_cfg = dict(models.get("fm", cfg))
+        mem_cfg = dict(models.get("memory") or {})
+        data = cfg.get("data", {})
+        if not isinstance(data, Mapping):
+            data = {}
+        data_mem = dict(data.get("memory") or {})
+
+        kwargs = dict(fm_cfg)
+        if bool(data_mem.get("enabled", False)):
+            kwargs["memory_enabled"] = True
+            kwargs["memory_method"] = str(mem_cfg.get("method", kwargs.get("memory_method", "fusion")))
+            kwargs["memory_injection"] = str(
+                mem_cfg.get("injection", kwargs.get("memory_injection", "cross_attn"))
+            )
+            kwargs["memory_dim"] = int(mem_cfg.get("dim", kwargs.get("memory_dim", 256)))
+            kwargs["memory_history_frames"] = int(
+                data_mem.get("history_frames", kwargs.get("memory_history_frames", 64))
+            )
+            kwargs["memory_recent_frame"] = int(
+                data_mem.get("recent_frame", kwargs.get("memory_recent_frame", 2))
+            )
+            kwargs["memory_visual_layers"] = int(
+                mem_cfg.get("visual_layers", kwargs.get("memory_visual_layers", 2))
+            )
+            kwargs["memory_visual_heads"] = int(
+                mem_cfg.get("visual_heads", kwargs.get("memory_visual_heads", 4))
+            )
+            kwargs["memory_state_channels"] = int(
+                mem_cfg.get("state_channels", kwargs.get("memory_state_channels", 128))
+            )
+            kwargs["memory_state_layers"] = int(
+                mem_cfg.get("state_layers", kwargs.get("memory_state_layers", 2))
+            )
+            kwargs["memory_state_mem_dim"] = int(
+                mem_cfg.get("state_mem_dim", kwargs.get("memory_state_mem_dim", 64))
+            )
+            kwargs["memory_num_queries"] = int(
+                mem_cfg.get("num_queries", kwargs.get("memory_num_queries", 3))
+            )
+            kwargs["memory_state_hidden_dim"] = int(
+                mem_cfg.get("state_hidden_dim", kwargs.get("memory_state_hidden_dim", 64))
+            )
+            kwargs["memory_state_heads"] = int(
+                mem_cfg.get("state_heads", kwargs.get("memory_state_heads", 4))
+            )
+            kwargs["memory_dropout"] = float(mem_cfg.get("dropout", kwargs.get("memory_dropout", 0.1)))
+            if "cross_attn_layers" in mem_cfg:
+                kwargs["memory_cross_attn_layers"] = tuple(int(x) for x in mem_cfg["cross_attn_layers"])
+
         return cls(
             action_dim=action_dim,
             state_dim=state_dim,
             cond_steps=cond_steps,
             tactile_channels=tactile_channels,
-            **fm_cfg,
+            **kwargs,
         )
 
     @staticmethod
@@ -143,7 +271,7 @@ class FlowMatchingPolicy(nn.Module):
         pad = x[:, -1:].expand(-1, target_t - t, -1)
         return torch.cat([x, pad], dim=1)
 
-    def _build_condition(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _build_obs_condition(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
         image = obs.get("image")
         image_backbone_feat = obs.get("image_backbone_feat")
         state = obs["state"]
@@ -155,6 +283,63 @@ class FlowMatchingPolicy(nn.Module):
             tactile=tactile,
         )
 
+    def _build_memory(self, obs: Dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.memory_encoder is None or self.memory_token_proj is None:
+            raise RuntimeError("memory encoder is not configured")
+        required = ("memory_image_backbone_feat", "memory_state", "memory_visual_offsets")
+        missing = [key for key in required if key not in obs]
+        if missing:
+            raise KeyError(
+                "memory is enabled but obs is missing required keys: " + ", ".join(missing)
+            )
+        visual_tokens = self.condition_encoder.encode_image_sequence_from_backbone_feat(
+            obs["memory_image_backbone_feat"]
+        )
+        mem_out = self.memory_encoder(
+            visual_tokens=visual_tokens,
+            visual_offsets=obs["memory_visual_offsets"],
+            state=obs["memory_state"],
+            visual_valid=obs.get("memory_visual_valid"),
+            state_valid=obs.get("memory_state_valid"),
+        )
+        tokens = self.memory_token_proj(mem_out.tokens)
+        memory_global = self.memory_token_proj(mem_out.memory_global)
+        return tokens, memory_global
+
+    def _build_condition(
+        self,
+        obs: Dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        obs_cond = self._build_obs_condition(obs)
+        if not self.memory_enabled:
+            return obs_cond, None
+        tokens, memory_global = self._build_memory(obs)
+        if self.memory_injection == "cross_attn":
+            # Locked: memory only in condition_tokens; obs stays in global_cond / AdaLN.
+            return obs_cond, tokens
+        if self.memory_cond_fusion is None:
+            raise RuntimeError("memory_cond_fusion is required for concat_global_cond mode")
+        global_cond = self.memory_cond_fusion(torch.cat([obs_cond, memory_global], dim=-1))
+        return global_cond, None
+
+    def _model_forward(
+        self,
+        sample: torch.Tensor,
+        timestep: torch.Tensor,
+        *,
+        global_cond: torch.Tensor,
+        condition_tokens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.velocity_model == "dit":
+            return self.model(
+                sample,
+                timestep,
+                local_cond=None,
+                global_cond=global_cond,
+                condition_tokens=condition_tokens,
+            )
+        return self.model(sample, timestep, local_cond=None, global_cond=global_cond)
+
     def compute_loss(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         obs = batch["obs"]
         actions = self._pad_or_trim_time(batch["action"], self.action_horizon)
@@ -163,7 +348,7 @@ class FlowMatchingPolicy(nn.Module):
                 f"action dim mismatch: got {actions.shape[-1]}, expected {self.action_dim}"
             )
 
-        global_cond = self._build_condition(obs)
+        global_cond, condition_tokens = self._build_condition(obs)
 
         condition_mask = self.mask_generator(actions.shape)
         loss_mask = ~condition_mask
@@ -177,7 +362,12 @@ class FlowMatchingPolicy(nn.Module):
         target_velocity = x1 - x0
         xt = torch.where(condition_mask, x1, xt)
 
-        pred_velocity = self.model(xt, t, local_cond=None, global_cond=global_cond)
+        pred_velocity = self._model_forward(
+            xt,
+            t,
+            global_cond=global_cond,
+            condition_tokens=condition_tokens,
+        )
         loss = F.mse_loss(pred_velocity, target_velocity, reduction="none")
         loss = loss * loss_mask.to(loss.dtype)
         loss = loss.reshape(loss.shape[0], -1).mean(dim=1).mean()
@@ -194,7 +384,7 @@ class FlowMatchingPolicy(nn.Module):
         num_inference_steps: int | None = None,
         solver: str | None = None,
     ) -> torch.Tensor:
-        global_cond = self._build_condition(obs)
+        global_cond, condition_tokens = self._build_condition(obs)
         steps = self.num_inference_steps if num_inference_steps is None else int(num_inference_steps)
         solver = self.solver if solver is None else str(solver).lower()
 
@@ -215,12 +405,20 @@ class FlowMatchingPolicy(nn.Module):
             t1 = times[i + 1]
             dt = t1 - t0
             t_batch = t0.expand(bsz)
-            velocity = self.model(trajectory, t_batch, local_cond=None, global_cond=global_cond)
+            velocity = self._model_forward(
+                trajectory,
+                t_batch,
+                global_cond=global_cond,
+                condition_tokens=condition_tokens,
+            )
             if solver == "heun" and i < steps - 1:
                 x_euler = trajectory + dt * velocity
                 t_batch_next = t1.expand(bsz)
-                velocity_next = self.model(
-                    x_euler, t_batch_next, local_cond=None, global_cond=global_cond
+                velocity_next = self._model_forward(
+                    x_euler,
+                    t_batch_next,
+                    global_cond=global_cond,
+                    condition_tokens=condition_tokens,
                 )
                 trajectory = trajectory + 0.5 * dt * (velocity + velocity_next)
             else:

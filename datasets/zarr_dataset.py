@@ -123,13 +123,16 @@ class ZarrDataset(Dataset):
         action_key: str = "action_30hz",
         camera_views: Sequence[str] | None = None,
         camera_augmentation: bool = False,
+        memory: Mapping[str, Any] | None = None,
         norm_output_range: Tuple[float, float] = (-1.0, 1.0),
         normalizer_max_windows: int | None = None,
+        max_windows: int | None = None,
     ):
         self.root_dir = root_dir
         self.window_size = max(1, int(window_size))
         self.stride = max(1, int(stride))
         self.image_size = int(image_size)
+        self.max_windows = None if max_windows is None else max(1, int(max_windows))
 
         self.n_image_steps = self.window_size if n_image_steps is None else max(1, int(n_image_steps))
         self.action_horizon = self.window_size if action_horizon is None else max(1, int(action_horizon))
@@ -150,6 +153,15 @@ class ZarrDataset(Dataset):
         self.fit_normalizer = bool(fit_normalizer)
         self.training = True
 
+        memory_cfg = dict(memory or {})
+        self.memory_enabled = bool(memory_cfg.get("enabled", False))
+        self.memory_history_frames = max(1, int(memory_cfg.get("history_frames", 64)))
+        self.memory_sample_stride = max(1, int(memory_cfg.get("sample_stride", 4)))
+        self.memory_recent_frame = max(1, int(memory_cfg.get("recent_frame", 2)))
+        # Locked: pad_first only (ignore any start_mode in config).
+        self.memory_start_mode = "pad_first"
+        self.memory_visual_offsets = self._build_memory_visual_offsets()
+
         if self.camera_augmentation and self.use_camera_latent:
             raise ValueError(
                 "camera_augmentation=true is incompatible with use_camera_latent=true. "
@@ -159,9 +171,10 @@ class ZarrDataset(Dataset):
         self.latent_cache_zarr = None
         self.latent_cache_group = None
         self.cached_image_backbone_feat = None
+        self.cached_frame_image_backbone_feat = None
+        self._frame_latent_view_indices: tuple[int, ...] | None = None
         self.image_backbone_dim: int | None = None
         self.cached_norm_action: np.ndarray | None = None
-
         self.camera_key = camera_key
         self.tactile_key = tactile_key
         self.state_key = state_key
@@ -189,8 +202,22 @@ class ZarrDataset(Dataset):
             f"[ZarrDataset] camera_views={list(self.camera_views)} "
             f"(n_image_views={self.n_image_views}, zarr_views={n_zarr_views})"
         )
+        if self.memory_enabled:
+            print(
+                "[ZarrDataset] memory enabled: "
+                f"history_frames={self.memory_history_frames}, "
+                f"sample_stride={self.memory_sample_stride}, "
+                f"recent_frame={self.memory_recent_frame}, "
+                f"visual_offsets={self.memory_visual_offsets.tolist()}, "
+                f"start_mode={self.memory_start_mode}"
+            )
 
         self.windows = self._build_windows()
+        if self.max_windows is not None:
+            cap = max(1, int(self.max_windows))
+            if len(self.windows) > cap:
+                print(f"[ZarrDataset] truncating windows {len(self.windows)} -> {cap} (data.max_windows)")
+                self.windows = self.windows[:cap]
         if len(self.windows) == 0:
             raise ValueError(
                 "No valid strict anchor windows. "
@@ -237,7 +264,8 @@ class ZarrDataset(Dataset):
             cfg["normalizer_max_windows"] = norm["max_windows"]
         if "fit_normalizer" in cfg:
             cfg["fit_normalizer"] = bool(cfg["fit_normalizer"])
-        return cls(**cfg)
+        memory = cfg.pop("memory", None)
+        return cls(**cfg, memory=memory)
 
     def set_training(self, training: bool) -> None:
         self.training = bool(training)
@@ -331,94 +359,108 @@ class ZarrDataset(Dataset):
     def _maybe_open_latent_cache(self) -> None:
         cache_path = self._resolve_latent_cache_path(require_exists=True)
         self.latent_cache_zarr = zarr.open_group(cache_path, mode="r")
-        if "data" not in self.latent_cache_zarr or "meta" not in self.latent_cache_zarr:
+        if "data" not in self.latent_cache_zarr:
             raise KeyError(f"Invalid latent cache zarr structure: {cache_path}")
 
         self.latent_cache_group = self.latent_cache_zarr["data"]
-        cache_meta = self.latent_cache_zarr["meta"]
-        if "image_backbone_feat" not in self.latent_cache_group:
+        if "frame_image_backbone_feat" not in self.latent_cache_group:
             raise KeyError(
-                "Latent cache missing data/image_backbone_feat. "
+                "Latent cache missing data/frame_image_backbone_feat (scheme A). "
                 "Rebuild with ./scripts/precompute.sh"
-            )
-        for key in ("window_anchor_times", "window_episode_ends", "window_episode_indices"):
-            if key not in cache_meta:
-                raise KeyError(
-                    f"Latent cache missing meta/{key}. Rebuild with ./scripts/precompute.sh"
-                )
-
-        cache_anchor = np.asarray(cache_meta["window_anchor_times"][:], dtype=np.int64)
-        cache_ep_end = np.asarray(cache_meta["window_episode_ends"][:], dtype=np.int64)
-        cache_ep_idx = np.asarray(cache_meta["window_episode_indices"][:], dtype=np.int64)
-        window_arr = np.asarray(self.windows, dtype=np.int64)
-        if len(cache_anchor) != len(window_arr):
-            raise ValueError(
-                f"Latent cache window count mismatch: cache={len(cache_anchor)} "
-                f"dataset={len(window_arr)}"
-            )
-        if not (
-            np.array_equal(cache_anchor, window_arr[:, 0])
-            and np.array_equal(cache_ep_end, window_arr[:, 1])
-            and np.array_equal(cache_ep_idx, window_arr[:, 2])
-        ):
-            raise ValueError(
-                "Latent cache windows do not match dataset windows. "
-                "Rebuild cache for the current data config."
             )
 
         cache_attrs = dict(getattr(self.latent_cache_zarr, "attrs", {}))
         self._validate_latent_cache_identity(cache_path, cache_attrs)
 
-        expected = {
-            "window_size": self.window_size,
-            "action_horizon": self.action_horizon,
-            "n_image_steps": self.n_image_steps,
-            "stride": self.stride,
-        }
-        for key, expected_value in expected.items():
-            actual = cache_attrs.get(key)
-            if actual is not None and int(actual) != int(expected_value):
-                raise ValueError(
-                    f"Latent cache attr mismatch for {key}: cache={actual}, dataset={expected_value}"
-                )
-
         cache_views = cache_attrs.get("camera_views")
-        if cache_views is not None:
-            cache_view_list = parse_cache_camera_views(str(cache_views))
-            latent_view_indices = cache_view_indices(self.camera_views, cache_view_list)
-            if cache_view_list != self.camera_views:
-                print(
-                    "[ZarrDataset] latent cache camera_views superset: "
-                    f"cache={list(cache_view_list)!r}, using={list(self.camera_views)!r}"
-                )
-        else:
-            latent_view_indices = camera_view_indices(self.camera_views)
+        if cache_views is None or not str(cache_views).strip():
+            raise KeyError(
+                f"Latent cache missing camera_views attrs at {cache_path}. "
+                "Rebuild with ./scripts/precompute.sh (scheme A)."
+            )
+        cache_view_list = parse_cache_camera_views(str(cache_views))
+        latent_view_indices = cache_view_indices(self.camera_views, cache_view_list)
+        if cache_view_list != self.camera_views:
+            print(
+                "[ZarrDataset] latent cache camera_views: "
+                f"cache={list(cache_view_list)!r}, using={list(self.camera_views)!r}, "
+                f"indices={list(latent_view_indices)}"
+            )
 
-        self.cached_image_backbone_feat = self.latent_cache_group["image_backbone_feat"]
-        cache_n_views = int(cache_attrs.get("n_image_views", self.cached_image_backbone_feat.shape[-2]))
+        frame_src = self.latent_cache_group["frame_image_backbone_feat"]
+        cache_n_views = int(cache_attrs.get("n_image_views", frame_src.shape[1]))
         if cache_n_views < self.n_image_views:
             raise ValueError(
                 f"Latent cache has fewer views ({cache_n_views}) than requested "
                 f"({self.n_image_views}). Rebuild cache."
             )
-        if cache_n_views != self.n_image_views:
-            print(
-                f"[ZarrDataset] slicing latent cache views {cache_n_views} -> {self.n_image_views}"
+
+        frame_count = self.ram_data[self.state_key].shape[0]
+        if int(frame_src.shape[0]) != frame_count:
+            raise ValueError(
+                "frame_image_backbone_feat frame count mismatch: "
+                f"cache={frame_src.shape[0]}, data={frame_count}"
             )
-        self.image_backbone_dim = int(cache_attrs.get("image_backbone_dim", self.cached_image_backbone_feat.shape[-1]))
-        print(
-            f"[ZarrDataset] preloading latent cache into RAM: {cache_path}, "
-            f"rows={self.cached_image_backbone_feat.shape[0]}, "
-            f"backbone_dim={self.image_backbone_dim}"
+
+        self.image_backbone_dim = int(cache_attrs.get("image_backbone_dim", frame_src.shape[-1]))
+        # Keep zarr group alive for on-demand gather (avoid full T×V×D RAM materialization).
+        self._frame_latent_view_indices = tuple(int(i) for i in latent_view_indices)
+        self.cached_frame_image_backbone_feat = frame_src
+        self.cached_image_backbone_feat = None
+        approx_gb = (
+            int(frame_src.shape[0])
+            * int(self.n_image_views)
+            * int(self.image_backbone_dim)
+            * 4
+            / (1024**3)
         )
-        feat_arr = np.asarray(self.cached_image_backbone_feat[:], dtype=np.float32)
-        if cache_n_views != self.n_image_views:
-            feat_arr = feat_arr[:, :, latent_view_indices, :]
-        feat_gb = feat_arr.nbytes / (1024**3)
-        self.cached_image_backbone_feat = feat_arr
-        self.latent_cache_zarr = None
+        print(
+            f"[ZarrDataset] frame latent cache mapped: {cache_path}, "
+            f"shape={tuple(frame_src.shape)}, using_views={self.n_image_views}, "
+            f"backbone_dim={self.image_backbone_dim}, approx_active_gb={approx_gb:.3f}"
+        )
         self.latent_cache_group = None
-        print(f"[ZarrDataset] latent cache RAM: shape={feat_arr.shape}, size={feat_gb:.3f} GB")
+
+    def _gather_frame_latent(self, indices) -> np.ndarray:
+        if self.cached_frame_image_backbone_feat is None:
+            raise RuntimeError(
+                "frame camera latent cache is not loaded; run ./scripts/precompute.sh"
+            )
+        idx = np.asarray(indices, dtype=np.int64)
+        feat = np.asarray(self.cached_frame_image_backbone_feat[idx], dtype=np.float32)
+        view_idx = getattr(self, "_frame_latent_view_indices", None)
+        if view_idx is None:
+            raise RuntimeError("frame latent view indices are not configured")
+        feat = feat[:, list(view_idx), :]
+        return feat
+
+    def get_camera_latent(self, idx: int) -> np.ndarray:
+        i0, i1 = self.image_range(idx)
+        feat = self._gather_frame_latent(np.arange(i0, i1, dtype=np.int64))
+        if feat.ndim == 2:
+            feat = feat[None, ...]
+        if feat.shape[0] != self.n_image_steps:
+            raise ValueError(
+                f"camera latent time mismatch: {feat.shape[0]} != {self.n_image_steps}"
+            )
+        if feat.shape[1] != self.n_image_views:
+            raise ValueError(
+                f"camera latent view mismatch: {feat.shape[1]} != {self.n_image_views}"
+            )
+        return feat
+
+    def get_memory_camera_latent(self, anchor_t: int, ep_idx: int) -> np.ndarray:
+        indices = self.memory_visual_indices(anchor_t, ep_idx)
+        feat = self._gather_frame_latent(indices)
+        if feat.shape[0] != len(self.memory_visual_offsets):
+            raise ValueError(
+                f"memory camera latent time mismatch: {feat.shape[0]} != {len(self.memory_visual_offsets)}"
+            )
+        if feat.shape[1] != self.n_image_views:
+            raise ValueError(
+                f"memory camera latent view mismatch: {feat.shape[1]} != {self.n_image_views}"
+            )
+        return feat
 
     def _precompute_normalized_actions(self) -> None:
         n = len(self.windows)
@@ -471,6 +513,41 @@ class ZarrDataset(Dataset):
                 windows.append((t, ep_end, ep_idx))
 
         return windows
+
+    def _build_memory_visual_offsets(self) -> np.ndarray:
+        n_tokens = max(1, int(np.ceil(self.memory_history_frames / self.memory_sample_stride)))
+        start = -self.memory_recent_frame - self.memory_sample_stride * (n_tokens - 1)
+        stop = -self.memory_recent_frame + 1
+        return np.arange(start, stop, self.memory_sample_stride, dtype=np.int64)
+
+    def _clamp_memory_indices(self, indices: np.ndarray, ep_idx: int) -> np.ndarray:
+        ep_start, ep_end = self.episode_bounds(ep_idx)
+        # pad_first: clamp out-of-episode indices to episode bounds.
+        return np.clip(indices, ep_start, ep_end - 1).astype(np.int64, copy=False)
+
+    def _memory_index_valid(self, raw_indices: np.ndarray, ep_idx: int) -> np.ndarray:
+        ep_start, ep_end = self.episode_bounds(ep_idx)
+        return ((raw_indices >= ep_start) & (raw_indices < ep_end)).astype(np.bool_)
+
+    def memory_visual_indices(self, anchor_t: int, ep_idx: int) -> np.ndarray:
+        raw = int(anchor_t) + self.memory_visual_offsets
+        return self._clamp_memory_indices(raw, ep_idx)
+
+    def memory_visual_valid(self, anchor_t: int, ep_idx: int) -> np.ndarray:
+        raw = int(anchor_t) + self.memory_visual_offsets
+        return self._memory_index_valid(raw, ep_idx)
+
+    def memory_state_indices(self, anchor_t: int, ep_idx: int) -> np.ndarray:
+        end = int(anchor_t) - self.memory_recent_frame + 1
+        start = end - self.memory_history_frames
+        raw = np.arange(start, end, dtype=np.int64)
+        return self._clamp_memory_indices(raw, ep_idx)
+
+    def memory_state_valid(self, anchor_t: int, ep_idx: int) -> np.ndarray:
+        end = int(anchor_t) - self.memory_recent_frame + 1
+        start = end - self.memory_history_frames
+        raw = np.arange(start, end, dtype=np.int64)
+        return self._memory_index_valid(raw, ep_idx)
 
     def _obs_window_indices(self, anchor_t: int, ep_idx: int) -> Tuple[int, int]:
         obs_start = int(anchor_t - self.window_size + 1)
@@ -536,21 +613,14 @@ class ZarrDataset(Dataset):
             return camera
         return np.asarray(camera[..., self._camera_channel_indices])
 
-    def get_camera_latent(self, idx: int) -> np.ndarray:
-        if self.cached_image_backbone_feat is None:
-            raise RuntimeError("camera latent cache is not loaded")
-        feat = np.asarray(self.cached_image_backbone_feat[int(idx)], dtype=np.float32)
-        if feat.ndim == 2:
-            feat = feat[None, ...]
-        if feat.shape[0] != self.n_image_steps:
+    def get_memory_state(self, anchor_t: int, ep_idx: int) -> np.ndarray:
+        indices = self.memory_state_indices(anchor_t, ep_idx)
+        state = self._slice_robot(self.ram_data[self.state_key][indices]).astype(np.float32, copy=False)
+        if state.shape[0] != self.memory_history_frames:
             raise ValueError(
-                f"camera latent time mismatch: {feat.shape[0]} != {self.n_image_steps}"
+                f"memory state length mismatch: {state.shape[0]} != {self.memory_history_frames}"
             )
-        if feat.shape[1] != self.n_image_views:
-            raise ValueError(
-                f"camera latent view mismatch: {feat.shape[1]} != {self.n_image_views}"
-            )
-        return feat
+        return state
 
     def get_tactile_raw(self, t0: int, t1: int) -> np.ndarray:
         if not self.use_tactile:
@@ -670,6 +740,28 @@ class ZarrDataset(Dataset):
                     f"(n_image_steps={self.n_image_steps}, n_image_views={self.n_image_views}, 3, H, W)"
                 )
             obs["image"] = image
+
+        if self.memory_enabled:
+            if not self.use_camera_latent:
+                raise RuntimeError(
+                    "data.memory.enabled=true currently requires data.use_camera_latent=true "
+                    "and a frame_backbone.zarr cache (./scripts/precompute.sh)."
+                )
+            memory_state_raw = self.get_memory_state(anchor_t, ep_idx)
+            memory_state = self.normalizer.normalize_state_np(memory_state_raw)
+            obs["memory_state"] = torch.from_numpy(memory_state.astype(np.float32))
+            obs["memory_image_backbone_feat"] = torch.from_numpy(
+                self.get_memory_camera_latent(anchor_t, ep_idx).astype(np.float32)
+            )
+            obs["memory_visual_offsets"] = torch.from_numpy(
+                self.memory_visual_offsets.astype(np.int64, copy=False)
+            )
+            obs["memory_visual_valid"] = torch.from_numpy(
+                self.memory_visual_valid(anchor_t, ep_idx)
+            )
+            obs["memory_state_valid"] = torch.from_numpy(
+                self.memory_state_valid(anchor_t, ep_idx)
+            )
 
         if self.use_tactile:
             tactile = self.normalizer.normalize_tactile_np(self.get_tactile(s0, s1))

@@ -14,16 +14,14 @@ Usage:
   ./scripts/train.sh [options]
 
 Options:
-  --config PATH   Config yaml (default: configs/config.yaml)
+  --config PATH   Config yaml (default: configs/train/config.yaml)
   --gpus IDS      CUDA_VISIBLE_DEVICES (default: 0)
-  --smoke         Use configs/smoke.yaml for a quick debug run
   -h, --help      Show this help
 
 Examples:
   ./scripts/train.sh
   ./scripts/train.sh --gpus 0
-  ./scripts/train.sh --config configs/config.yaml
-  ./scripts/train.sh --smoke
+  ./scripts/train.sh --config configs/train/smoke_mem.yaml
 
 Edit training hyperparameters in the config yaml (data, train, models, output, checkpoint).
 EOF
@@ -45,10 +43,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --gpus=*)
       GPUS="${1#*=}"
-      shift
-      ;;
-    --smoke)
-      CONFIG="configs/smoke.yaml"
       shift
       ;;
     -h|--help|help)

@@ -1,38 +1,41 @@
+# Smoke train only — shares full frame_backbone.zarr with configs/train/config.yaml.
+# Precompute is NOT truncated; run ./scripts/precompute.sh once, then this for short train.
 seed: 42
 runtime:
   device: cuda
 
 output:
-  root_dir: outputs/peel
-  run_name: peel_new_dit_h8_c32_v2_abs
+  root_dir: outputs/huanggua_office
+  run_name: huanggua_office_mem_unet_smoke
 
 data:
-  root_dir: /mnt/workspace/zyj/data/processed/peel/peel_new
-  # window
-  window_size: 8
+  root_dir: /mnt/workspace/zyj/data/processed/huanggua_office/huanggua_office_0720_2242
+  window_size: 16
   stride: 1
   n_image_steps: 1
-  action_horizon: 32
-  # robot
+  action_horizon: 64
   action_type: joint
-  action_representation: absolute
-  # tactile
+  action_representation: relative
   use_tactile: false
-  # camera (cache stores 3 views; 2-view configs slice)
   camera_views: ['left_wrist_0', 'right_wrist_0']
   image_size: 224
   image_as_uint8: true
   use_camera_latent: true
   latent_cache_root_dir: ${data.root_dir}/latent_cache/dinov2_s14
   camera_augmentation: false
-  # keys
   camera_key: camera
   tactile_key: tactile
   state_key: state_30hz
   action_key: action_30hz
+  max_windows: 512
   norm:
     output_range: [-1, 1]
-    max_windows: 50000
+    max_windows: 512
+  memory:
+    enabled: true
+    history_frames: 64
+    sample_stride: 4
+    recent_frame: 4
 
 models:
   fm:
@@ -48,10 +51,8 @@ models:
     tactile_temporal_pool: conv1d
     state_feat_dim: 256
     state_pool: flatten
-    action_horizon: 32
-    n_action_steps: 32
     diffusion_step_embed_dim: 256
-    velocity_model: dit
+    velocity_model: unet
     down_dims: [256, 512, 1024]
     kernel_size: 5
     n_groups: 8
@@ -60,24 +61,38 @@ models:
     dit_num_heads: 8
     dit_mlp_ratio: 4.0
     dit_dropout: 0.1
-    num_inference_steps: 16
+    num_inference_steps: 32
     solver: euler
+  memory:
+    method: fusion
+    injection: concat_global_cond
+    dim: 256
+    num_queries: 3
+    visual_heads: 4
+    state_hidden_dim: 64
+    state_layers: 2
+    state_heads: 4
+    dropout: 0.1
+    cross_attn_layers: [3, 7, 11]
+    visual_layers: 2
+    state_channels: 128
+    state_mem_dim: 64
 
 train:
-  batch_size: 512
+  batch_size: 128
   num_workers: 8
   drop_last: true
   pin_memory: true
   persistent_workers: true
-  prefetch_factor: 4
-  epochs: 256
+  prefetch_factor: 2
+  epochs: 1
   grad_clip: 1.0
   use_amp: false
-  open_loop_test_every: 256
-  open_loop_test_max_batches: 16
-  plot_samples: 64
+  open_loop_test_every: 999999
+  open_loop_test_max_batches: 1
+  plot_samples: 8
   plot_dims: auto
-  max_train_batches: null
+  max_train_batches: 3
   resume_path: null
   optimizer:
     lr: 1.0e-4
@@ -85,12 +100,11 @@ train:
     weight_decay: 1.0e-4
 
 checkpoint:
-  save_every: 50
+  save_every: 999999
 
 precompute:
-  batch_size: 512
+  batch_size: 256
   device: cuda
-  max_windows: null
   overwrite: false
   output_path: null
 

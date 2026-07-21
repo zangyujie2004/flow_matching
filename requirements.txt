@@ -19,5 +19,5 @@ tensorboard>=2.14.0
 matplotlib>=3.7.0
 opencv-python>=4.8.0
 
-# Optional: pytest for datasets/test, models/fm/tests
+# Optional: pytest for tests/
 # pytest>=7.4.0

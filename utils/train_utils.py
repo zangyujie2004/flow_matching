@@ -26,6 +26,45 @@ def set_seed(seed: int = 42) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 
+def sync_fm_action_horizon_from_data(
+    fm_cfg: Mapping[str, Any],
+    data_cfg: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Single source of truth: ``data.action_horizon`` (and optional ``data.n_action_steps``).
+
+    Injects into a copy of ``models.fm`` so Dataset and Policy stay aligned.
+    Legacy resolved configs that only set ``models.fm.action_horizon`` still work.
+    """
+    resolved = dict(fm_cfg)
+    if "action_horizon" in data_cfg and data_cfg["action_horizon"] is not None:
+        horizon = int(data_cfg["action_horizon"])
+    elif "action_horizon" in resolved and resolved["action_horizon"] is not None:
+        horizon = int(resolved["action_horizon"])
+    else:
+        horizon = 32
+    if horizon < 1:
+        raise ValueError(f"action_horizon must be >= 1, got {horizon}")
+
+    if "n_action_steps" in data_cfg and data_cfg["n_action_steps"] is not None:
+        n_steps = int(data_cfg["n_action_steps"])
+    elif "action_horizon" not in data_cfg and resolved.get("n_action_steps") is not None:
+        # Legacy resolved_config: horizon lived only under models.fm
+        n_steps = int(resolved["n_action_steps"])
+    else:
+        n_steps = horizon
+
+    if n_steps < 1:
+        raise ValueError(f"n_action_steps must be >= 1, got {n_steps}")
+    if n_steps > horizon:
+        raise ValueError(
+            f"n_action_steps ({n_steps}) cannot exceed action_horizon ({horizon})"
+        )
+
+    resolved["action_horizon"] = horizon
+    resolved["n_action_steps"] = n_steps
+    return resolved
+
+
 def _get_by_path(cfg: Mapping[str, Any], path: str, default: Any = _MISSING) -> Any:
     cur: Any = cfg
     for part in path.split("."):

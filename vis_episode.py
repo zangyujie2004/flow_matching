@@ -30,7 +30,7 @@ from tools.normalizer import DatasetNormalizer
 from trainers.eval_open_loop import parse_dims, plot_action_curves
 from trainers.policy_trainer import load_checkpoint
 from utils.tensor import move_to_device
-from utils.train_utils import cfg_get, set_seed
+from utils.train_utils import cfg_get, set_seed, sync_fm_action_horizon_from_data
 
 # preprocess/export/layout.py: ("base_0", "left_wrist_0", "right_wrist_0")
 MAIN_CAMERA_VIEW_INDEX = 1
@@ -53,10 +53,13 @@ def build_dataset(cfg: dict) -> ZarrDataset:
 
 def build_policy_from_cfg(cfg: dict, device: torch.device, dataset: ZarrDataset) -> FlowMatchingPolicy:
     data_cfg = cfg["data"]
-    fm_cfg = dict(cfg["models"]["fm"])
+    fm_cfg = sync_fm_action_horizon_from_data(cfg["models"]["fm"], data_cfg)
     fm_cfg["use_tactile"] = bool(data_cfg.get("use_tactile", True))
+    cfg_for_build = dict(cfg)
+    cfg_for_build["models"] = dict(cfg["models"])
+    cfg_for_build["models"]["fm"] = fm_cfg
     return build_flow_policy(
-        {"models": {"fm": fm_cfg}},
+        cfg_for_build,
         action_dim=dataset.action_dim,
         state_dim=dataset.action_dim,
         cond_steps=dataset.window_size,

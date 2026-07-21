@@ -3,16 +3,16 @@ runtime:
   device: cuda
 
 output:
-  root_dir: outputs/peel
-  run_name: peel_new_unet_h8_c32_v2_rel
+  root_dir: outputs/huanggua_office
+  run_name: huanggua_office_mem_unet
 
 data:
-  root_dir: /mnt/workspace/zyj/data/processed/peel/peel_new
+  root_dir: /mnt/workspace/zyj/data/processed/huanggua_office/huanggua_office_0720_2242
   # window
-  window_size: 8
+  window_size: 16
   stride: 1
   n_image_steps: 1
-  action_horizon: 32
+  action_horizon: 64
   # robot
   action_type: joint
   action_representation: relative
@@ -24,15 +24,23 @@ data:
   image_as_uint8: true
   use_camera_latent: true
   latent_cache_root_dir: ${data.root_dir}/latent_cache/dinov2_s14
-  camera_augmentation: false   # true = photometric aug; forces use_camera_latent=false
+  camera_augmentation: false  
   # keys
   camera_key: camera
   tactile_key: tactile
   state_key: state_30hz
   action_key: action_30hz
+  # norm
   norm:
     output_range: [-1, 1]
     max_windows: 50000
+  # memory
+  memory:
+    enabled: true
+    history_frames: 64
+    sample_stride: 4
+    recent_frame: 4   # n=t-n
+
 models:
   fm:
     cond_dim: 256
@@ -49,8 +57,6 @@ models:
     tactile_temporal_pool: conv1d   # mean | conv1d
     state_feat_dim: 256
     state_pool: flatten           
-    action_horizon: 32
-    n_action_steps: 32
     diffusion_step_embed_dim: 256
     velocity_model: unet  # unet | dit
     # unet config
@@ -64,8 +70,24 @@ models:
     dit_mlp_ratio: 4.0
     dit_dropout: 0.1
     # common config
-    num_inference_steps: 16
-    solver: euler    
+    num_inference_steps: 32
+    solver: euler 
+  memory:
+    method: fusion # fusion | multi-scale
+    injection: concat_global_cond # cross_attn | concat_global_cond
+    # multi-scale
+    dim: 256
+    num_queries: 3
+    visual_heads: 4
+    state_hidden_dim: 64
+    state_layers: 2
+    state_heads: 4
+    dropout: 0.1
+    cross_attn_layers: [3, 7, 11]
+    # fusion
+    visual_layers: 2
+    state_channels: 128
+    state_mem_dim: 64
 
 train:
   batch_size: 512
@@ -92,12 +114,11 @@ checkpoint:
   save_every: 200
 
 precompute:
-  batch_size: 512
+  batch_size: 1024
   device: cuda
-  max_windows: null
-  overwrite: true
+  overwrite: false
   output_path: null  
 
 deploy:
-  action_process: abs_qpos #abs_qpos
+  action_process: abs_qpos # abs_qpos
   action_hz: 30.0

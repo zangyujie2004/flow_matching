@@ -10,7 +10,7 @@ import yaml
 
 from models.fm import FlowMatchingPolicy, build_flow_policy
 from tools.normalizer import DatasetNormalizer
-from utils.train_utils import cfg_get
+from utils.train_utils import cfg_get, sync_fm_action_horizon_from_data
 
 ACTION_DIMS = {"joint": 14, "eef": 20}
 DEFAULT_NUM_INFERENCE_STEPS = 16
@@ -105,12 +105,15 @@ def build_policy_from_cfg(
     policy_state_dict: Mapping[str, Any] | None = None,
 ) -> FlowMatchingPolicy:
     data_cfg = cfg["data"]
-    fm_cfg = dict(cfg["models"]["fm"])
+    fm_cfg = sync_fm_action_horizon_from_data(cfg["models"]["fm"], data_cfg)
     if match_training:
         fm_cfg["use_tactile"] = bool(data_cfg.get("use_tactile", fm_cfg.get("use_tactile", True)))
     fm_cfg = resolve_fm_cfg_for_inference(fm_cfg, policy_state_dict)
+    cfg_for_build = dict(cfg)
+    cfg_for_build["models"] = dict(cfg["models"])
+    cfg_for_build["models"]["fm"] = fm_cfg
     return build_flow_policy(
-        {"models": {"fm": fm_cfg}},
+        cfg_for_build,
         action_dim=action_dim_for_config(cfg),
         state_dim=action_dim_for_config(cfg),
         cond_steps=int(data_cfg["window_size"]),

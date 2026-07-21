@@ -7,6 +7,7 @@ __pycache__/
 .venv/
 venv/
 **/policy_latent_cache.zarr/
+**/frame_backbone.zarr/
 *.pt
 *.pth
 *.ckpt
@@ -19,3 +20,4 @@ outputs/**/*.pt
 /workload/
 /pretrained_weights/
 _reference/
+/tests/
