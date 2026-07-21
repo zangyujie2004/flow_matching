@@ -17,10 +17,11 @@ from infer.config import (
     policy_config_from_checkpoint_state,
 )
 from infer.postprocess import apply_action_process
-from infer.preprocess import build_obs_from_frames, parse_preprocess_config
+from infer.preprocess import build_dino_images, build_obs_from_frames, parse_preprocess_config
 from infer.tensor import as_float32_array, default_tactile_norm, numpy_obs_to_torch
 from infer.types import InferenceChunk, PreprocessConfig
 from tools.normalizer import DatasetNormalizer
+from tools.async_dino_buffer import AsyncDinoBuffer
 from utils.train_utils import cfg_get
 
 _IDENTITY_ROT6D = np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32)
@@ -81,6 +82,8 @@ class FMInferenceRuntime:
         self.num_inference_steps = int(fm_cfg.get("num_inference_steps", DEFAULT_NUM_INFERENCE_STEPS))
         self.solver = str(fm_cfg.get("solver", DEFAULT_SOLVER))
         self.velocity_model = str(self.policy.velocity_model)
+        self.async_dino_buffer: AsyncDinoBuffer | None = None
+        self.async_dino_preprocess: PreprocessConfig | None = None
 
         if warmup:
             self._warmup()
@@ -185,6 +188,47 @@ class FMInferenceRuntime:
             self.predict_rot6d_abs(obs, state_raw=state_raw)
         elapsed_ms = (time.perf_counter() - start) * 1000.0 / repeats
         return {"infer_ms": float(elapsed_ms), "repeats": float(repeats)}
+
+    def start_async_dino(
+        self,
+        *,
+        preprocess: PreprocessConfig | None = None,
+        sample_interval_frames: int = 4,
+        deadline_ms: float = 132.0,
+    ) -> AsyncDinoBuffer:
+        """Start a simple two- or three-camera DINO buffer."""
+
+        if self.async_dino_buffer is not None:
+            self.async_dino_buffer.stop()
+        self.async_dino_preprocess = preprocess or parse_preprocess_config(self.cfg)
+        dino_model = self.policy.condition_encoder.image_encoder.encoder
+        self.async_dino_buffer = AsyncDinoBuffer(
+            dino_model=dino_model,
+            device=str(self.device),
+            sample_interval_frames=sample_interval_frames,
+            deadline_ms=deadline_ms,
+        )
+        self.async_dino_buffer.start()
+        return self.async_dino_buffer
+
+    def submit_async_dino_frame(
+        self,
+        frame_id: int,
+        frame: Any,
+        capture_time: float | None = None,
+    ) -> bool:
+        """Submit one synchronized infer frame at the camera frame rate."""
+
+        if self.async_dino_buffer is None or self.async_dino_preprocess is None:
+            raise RuntimeError("call start_async_dino() first")
+        images = build_dino_images(frame, self.async_dino_preprocess)
+        return self.async_dino_buffer.submit_frame(
+            frame_id, *images, capture_time=capture_time
+        )
+
+    def stop_async_dino(self) -> None:
+        if self.async_dino_buffer is not None:
+            self.async_dino_buffer.stop()
 
     def infer_from_window(
         self,

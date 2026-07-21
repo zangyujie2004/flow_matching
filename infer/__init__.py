@@ -25,7 +25,7 @@ from infer.config import (
     resolve_fm_cfg_for_inference,
 )
 from infer.postprocess import apply_action_process, eef_rot6d_abs_to_rpy_abs, rot6d_to_rpy
-from infer.preprocess import build_obs_from_frames, parse_preprocess_config
+from infer.preprocess import build_dino_images, build_obs_from_frames, parse_preprocess_config
 from infer.runtime import FMInferenceRuntime, random_smoke_obs
 from infer.tensor import numpy_obs_to_torch
 from infer.types import InferenceChunk, PreprocessConfig
@@ -43,6 +43,7 @@ __all__ = [
     "action_dim_for_config",
     "apply_action_process",
     "build_obs_from_frames",
+    "build_dino_images",
     "build_policy_from_cfg",
     "eef_rot6d_abs_to_rpy_abs",
     "infer_velocity_model_from_state_dict",

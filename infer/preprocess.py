@@ -345,6 +345,27 @@ def ros_image_to_rgb(msg: Any) -> np.ndarray:
         return image[:, :, 2::-1].copy()
     raise ValueError(f"unsupported RGB image encoding {msg.encoding!r}")
 
+
+def build_dino_images(frame: Any, cfg: PreprocessConfig) -> list[torch.Tensor]:
+    """Convert the configured two or three camera images to NCHW uint8 tensors."""
+
+    if len(cfg.camera_views) not in {2, 3}:
+        raise ValueError("Async DINO needs two or three camera views")
+    samples = _frame_samples(frame)
+    images = []
+    for name in cfg.camera_views:
+        if name not in samples:
+            raise KeyError(f"frame missing camera stream {name!r}")
+        sample = samples[name]
+        if hasattr(sample, "data"):
+            rgb = np.asarray(sample.data, dtype=np.uint8)
+        else:
+            rgb = ros_image_to_rgb(sample.msg)
+        resized = resize_rgb_like_training(rgb, cfg.image_size)
+        image = torch.from_numpy(np.ascontiguousarray(resized.transpose(2, 0, 1)))
+        images.append(image.unsqueeze(0))
+    return images
+
 def build_obs_from_frames(
     frames: Sequence[Any],
     cfg: PreprocessConfig,
