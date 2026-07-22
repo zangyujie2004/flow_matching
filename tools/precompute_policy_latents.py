@@ -18,9 +18,11 @@ if str(_POLICY_ROOT) not in sys.path:
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 from datasets import ZarrDataset  # noqa: E402
-from models.fm.encoders.dino_v2 import DinoV2SmallEncoder  # noqa: E402
+from models.fm.encoders.dino_v2 import DinoV2SmallEncoder, resolve_dino_model_name  # noqa: E402
 from tools.latent_cache import (  # noqa: E402
+    DINOV2_NUM_TOKENS,
     FRAME_CACHE_VERSION,
+    apply_resolved_latent_cache_root_dir,
     frame_cache_matches,
     resolve_frame_backbone_zarr_path,
     write_latent_cache_identity_attrs,
@@ -46,6 +48,7 @@ def build_dataset(cfg: dict) -> ZarrDataset:
 def resolve_output_path_from_cfg(cfg: dict, output_path: str | None = None) -> str:
     if output_path:
         return str(output_path)
+    cfg = apply_resolved_latent_cache_root_dir(dict(cfg))
     root = cfg_get(cfg, "data.latent_cache_root_dir", None) or cfg_get(cfg, "data.root_dir")
     if root is None:
         raise KeyError("data.root_dir is required to resolve precompute output path")
@@ -65,6 +68,7 @@ def build_frame_image_batch(dataset: ZarrDataset, frame_indices: list[int]) -> t
 
 def precompute_image_latents(cfg: dict, *, force: bool = False) -> str:
     """Write frame-only DINO backbone cache (scheme A). Independent of train windows."""
+    cfg = apply_resolved_latent_cache_root_dir(dict(cfg))
     pre_cfg = dict(cfg.get("precompute", {}))
     output_path = resolve_output_path_from_cfg(cfg, pre_cfg.get("output_path"))
     # yaml overwrite=true kept as force alias for backward compat
@@ -72,9 +76,15 @@ def precompute_image_latents(cfg: dict, *, force: bool = False) -> str:
 
     batch_size = max(1, int(pre_cfg.get("batch_size", 256)))
     device = torch.device(str(pre_cfg.get("device", cfg_get(cfg, "runtime.device", "cuda"))))
-    fm_cfg = cfg["models"]["fm"]
+    fm_cfg = dict(cfg["models"]["fm"])
     if not bool(fm_cfg.get("freeze_image_encoder", True)):
         raise ValueError("Precompute requires models.fm.freeze_image_encoder=true.")
+
+    model_name = resolve_dino_model_name(
+        fm_cfg.get("image_encoder_name"),
+        fm_cfg.get("dino_model_name"),
+    )
+    fm_cfg["dino_model_name"] = model_name
 
     dataset = build_dataset(cfg)
     total_frames = int(dataset.ram_data[dataset.camera_key].shape[0])
@@ -106,7 +116,7 @@ def precompute_image_latents(cfg: dict, *, force: bool = False) -> str:
         out_dim=int(fm_cfg.get("image_feat_dim", 256)),
         pretrained=bool(fm_cfg.get("image_pretrained", True)),
         freeze=True,
-        model_name=str(fm_cfg.get("dino_model_name", "vit_small_patch14_dinov2.lvd142m")),
+        model_name=model_name,
     ).to(device)
     image_encoder.eval()
 
@@ -116,6 +126,7 @@ def precompute_image_latents(cfg: dict, *, force: bool = False) -> str:
     out_root.attrs["image_size"] = int(dataset.image_size)
     out_root.attrs["color_order"] = "rgb"
     out_root.attrs["frame_image_selection"] = "all_frames"
+    out_root.attrs["image_num_tokens"] = int(DINOV2_NUM_TOKENS)
     write_latent_cache_identity_attrs(out_root, fm_cfg)
     out_root.attrs["camera_views"] = ",".join(dataset.camera_views)
 
@@ -123,11 +134,13 @@ def precompute_image_latents(cfg: dict, *, force: bool = False) -> str:
     # empty meta group kept for zarr layout stability
     out_root.create_group("meta")
 
-    chunk_bsz = max(1, min(batch_size, 1024))
+    # Token cache is large (T,V,257,D); keep chunks modest for OSS/CPFS writes.
+    chunk_bsz = max(1, min(batch_size, 64))
     frame_arr = None
     print(
         f"[precompute] encoding all frames: T={total_frames}, views={list(dataset.camera_views)}, "
-        f"batch_size={batch_size}, device={device}"
+        f"model={model_name}, tokens={DINOV2_NUM_TOKENS}, "
+        f"batch_size={batch_size}, device={device}, out={output_path}"
     )
 
     for start_idx in tqdm(
@@ -141,7 +154,8 @@ def precompute_image_latents(cfg: dict, *, force: bool = False) -> str:
         with torch.inference_mode():
             bsz, num_views = image_batch.shape[:2]
             flat = image_batch.reshape(bsz * num_views, *image_batch.shape[2:])
-            image_feat = image_encoder.extract_backbone_feat(flat).reshape(bsz, num_views, -1)
+            tokens = image_encoder.extract_backbone_feat(flat)  # (B*V, 257, D)
+            image_feat = tokens.reshape(bsz, num_views, tokens.shape[1], tokens.shape[2])
 
         img = image_feat.detach().cpu().numpy().astype(np.float32, copy=False)
         if frame_arr is None:
@@ -153,6 +167,7 @@ def precompute_image_latents(cfg: dict, *, force: bool = False) -> str:
             )
             out_root.attrs["image_backbone_dim"] = int(img.shape[-1])
             out_root.attrs["n_image_views"] = int(img.shape[1])
+            out_root.attrs["image_num_tokens"] = int(img.shape[2])
         frame_arr[start_idx : start_idx + len(frame_indices)] = img
 
     if frame_arr is None:
@@ -161,7 +176,8 @@ def precompute_image_latents(cfg: dict, *, force: bool = False) -> str:
     print(f"[precompute] saved frame backbone cache: {output_path}")
     print(
         f"[precompute] frame_image_backbone_feat shape=({total_frames}, "
-        f"{out_root.attrs['n_image_views']}, {out_root.attrs['image_backbone_dim']})"
+        f"{out_root.attrs['n_image_views']}, {out_root.attrs['image_num_tokens']}, "
+        f"{out_root.attrs['image_backbone_dim']})"
     )
     return output_path
 
@@ -192,6 +208,7 @@ def main() -> None:
         cfg = resolve_full_config(config_path, policy_root=_POLICY_ROOT)
     else:
         cfg = load_config(str(config_path))
+    cfg = apply_resolved_latent_cache_root_dir(cfg)
     precompute_image_latents(cfg, force=bool(args.force))
 
 

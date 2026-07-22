@@ -5,9 +5,20 @@ from typing import Mapping
 import torch
 import torch.nn as nn
 
-from .encoders.dino_v2 import DinoV2Encoder
+from .encoders.dino_v2 import DinoV2Encoder, resolve_dino_model_name
 from .encoders.state_mlp import StateMLP
 from .encoders.tactile_cnn import TactileCNNEncoder
+
+
+def _normalize_image_encoder_name(name: str | None) -> str:
+    key = str(name or "").strip().lower()
+    if key in {"dinov2_base", "dinov2-base", "dino_base", "dinobase"}:
+        return "dinov2_base"
+    if key in {"dinov2_small", "dinov2-small", "dino_small", "dino", "dinov2"}:
+        return "dinov2"
+    if not key:
+        return "dinov2"
+    return key
 
 
 class ConditionEncoder(nn.Module):
@@ -22,11 +33,15 @@ class ConditionEncoder(nn.Module):
         use_tactile: bool = True,
         tactile_channels: int = 12,
         image_encoder_name: str = "dinov2",
-        dino_model_name: str = "vit_small_patch14_dinov2.lvd142m",
+        dino_model_name: str | None = None,
         freeze_image_encoder: bool = True,
         image_pretrained: bool = True,
         image_feat_dim: int = 256,
         n_image_views: int = 3,
+        view_pool: str = "global_concat",
+        local_pool_size: int = 2,
+        local_attn_heads: int = 4,
+        local_attn_dropout: float = 0.0,
         tactile_feat_dim: int = 256,
         tactile_temporal_pool: str = "conv1d",
         state_feat_dim: int = 256,
@@ -38,16 +53,21 @@ class ConditionEncoder(nn.Module):
         self.use_tactile = bool(use_tactile)
         self.cond_dim = int(cond_dim)
 
-        image_encoder_name = image_encoder_name.lower()
-        if image_encoder_name not in {"dinov2_small", "dinov2-small", "dino_small", "dino", "dinov2"}:
+        enc_name = _normalize_image_encoder_name(image_encoder_name)
+        if enc_name not in {"dinov2", "dinov2_base"}:
             raise ValueError(f"unsupported image_encoder_name={image_encoder_name!r}")
+        model_name = resolve_dino_model_name(enc_name, dino_model_name)
 
         self.image_encoder = DinoV2Encoder(
             out_dim=image_feat_dim,
             n_views=n_image_views,
+            view_pool=str(view_pool),
+            local_pool_size=int(local_pool_size),
+            local_attn_heads=int(local_attn_heads),
+            local_attn_dropout=float(local_attn_dropout),
             pretrained=image_pretrained,
             freeze=freeze_image_encoder,
-            model_name=dino_model_name,
+            model_name=model_name,
         )
 
         self.tactile_encoder = None

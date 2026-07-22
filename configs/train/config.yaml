@@ -7,9 +7,9 @@ output:
   run_name: huanggua_office_mem_unet
 
 data:
-  root_dir: /mnt/workspace/zyj/data/processed/huanggua_office/huanggua_office_0720_2242
+  root_dir: /mnt/workspace/zyj/data/processed/panzi/panzi_0720_1524_suceess
   # window
-  window_size: 16
+  window_size: 8
   stride: 1
   n_image_steps: 1
   action_horizon: 64
@@ -23,7 +23,7 @@ data:
   image_size: 224
   image_as_uint8: true
   use_camera_latent: true
-  latent_cache_root_dir: ${data.root_dir}/latent_cache/dinov2_s14
+  latent_cache_root_dir: ${data.root_dir}/latent_cache/{auto}
   camera_augmentation: false  
   # keys
   camera_key: camera
@@ -46,11 +46,15 @@ models:
     cond_dim: 256
     # vision — DINOv2 (timm)
     n_image_views: 2
-    image_encoder_name: dinov2
-    dino_model_name: vit_small_patch14_dinov2.lvd142m
+    image_encoder_name: dinov2_base
+    dino_model_name: vit_base_patch14_dinov2.lvd142m  # vit_small_patch14_dinov2.lvd142m
     freeze_image_encoder: true
     image_pretrained: true
     image_feat_dim: 256
+    view_pool: local_attn  # global_concat | local_pool | local_attn
+    local_pool_size: 2
+    local_attn_heads: 4
+    local_attn_dropout: 0.1
     # tactile CNN
     use_tactile: false
     tactile_feat_dim: 256

@@ -6,13 +6,83 @@ from typing import Any, Mapping
 FRAME_CACHE_BASENAME = "frame_backbone.zarr"
 LEGACY_CACHE_BASENAME = "policy_latent_cache.zarr"
 LATENT_CACHE_BASENAME = FRAME_CACHE_BASENAME  # preferred write/read name
-DEFAULT_CACHE_SUBDIR = os.path.join("latent_cache", "dinov2_s14")
 DEFAULT_DINOV2_MODEL = "vit_small_patch14_dinov2.lvd142m"
-FRAME_CACHE_VERSION = 2
+DINOV2_BASE_MODEL = "vit_base_patch14_dinov2.lvd142m"
+# v3: store full forward_features tokens (T, V, 257, D) instead of CLS-only (T, V, D)
+FRAME_CACHE_VERSION = 3
+DINOV2_NUM_TOKENS = 257
+CACHE_SUBDIR_SMALL = "dinov2_s14"
+CACHE_SUBDIR_BASE = "dinov2_b14"
+DEFAULT_CACHE_SUBDIR = os.path.join("latent_cache", CACHE_SUBDIR_SMALL)
 
 
-def default_latent_cache_root_dir(data_root: str) -> str:
-    return os.path.join(str(data_root), "latent_cache", "dinov2_s14")
+def normalize_image_encoder_name(name: str | None) -> str:
+    key = str(name or "").strip().lower()
+    if key in {"dinov2_base", "dinov2-base", "dino_base", "dinobase"}:
+        return "dinov2_base"
+    if key in {"dinov2_small", "dinov2-small", "dino_small", "dino", "dinov2"}:
+        return "dinov2"
+    if not key:
+        return "dinov2"
+    return key
+
+
+def cache_subdir_for_vision(
+    *,
+    image_encoder_name: str | None = None,
+    dino_model_name: str | None = None,
+) -> str:
+    """latent_cache/{dinov2_s14|dinov2_b14} depending on small vs base."""
+    enc = normalize_image_encoder_name(image_encoder_name)
+    model = str(dino_model_name or "").lower()
+    if enc == "dinov2_base" or "base" in model:
+        return CACHE_SUBDIR_BASE
+    return CACHE_SUBDIR_SMALL
+
+
+def default_latent_cache_root_dir(
+    data_root: str,
+    *,
+    image_encoder_name: str | None = None,
+    dino_model_name: str | None = None,
+    fm_cfg: Mapping[str, Any] | None = None,
+) -> str:
+    if fm_cfg is not None:
+        image_encoder_name = image_encoder_name or fm_cfg.get("image_encoder_name")
+        dino_model_name = dino_model_name or fm_cfg.get("dino_model_name")
+    subdir = cache_subdir_for_vision(
+        image_encoder_name=image_encoder_name,
+        dino_model_name=dino_model_name,
+    )
+    return os.path.join(str(data_root), "latent_cache", subdir)
+
+
+def resolve_latent_cache_root_dir(cfg: Mapping[str, Any]) -> str:
+    """Resolve data.latent_cache_root_dir; auto-fill from small/base when missing/placeholder."""
+    data = cfg.get("data") or {}
+    fm = (cfg.get("models") or {}).get("fm") or {}
+    root = data.get("root_dir")
+    if root is None:
+        raise KeyError("data.root_dir is required to resolve latent_cache_root_dir")
+
+    current = data.get("latent_cache_root_dir")
+    auto = default_latent_cache_root_dir(str(root), fm_cfg=fm)
+    if current is None or str(current).strip() == "":
+        return auto
+
+    text = str(current)
+    # Placeholders: {auto}, {dinov2_s14}, {dinov2_b14}, or literal braces typos
+    if "{auto}" in text or "{dinov2_s14}" in text or "{dinov2_b14}" in text or "{dinov2" in text:
+        return auto
+    return text
+
+
+def apply_resolved_latent_cache_root_dir(cfg: dict[str, Any]) -> dict[str, Any]:
+    """In-place set data.latent_cache_root_dir from vision encoder (small/base)."""
+    data = dict(cfg.get("data") or {})
+    data["latent_cache_root_dir"] = resolve_latent_cache_root_dir(cfg)
+    cfg["data"] = data
+    return cfg
 
 
 def resolve_frame_backbone_zarr_path(cache_root_dir: str) -> str:
@@ -32,21 +102,14 @@ def resolve_latent_cache_zarr_path(cache_root_dir: str) -> str:
     return frame_path
 
 
-def normalize_image_encoder_name(name: str | None) -> str:
-    key = str(name or "").strip().lower()
-    if key in {"dinov2_small", "dinov2-small", "dino_small", "dino", "dinov2"}:
-        return "dinov2"
-    if not key:
-        return "dinov2"
-    return key
-
-
 def expected_cache_identity(fm_cfg: Mapping[str, Any]) -> dict[str, str]:
+    enc = normalize_image_encoder_name(fm_cfg.get("image_encoder_name", "dinov2"))
+    model = str(fm_cfg.get("dino_model_name") or "")
+    if not model:
+        model = DINOV2_BASE_MODEL if enc == "dinov2_base" else DEFAULT_DINOV2_MODEL
     return {
-        "image_encoder_name": normalize_image_encoder_name(
-            fm_cfg.get("image_encoder_name", "dinov2")
-        ),
-        "image_model_name": str(fm_cfg.get("dino_model_name", DEFAULT_DINOV2_MODEL)),
+        "image_encoder_name": enc,
+        "image_model_name": model,
     }
 
 
@@ -54,7 +117,7 @@ def cache_identity_from_attrs(attrs: Mapping[str, Any]) -> dict[str, str]:
     model_name = attrs.get("image_model_name") or attrs.get("dino_model_name")
     encoder_name = attrs.get("image_encoder_name")
     if encoder_name is None and model_name:
-        encoder_name = "dinov2"
+        encoder_name = "dinov2_base" if "base" in str(model_name).lower() else "dinov2"
     return {
         "image_encoder_name": normalize_image_encoder_name(str(encoder_name or "")),
         "image_model_name": str(model_name or ""),
@@ -146,5 +209,8 @@ def frame_cache_matches(
         return False
     feat = root["data"]["frame_image_backbone_feat"]
     if int(feat.shape[0]) != int(total_frames):
+        return False
+    # v3+: (T, V, 257, D)
+    if len(feat.shape) != 4 or int(feat.shape[2]) != int(DINOV2_NUM_TOKENS):
         return False
     return True

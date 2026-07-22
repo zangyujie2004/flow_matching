@@ -36,9 +36,12 @@ def build_dataset_and_loader(cfg: dict) -> tuple[ZarrDataset, DataLoader]:
     fm_cfg = dict(cfg.get("models", {}).get("fm", {}))
     data_cfg = dict(data_cfg)
     if bool(data_cfg.get("use_camera_latent", False)):
+        from models.fm.encoders.dino_v2 import resolve_dino_model_name
+
         data_cfg["latent_cache_image_encoder_name"] = fm_cfg.get("image_encoder_name", "dinov2")
-        data_cfg["latent_cache_image_model_name"] = fm_cfg.get(
-            "dino_model_name", "vit_small_patch14_dinov2.lvd142m"
+        data_cfg["latent_cache_image_model_name"] = resolve_dino_model_name(
+            fm_cfg.get("image_encoder_name"),
+            fm_cfg.get("dino_model_name"),
         )
     train_cfg = cfg["train"]
     dataset = ZarrDataset.from_config(data_cfg)

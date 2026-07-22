@@ -405,9 +405,18 @@ class ZarrDataset(Dataset):
         self.image_backbone_dim = int(cache_attrs.get("image_backbone_dim", frame_src.shape[-1]))
         # Materialize full frame cache into RAM so DataLoader workers avoid zarr I/O.
         frame = np.asarray(frame_src[:], dtype=np.float32)
+        if frame.ndim == 3:
+            raise ValueError(
+                f"Latent cache at {cache_path} is CLS-only shape {tuple(frame.shape)}. "
+                "Rebuild with ./scripts/precompute.sh (expects T,V,257,D)."
+            )
+        if frame.ndim != 4:
+            raise ValueError(
+                f"Unexpected frame_image_backbone_feat ndim={frame.ndim}, shape={tuple(frame.shape)}"
+            )
         view_idx = [int(i) for i in latent_view_indices]
         if view_idx != list(range(int(frame.shape[1]))):
-            frame = np.ascontiguousarray(frame[:, view_idx, :])
+            frame = np.ascontiguousarray(frame[:, view_idx])
         self._frame_latent_view_indices = tuple(range(int(frame.shape[1])))
         self.cached_frame_image_backbone_feat = frame
         self.cached_image_backbone_feat = None

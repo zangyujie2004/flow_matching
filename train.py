@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from trainers.policy_trainer import main as train_main
+from tools.latent_cache import apply_resolved_latent_cache_root_dir
 from utils.train_utils import load_config
 
 
@@ -23,6 +24,7 @@ def main() -> None:
         config_path = policy_root / config_path
 
     cfg = load_config(str(config_path))
+    cfg = apply_resolved_latent_cache_root_dir(cfg)
     train_main(cfg)
 
 
