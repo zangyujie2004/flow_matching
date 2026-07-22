@@ -19,7 +19,7 @@ data:
   # tatile
   use_tactile: false
   # camera
-  camera_views: ['left_wrist_0', 'right_wrist_0'] # ['base_0', 'left_wrist_0', 'right_wrist_0']
+  camera_views: ['base_0', 'left_wrist_0', 'right_wrist_0']
   image_size: 224
   image_as_uint8: true
   use_camera_latent: true
@@ -45,7 +45,7 @@ models:
   fm:
     cond_dim: 256
     # vision — DINOv2 (timm)
-    n_image_views: 2
+    n_image_views: 3
     image_encoder_name: dinov2
     dino_model_name: vit_small_patch14_dinov2.lvd142m
     freeze_image_encoder: true

@@ -402,52 +402,54 @@ def build_policy_memory_input(
     if policy.memory_encoder is None or policy.memory_token_proj is None:
         raise RuntimeError("policy memory is not enabled")
 
-    # (B,T,V,C) -> (B,T*V,C), useful only for checking the 48 view-time tokens.
-    flattened = feature_window.reshape(b, t * v, c)
-    # The real DINO head is 2D: (B*T*V,C) -> (B*T*V,C').
-    head_input = flattened.reshape(b * t * v, c)
-    projected = image_encoder.encoder.forward_from_backbone_feat(head_input)
-    projected_features = projected.reshape(b, t, v, -1)  # (B,T,V,C')
-    view_concat = projected_features.reshape(b, t, -1)  # (B,T,V*C')
+    if visual_offsets.ndim == 1 and visual_offsets.shape[0] != t:
+        raise ValueError(f"visual_offsets length {visual_offsets.shape[0]} != T={t}")
+    if visual_offsets.ndim == 2 and visual_offsets.shape != (b, t):
+        raise ValueError(f"visual_offsets shape {tuple(visual_offsets.shape)} != ({b},{t})")
+    if visual_offsets.ndim not in {1, 2}:
+        raise ValueError(f"visual_offsets must be (T,) or (B,T), got {visual_offsets.shape}")
+    if not hasattr(policy.memory_encoder, "encode_visual_views"):
+        raise RuntimeError("build_policy_memory_input requires fusion MemoryEncoder")
+
+    # Never reshape B,T,V,C directly: view must precede time before V enters batch.
+    after_permute = feature_window.permute(0, 2, 1, 3).contiguous()  # (B,V,T,C)
+    view_batch_input = after_permute.reshape(b * v, t, c)  # (B*V,T,C)
+    projected_features = image_encoder.project_view_histories_from_backbone_feat(
+        feature_window
+    )  # (B*V,T,C')
     after_projection_head = (
         cuda_memory_snapshot("after_projection_head", feature_window.device)
         if measure_cuda_memory else None
     )
 
-    # Preserve every view for Memory: (B,T,V,C') -> (B,T*V,C').
-    transformer_input = projected_features.reshape(b, t * v, -1)
-    if visual_offsets.ndim == 1 and visual_offsets.shape[0] == t:
-        transformer_offsets = visual_offsets.repeat_interleave(v)
-    elif visual_offsets.ndim == 2 and visual_offsets.shape == (b, t):
-        transformer_offsets = visual_offsets.repeat_interleave(v, dim=1)
-    else:
-        raise ValueError(
-            f"visual_offsets must be (T,) or (B,T), got {tuple(visual_offsets.shape)}"
+    visual_global, view_summary, restored, view_concat = (
+        policy.memory_encoder.encode_visual_views(
+            projected_features,
+            visual_offsets,
+            batch_size=b,
+            num_views=v,
         )
-
-    # Optional separate view-fusion branch. Current mean-pool policies have no view_proj.
-    projection_output = None
-    if image_encoder.view_proj is not None:
-        projection_output = image_encoder.view_proj(view_concat)  # (B,T,C')
-
-    memory_out = policy.memory_encoder(
-        visual_tokens=transformer_input,
-        visual_offsets=transformer_offsets,
-        state=memory_state,
     )
-    memory_tokens = policy.memory_token_proj(memory_out.tokens)  # (B,N,cond_dim)
-    memory_global = policy.memory_token_proj(memory_out.memory_global)  # (B,cond_dim)
+    state_global = policy.memory_encoder.state_encoder(memory_state)  # (B,state_mem_dim)
+    fused = policy.memory_encoder.fusion(
+        torch.cat([visual_global, state_global], dim=-1)
+    )  # (B,memory_dim)
+    memory_tokens = policy.memory_token_proj(fused.unsqueeze(1))  # (B,1,cond_dim)
+    memory_global = policy.memory_token_proj(fused)  # (B,cond_dim)
     after_transformer = (
         cuda_memory_snapshot("after_transformer", feature_window.device)
         if measure_cuda_memory else None
     )
     return {
-        "flattened": flattened,
-        "head_input": head_input,
+        "after_permute": after_permute,
+        "view_batch_input": view_batch_input,
         "projected_features": projected_features,
+        "transformer_input": projected_features,
+        "view_summary": view_summary,
+        "restored_view_summary": restored,
         "view_concat": view_concat,
-        "projection_output": projection_output,
-        "transformer_input": transformer_input,
+        "visual_global": visual_global,
+        "state_global": state_global,
         "memory_tokens": memory_tokens,
         "memory_global": memory_global,
         "cuda_after_projection_head": after_projection_head,

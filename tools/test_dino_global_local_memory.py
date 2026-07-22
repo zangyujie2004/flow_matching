@@ -8,6 +8,7 @@ import torch
 
 from infer.preprocess import cuda_memory_snapshot, tensor_mib
 from infer.runtime import FMInferenceRuntime
+from models.fm.encoders.dino_v2 import DinoV2SmallEncoder
 from tools.async_dino_buffer import AsyncDinoBuffer
 
 
@@ -63,19 +64,26 @@ def print_timing(stats: dict) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
+    if len(sys.argv) > 2:
         raise SystemExit(
-            "Usage: python -m tools.test_dino_global_local_memory RUN_DIR"
+            "Usage: python -m tools.test_dino_global_local_memory [RUN_DIR]"
         )
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this GPU-memory smoke test")
 
-    runtime = FMInferenceRuntime(Path(sys.argv[1]), device="cuda", warmup=False)
     num_views = 3
-    model = runtime.policy.condition_encoder.image_encoder.encoder
-    image_size = int(runtime.policy_cfg["data"].get("image_size", 224))
+    device = torch.device("cuda")
+    if len(sys.argv) == 2:
+        runtime = FMInferenceRuntime(Path(sys.argv[1]), device="cuda", warmup=False)
+        model = runtime.policy.condition_encoder.image_encoder.encoder
+        image_size = int(runtime.policy_cfg["data"].get("image_size", 224))
+        run_dir_views = runtime.n_image_views
+    else:
+        model = DinoV2SmallEncoder(pretrained=True, freeze=True).to(device).eval()
+        image_size = 224
+        run_dir_views = None
     backbone = model.backbone
-    print(f"test_num_views={num_views}, run_dir_num_views={runtime.n_image_views}")
+    print(f"test_num_views={num_views}, run_dir_num_views={run_dir_views}")
 
     patch_size = backbone.patch_embed.patch_size
     if isinstance(patch_size, int):
@@ -127,11 +135,11 @@ def main() -> None:
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
-    empty_snapshot = cuda_memory_snapshot("model_loaded_buffer_empty", runtime.device)
+    empty_snapshot = cuda_memory_snapshot("model_loaded_buffer_empty", device)
 
     global_buffer = AsyncDinoBuffer(model, device="cuda", store_local_features=False)
     fill_buffer(global_buffer, image_size, num_views)
-    global_snapshot = cuda_memory_snapshot("global_buffer_16", runtime.device)
+    global_snapshot = cuda_memory_snapshot("global_buffer_16", device)
     global_buffer.stop()
     global_window = global_buffer.get_global_feature_window()
     assert global_window is not None
@@ -144,7 +152,7 @@ def main() -> None:
 
     both_buffer = AsyncDinoBuffer(model, device="cuda", store_local_features=True)
     fill_buffer(both_buffer, image_size, num_views)
-    both_snapshot = cuda_memory_snapshot("global_plus_local_buffer_16", runtime.device)
+    both_snapshot = cuda_memory_snapshot("global_plus_local_buffer_16", device)
     both_buffer.stop()
     latest = both_buffer.get_latest()
     local_window = both_buffer.get_local_feature_window()
@@ -184,7 +192,7 @@ def main() -> None:
     latest = local_window = global_window = None
     both_buffer.clear()
     torch.cuda.empty_cache()
-    cleared_snapshot = cuda_memory_snapshot("buffers_cleared", runtime.device)
+    cleared_snapshot = cuda_memory_snapshot("buffers_cleared", device)
     print(cleared_snapshot)
     print("DINO local = patch-level [B,T,V,N,C]")
     print("DINO global = average-pooled image feature [B,T,V,C]")

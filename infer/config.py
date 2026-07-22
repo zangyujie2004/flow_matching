@@ -143,6 +143,42 @@ def policy_config_from_checkpoint_state(state: Mapping[str, Any], fallback: Mapp
     return dict(fallback)
 
 
+def load_policy_state_dict_checked(
+    policy: FlowMatchingPolicy,
+    state_dict: Mapping[str, Any],
+    checkpoint_path: Path | str,
+) -> None:
+    """Reject and clearly report missing, unexpected, or size-mismatched weights."""
+    model_state = policy.state_dict()
+    missing = sorted(key for key in model_state if key not in state_dict)
+    unexpected = sorted(key for key in state_dict if key not in model_state)
+    mismatched = sorted(
+        (
+            key,
+            tuple(state_dict[key].shape),
+            tuple(model_state[key].shape),
+        )
+        for key in model_state.keys() & state_dict.keys()
+        if tuple(state_dict[key].shape) != tuple(model_state[key].shape)
+    )
+    if missing or unexpected or mismatched:
+        lines = [f"Checkpoint is incompatible with current policy: {checkpoint_path}"]
+        lines.append(f"Missing keys: {missing}")
+        lines.append(f"Unexpected keys: {unexpected}")
+        lines.append(f"Size mismatches: {mismatched}")
+        if any("view_fusion_proj" in key for key in missing) or any(
+            "view_fusion_proj" in key for key, _, _ in mismatched
+        ):
+            lines.append(
+                "The configured view_fusion_proj requires matching view-count weights; "
+                "train or fine-tune it."
+            )
+        message = "\n".join(lines)
+        print(message)
+        raise RuntimeError(message)
+    policy.load_state_dict(state_dict)
+
+
 def load_runtime_checkpoint(
     path: Path | str,
     cfg: Mapping[str, Any],
@@ -156,12 +192,7 @@ def load_runtime_checkpoint(
         match_training=match_training,
         policy_state_dict=state.get("policy_state_dict"),
     )
-    try:
-        policy.load_state_dict(state["policy_state_dict"])
-    except RuntimeError as exc:
-        raise RuntimeError(
-            f"Failed to load checkpoint into {policy.velocity_model} backbone: {path}"
-        ) from exc
+    load_policy_state_dict_checked(policy, state["policy_state_dict"], path)
     normalizer = DatasetNormalizer.load_state_dict(state["normalizer_state_dict"])
     policy.eval()
     return policy, normalizer, state

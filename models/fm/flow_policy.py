@@ -131,6 +131,7 @@ class FlowMatchingPolicy(nn.Module):
                 num_queries=memory_num_queries,
                 state_hidden_dim=memory_state_hidden_dim,
                 state_heads=memory_state_heads,
+                n_views=n_image_views,
                 dropout=memory_dropout,
             )
             self.memory_token_proj = (
@@ -295,16 +296,31 @@ class FlowMatchingPolicy(nn.Module):
                 "memory is enabled but obs is missing required keys: " + ", ".join(missing)
             )
         visual_tokens = obs.get("memory_visual_tokens")
+        num_views = None
         if visual_tokens is None:
-            visual_tokens = self.condition_encoder.encode_image_sequence_from_backbone_feat(
-                obs["memory_image_backbone_feat"]
-            )
+            backbone_feat = obs["memory_image_backbone_feat"]
+            if self.memory_method == "fusion":
+                if backbone_feat.ndim != 4:
+                    raise ValueError(
+                        f"memory backbone features must be (B,T,V,C), got {backbone_feat.shape}"
+                    )
+                num_views = int(backbone_feat.shape[2])
+                visual_tokens = (
+                    self.condition_encoder.image_encoder
+                    .project_view_histories_from_backbone_feat(backbone_feat)
+                )
+            else:
+                visual_tokens = self.condition_encoder.encode_image_sequence_from_backbone_feat(
+                    backbone_feat
+                )
+        memory_kwargs = {"num_views": num_views} if self.memory_method == "fusion" else {}
         mem_out = self.memory_encoder(
             visual_tokens=visual_tokens,
             visual_offsets=obs["memory_visual_offsets"],
             state=obs["memory_state"],
             visual_valid=obs.get("memory_visual_valid"),
             state_valid=obs.get("memory_state_valid"),
+            **memory_kwargs,
         )
         tokens = self.memory_token_proj(mem_out.tokens)
         memory_global = self.memory_token_proj(mem_out.memory_global)

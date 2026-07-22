@@ -137,7 +137,7 @@ class VisualTemporalMemoryEncoder(nn.Module):
 
 
 class MemoryEncoder(nn.Module):
-    """Fusion path: visual CLS + state Conv → single memory vector."""
+    """Shared per-view temporal CLS encoders + view/state fusion."""
 
     def __init__(
         self,
@@ -152,12 +152,14 @@ class MemoryEncoder(nn.Module):
         state_channels: int = 128,
         state_layers: int = 2,
         state_mem_dim: int = 64,
+        n_views: int = 3,
         dropout: float = 0.1,
         **_ignored,
     ):
         super().__init__()
         visual_branch_dim = int(memory_dim)
         state_branch_dim = int(state_mem_dim)
+        self.n_views = int(n_views)
         max_time_offset = int(history_frames) + int(recent_frame)
         self.visual_encoder = VisualTemporalMemoryEncoder(
             visual_dim=int(visual_dim),
@@ -174,6 +176,13 @@ class MemoryEncoder(nn.Module):
             layers=int(state_layers),
             dropout=float(dropout),
         )
+        self.view_fusion_proj = nn.Sequential(
+            nn.LayerNorm(self.n_views * visual_branch_dim),
+            nn.Linear(self.n_views * visual_branch_dim, visual_branch_dim),
+            nn.SiLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(visual_branch_dim, visual_branch_dim),
+        )
         self.fusion = nn.Sequential(
             nn.LayerNorm(visual_branch_dim + state_branch_dim),
             nn.Linear(visual_branch_dim + state_branch_dim, int(memory_dim)),
@@ -181,6 +190,53 @@ class MemoryEncoder(nn.Module):
             nn.Dropout(float(dropout)),
             nn.Linear(int(memory_dim), int(memory_dim)),
         )
+
+    def encode_visual_views(
+        self,
+        visual_tokens: torch.Tensor,
+        visual_offsets: torch.Tensor,
+        visual_valid: torch.Tensor | None = None,
+        *,
+        batch_size: int,
+        num_views: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Encode B*V independent length-T histories, then fuse their CLS summaries."""
+        if visual_tokens.ndim != 3:
+            raise ValueError(f"expected visual tokens (B*V,T,D), got {visual_tokens.shape}")
+        bv, t, _ = visual_tokens.shape
+        if batch_size <= 0 or bv % batch_size != 0:
+            raise ValueError(f"visual batch {bv} is not divisible by state batch {batch_size}")
+        inferred_views = bv // batch_size
+        num_views = inferred_views if num_views is None else int(num_views)
+        if num_views != inferred_views:
+            raise ValueError(f"num_views {num_views} != inferred views {inferred_views}")
+        if num_views != self.n_views:
+            raise ValueError(
+                f"input has {num_views} views, but this model was built for {self.n_views}; "
+                "view_fusion_proj dimensions must match the checkpoint/config"
+            )
+
+        offsets = visual_offsets
+        if offsets.ndim == 2 and offsets.shape == (batch_size, t):
+            offsets = offsets[:, None].expand(-1, num_views, -1).reshape(bv, t)
+        valid = visual_valid
+        if valid is not None:
+            if valid.ndim == 1:
+                valid = valid.unsqueeze(0).expand(bv, -1)
+            elif valid.shape == (batch_size, t):
+                valid = valid[:, None].expand(-1, num_views, -1).reshape(bv, t)
+            valid = _as_batch_valid(
+                valid,
+                batch=bv,
+                seq=t,
+                device=visual_tokens.device,
+            )
+
+        view_summary = self.visual_encoder(visual_tokens, offsets, valid=valid)  # (B*V,D)
+        restored = view_summary.reshape(batch_size, num_views, -1)  # (B,V,D)
+        view_concat = restored.reshape(batch_size, -1)  # (B,V*D)
+        visual_global = self.view_fusion_proj(view_concat)  # (B,D)
+        return visual_global, view_summary, restored, view_concat
 
     def forward(
         self,
@@ -190,13 +246,19 @@ class MemoryEncoder(nn.Module):
         state: torch.Tensor,
         visual_valid: torch.Tensor | None = None,
         state_valid: torch.Tensor | None = None,
+        num_views: int | None = None,
     ) -> MemoryOutput:
-        bsz, tv, _ = visual_tokens.shape
+        bsz = state.shape[0]
         ts = state.shape[1]
-        device = visual_tokens.device
-        vis_valid = _as_batch_valid(visual_valid, batch=bsz, seq=tv, device=device)
+        device = state.device
         st_valid = _as_batch_valid(state_valid, batch=bsz, seq=ts, device=device)
-        visual_mem = self.visual_encoder(visual_tokens, visual_offsets, valid=vis_valid)
+        visual_mem, _, _, _ = self.encode_visual_views(
+            visual_tokens,
+            visual_offsets,
+            visual_valid,
+            batch_size=bsz,
+            num_views=num_views,
+        )
         state_mem = self.state_encoder(state, valid=st_valid)
         token = self.fusion(torch.cat([visual_mem, state_mem], dim=-1))
         tokens = token.unsqueeze(1)

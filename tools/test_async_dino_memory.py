@@ -1,112 +1,145 @@
-"""CUDA smoke test for three-view Async DINO Buffer -> Policy Memory."""
+"""CUDA smoke test for two/three-view Async DINO history -> fusion Memory."""
 
-import sys
+import argparse
 import time
-from pathlib import Path
 
-import numpy as np
 import torch
 
-from infer.preprocess import cuda_memory_snapshot, tensor_mib
-from infer.runtime import FMInferenceRuntime
+from infer.preprocess import build_policy_memory_input
+from models.fm.flow_policy import FlowMatchingPolicy
+from tools.async_dino_buffer import AsyncDinoBuffer
 
 
-def wait_until_processed(buffer, target: int, timeout_s: float = 30.0) -> None:
-    deadline = time.perf_counter() + timeout_s
+def wait_until_processed(buffer: AsyncDinoBuffer, target: int) -> None:
+    deadline = time.perf_counter() + 60.0
     while buffer.get_stats()["processed_count"] < target:
         if time.perf_counter() >= deadline:
-            raise TimeoutError(f"DINO did not finish sample {target} within {timeout_s}s")
+            raise TimeoutError(f"DINO did not finish sample {target} within 60 seconds")
         time.sleep(0.01)
 
 
+@torch.inference_mode()
 def main() -> None:
-    if len(sys.argv) != 2:
-        raise SystemExit("Usage: python -m tools.test_async_dino_memory RUN_DIR")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num-views", type=int, choices=(2, 3), default=3)
+    args = parser.parse_args()
     if not torch.cuda.is_available():
-        raise RuntimeError("This test requires CUDA because the Buffer must stay on GPU")
+        raise RuntimeError("This smoke test requires CUDA")
 
-    runtime = FMInferenceRuntime(Path(sys.argv[1]), device="cuda", warmup=False)
-    if not runtime.policy.memory_enabled:
-        raise RuntimeError("RUN_DIR policy must have data.memory.enabled=true")
-    if runtime.n_image_views != 3:
-        raise RuntimeError(f"RUN_DIR policy must use 3 views, got {runtime.n_image_views}")
+    device = torch.device("cuda")
+    b, t, v, c = 1, 16, args.num_views, 384
+    projected_dim = memory_dim = 256
+    state_dim, state_history = 14, 64
+    policy = FlowMatchingPolicy(
+        action_dim=state_dim,
+        state_dim=state_dim,
+        cond_steps=16,
+        cond_dim=256,
+        use_tactile=False,
+        action_horizon=64,
+        n_action_steps=32,
+        n_image_views=v,
+        image_pretrained=True,
+        image_feat_dim=projected_dim,
+        velocity_model="unet",
+        memory_enabled=True,
+        memory_method="fusion",
+        memory_injection="concat_global_cond",
+        memory_dim=memory_dim,
+        memory_history_frames=state_history,
+        memory_recent_frame=4,
+        memory_visual_layers=2,
+        memory_visual_heads=4,
+        memory_state_mem_dim=64,
+        memory_dropout=0.0,
+    ).to(device).eval()
 
-    image_size = int(runtime.policy_cfg["data"].get("image_size", 224))
-    buffer = runtime.start_async_dino()
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.synchronize()
-    cuda_before = cuda_memory_snapshot("before_dino", runtime.device)
-
-    # Wait after each submission so latest-only behavior does not drop test samples.
-    for sample_id in range(16):
+    dino = policy.condition_encoder.image_encoder.encoder
+    buffer = AsyncDinoBuffer(dino, device="cuda", store_local_features=False)
+    buffer.start()
+    for sample_id in range(t):
         images = [
-            torch.randint(0, 256, (1, 3, image_size, image_size), dtype=torch.uint8)
-            for _ in range(3)
+            torch.randint(0, 256, (b, 3, 224, 224), dtype=torch.uint8)
+            for _ in range(v)
         ]
-        accepted = buffer.submit_frame(
-            sample_id * 4, *images, capture_time=time.perf_counter()
-        )
-        assert accepted
+        assert buffer.submit_frame(sample_id * 4, *images)
         wait_until_processed(buffer, sample_id + 1)
 
-    latest = buffer.get_latest()["feature"]
-    window = buffer.get_feature_window()
-    assert window is not None
-    assert latest.requires_grad is False and latest.grad_fn is None
-    assert window.requires_grad is False and window.grad_fn is None
-    assert latest.device.type == "cuda" and window.device.type == "cuda"
-    assert latest.shape[:2] == (1, 3)
-    assert window.shape[:3] == (1, 16, 3)
-    cuda_buffer = cuda_memory_snapshot("buffer_full", runtime.device)
+    feature_window = buffer.get_feature_window()
+    assert feature_window is not None
+    assert feature_window.shape == (b, t, v, c)
+    assert feature_window.device.type == "cuda"
+    assert not feature_window.requires_grad and feature_window.grad_fn is None
 
-    state_shape = (runtime.policy.memory_history_frames, runtime.policy.state_dim)
-    memory_state_raw = np.zeros(state_shape, dtype=np.float32)
-    result = runtime.build_async_policy_memory(
-        memory_state_raw,
-        measure_cuda_memory=True,
+    memory_state = torch.randn(b, state_history, state_dim, device=device)
+    offsets = torch.arange(-64, -3, 4, device=device)
+    assert offsets.shape == (t,)
+    result = build_policy_memory_input(
+        feature_window,
+        policy,
+        memory_state,
+        offsets,
     )
-    assert result is not None
-    memory_obs = runtime._get_async_memory_obs(memory_state_raw)
-    policy_tokens, policy_global = runtime.policy._build_memory(memory_obs)
+
+    assert result["after_permute"].shape == (b, v, t, c)
+    assert result["view_batch_input"].shape == (b * v, t, c)
+    assert result["projected_features"].shape == (b * v, t, projected_dim)
+    assert result["transformer_input"].shape == (b * v, t, projected_dim)
+    assert result["view_summary"].shape == (b * v, memory_dim)
+    assert result["restored_view_summary"].shape == (b, v, memory_dim)
+    assert result["view_concat"].shape == (b, v * memory_dim)
+    assert result["visual_global"].shape == (b, memory_dim)
+    assert result["state_global"].shape == (b, 64)
+    assert result["memory_global"].shape == (b, memory_dim)
+
+    # The standard Policy path must produce exactly the same Memory output.
+    memory_obs = {
+        "memory_image_backbone_feat": feature_window,
+        "memory_state": memory_state,
+        "memory_visual_offsets": offsets,
+    }
+    policy_tokens, policy_global = policy._build_memory(memory_obs)
     assert torch.allclose(result["memory_tokens"], policy_tokens)
     assert torch.allclose(result["memory_global"], policy_global)
 
-    b, t, v, c = window.shape
-    c_prime = result["projected_features"].shape[-1]
-    assert result["flattened"].shape == (b, 48, c)
-    assert result["projected_features"].shape == (b, 16, 3, c_prime)
-    assert result["view_concat"].shape == (b, 16, 3 * c_prime)
-    assert result["transformer_input"].shape == (b, 48, c_prime)
+    obs_cond = torch.randn(b, policy.cond_dim, device=device)
+    final_global_cond = policy.memory_cond_fusion(
+        torch.cat([obs_cond, policy_global], dim=-1)
+    )
+    assert final_global_cond.shape == (b, policy.cond_dim)
 
-    print("DINO output shape:", tuple(latest[:, 0].shape))
-    print("single timestep shape:", tuple(latest.shape))
-    print("16-frame buffer shape:", tuple(window.shape))
-    print("DINO projection-head input shape:", tuple(result["head_input"].shape))
-    print("DINO projection-head output shape:", tuple(result["projected_features"].shape))
-    print("Transformer input shape:", tuple(result["transformer_input"].shape))
-    print("memory output shape:", tuple(result["memory_tokens"].shape))
-    projection = result["projection_output"]
-    print("projection output shape:", None if projection is None else tuple(projection.shape))
+    # There is one shared projection head and one shared temporal Transformer.
+    shared_head = policy.condition_encoder.image_encoder.encoder.head
+    shared_temporal = policy.memory_encoder.visual_encoder
+    assert sum(module is shared_head for module in policy.modules()) == 1
+    assert sum(module is shared_temporal for module in policy.modules()) == 1
+    expected_projected = shared_head(result["view_batch_input"])
+    assert torch.allclose(result["projected_features"], expected_projected)
+    summaries = result["restored_view_summary"]
+    assert not torch.allclose(result["view_batch_input"][0], result["view_batch_input"][1])
+    assert not torch.allclose(summaries[:, 0], summaries[:, 1])
+    for value in result.values():
+        if torch.is_tensor(value):
+            assert value.device.type == "cuda"
+            assert not value.requires_grad and value.grad_fn is None
+    assert final_global_cond.device.type == "cuda"
+    assert not final_global_cond.requires_grad and final_global_cond.grad_fn is None
 
-    theoretical = {
-        "single_view_single_frame_mib": tensor_mib(latest[:, 0]),
-        "three_view_single_timestep_mib": tensor_mib(latest),
-        "three_view_16_frame_buffer_mib": tensor_mib(window),
-        "projection_head_output_mib": tensor_mib(result["projected_features"]),
-        "transformer_input_mib": tensor_mib(result["transformer_input"]),
-        "final_memory_mib": tensor_mib(result["memory_tokens"]),
-    }
-    print("theoretical tensor memory:", theoretical)
-    print("CUDA allocated/reserved/peak memory:")
-    for snapshot in (
-        cuda_before,
-        cuda_buffer,
-        result["cuda_after_projection_head"],
-        result["cuda_after_transformer"],
-    ):
-        print(snapshot)
-    print("DINO timing:", buffer.get_stats())
+    print("buffer output:", tuple(feature_window.shape))
+    print("after permute:", tuple(result["after_permute"].shape))
+    print("view-as-batch input:", tuple(result["view_batch_input"].shape))
+    print("after shared DINO projection:", tuple(result["projected_features"].shape))
+    print("Transformer input:", tuple(result["transformer_input"].shape))
+    print("per-view CLS summaries:", tuple(result["view_summary"].shape))
+    print("restored view summaries:", tuple(result["restored_view_summary"].shape))
+    print("view concatenation:", tuple(result["view_concat"].shape))
+    print("visual_global:", tuple(result["visual_global"].shape))
+    print("state_global:", tuple(result["state_global"].shape))
+    print("memory_global:", tuple(result["memory_global"].shape))
+    print("final global_cond:", tuple(final_global_cond.shape))
+    print("offsets:", offsets.tolist())
+    print("shared projection head: yes")
+    print("shared temporal Transformer: yes")
     buffer.stop()
 
 

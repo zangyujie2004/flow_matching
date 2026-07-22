@@ -188,6 +188,21 @@ class DinoV2Encoder(nn.Module):
             return projected.mean(dim=2)
         raise ValueError(f"unsupported view_pool={self.view_pool!r}")
 
+    def project_view_histories_from_backbone_feat(
+        self,
+        feat: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project shared DINO features: (B,T,V,C) -> (B*V,T,out_dim)."""
+        if feat.ndim != 4:
+            raise ValueError(f"expected backbone feat (B,T,V,C), got {feat.shape}")
+        b, t, v, c = feat.shape
+        if v != self.n_views:
+            raise ValueError(f"feature views {v} != configured n_views {self.n_views}")
+        # Time and view must be exchanged before view becomes part of the batch.
+        view_history = feat.permute(0, 2, 1, 3).contiguous()  # (B,V,T,C)
+        view_batch = view_history.reshape(b * v, t, c)  # (B*V,T,C)
+        return self.encoder.forward_from_backbone_feat(view_batch)  # (B*V,T,out_dim)
+
     def encode_from_backbone_feat(self, feat: torch.Tensor) -> torch.Tensor:
         """feat: (B, T, V, D_backbone) or (B, V, D_backbone)."""
         return self.encode_all_from_backbone_feat(feat)[:, -1]

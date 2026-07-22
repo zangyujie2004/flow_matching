@@ -13,6 +13,7 @@ from infer.config import (
     action_dim_for_config,
     build_policy_from_cfg,
     load_run_config,
+    load_policy_state_dict_checked,
     parse_deploy_config,
     policy_config_from_checkpoint_state,
 )
@@ -66,12 +67,11 @@ class FMInferenceRuntime:
             policy_state_dict=ckpt_state.get("policy_state_dict"),
         ).to(self.device)
         self.normalizer = DatasetNormalizer.load_state_dict(ckpt_state["normalizer_state_dict"])
-        try:
-            self.policy.load_state_dict(ckpt_state["policy_state_dict"])
-        except RuntimeError as exc:
-            raise RuntimeError(
-                f"Failed to load checkpoint into {self.policy.velocity_model} backbone: {checkpoint_path}"
-            ) from exc
+        load_policy_state_dict_checked(
+            self.policy,
+            ckpt_state["policy_state_dict"],
+            checkpoint_path,
+        )
         self.policy.eval()
         self.use_tactile = bool(self.policy.use_tactile)
         if self.use_tactile and self.normalizer.tactile is None:
@@ -198,7 +198,7 @@ class FMInferenceRuntime:
             raise ValueError(f"memory_state_raw shape {state.shape} != {expected}")
         state_norm = self.normalizer.normalize_state_np(state).astype(np.float32, copy=False)
 
-        b, t, v, c = feature_window.shape
+        _b, t, v, c = feature_window.shape
         image_encoder = self.policy.condition_encoder.image_encoder
         expected_c = int(image_encoder.encoder.head[0].normalized_shape[0])
         if (t, v, c) != (16, image_encoder.n_views, expected_c):
@@ -206,15 +206,10 @@ class FMInferenceRuntime:
                 "async DINO window shape must be "
                 f"(B,16,{image_encoder.n_views},{expected_c}), got {tuple(feature_window.shape)}"
             )
-        projected = image_encoder.encoder.forward_from_backbone_feat(
-            feature_window.reshape(b * t * v, c)
-        )
-        # Keep all views: (B,T,V,C') -> (B,T*V,C').
-        visual_tokens = projected.reshape(b, t * v, -1)
         return {
-            "memory_visual_tokens": visual_tokens,
+            "memory_image_backbone_feat": feature_window,
             "memory_state": torch.from_numpy(state_norm).unsqueeze(0).to(self.device),
-            "memory_visual_offsets": self.memory_visual_offsets.repeat_interleave(v),
+            "memory_visual_offsets": self.memory_visual_offsets,
         }
 
     @torch.inference_mode()
