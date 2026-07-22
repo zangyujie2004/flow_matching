@@ -12,7 +12,7 @@ from tools.latency_benchmark_utils import (
     create_result_dir,
     cuda_memory,
     finalize_memory_snapshots,
-    load_runtime,
+    load_benchmark_context,
     runtime_metadata,
     save_results,
 )
@@ -26,11 +26,11 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    runtime, load_seconds, memory_snapshots = load_runtime(args)
+    runtime, load_seconds, memory_snapshots = load_benchmark_context(args)
     policy = runtime.policy
     device = runtime.device
     if not policy.memory_enabled:
-        raise RuntimeError("checkpoint policy does not enable Memory")
+        raise RuntimeError("benchmark policy does not enable Memory")
 
     obs_numpy, _state_raw = random_smoke_obs(runtime, seed=args.seed)
     if args.batch_size > 1:

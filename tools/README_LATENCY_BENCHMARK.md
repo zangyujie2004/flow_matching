@@ -4,11 +4,32 @@
 `resolved_config.yaml` 和 checkpoint 标定 DINO、Memory、Policy 及并发推理延迟。
 
 工具只调用仓库现有的 `FMInferenceRuntime`、DINO、MemoryEncoder 和
-FlowMatchingPolicy，不会创建随机 projection/Transformer，也不会修改 checkpoint。
+FlowMatchingPolicy，不会复制模型实现或修改 checkpoint。
+
+## 两种运行模式
+
+默认是 checkpoint 模式，必须提供兼容的 Flow Matching `--run-dir`，配置、
+normalizer 和权重均来自真实训练目录。
+
+尚无带 Memory 的 checkpoint 时可使用 `--architecture-only`。该模式不需要
+`--run-dir`，直接实例化项目现有的 DINO、Memory、UNet 和 Policy；模型权重为随机
+初始化，输入为合成数据：
+
+```bash
+python -m tools.bench_policy_latency \
+    --architecture-only \
+    --num-views 3 \
+    --device cuda:0
+```
+
+输出会明确记录 `benchmark_mode=architecture_only`、
+`checkpoint_loaded=false` 和 `task_quality_not_measured=true`。结果只用于标定当前
+结构的计算 latency 和显存，不能衡量任务效果，也不能称为 trained-checkpoint
+latency。`--num-views` 支持2或3；architecture-only 中省略时默认3视角。
 
 ## 前置条件
 
-RUN_DIR 必须至少包含：
+checkpoint 模式的 RUN_DIR 必须至少包含：
 
 ```text
 RUN_DIR/

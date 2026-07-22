@@ -10,22 +10,33 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import numpy as np
 import torch
 import yaml
 
 from infer.config import load_run_config
+from infer.preprocess import build_dino_images
 from infer.runtime import FMInferenceRuntime
+from infer.tensor import as_float32_array, numpy_obs_to_torch
+from infer.types import PreprocessConfig
+from models.fm.flow_policy import FlowMatchingPolicy
+from tools.async_dino_buffer import AsyncDinoBuffer
+from tools.normalizer import DatasetNormalizer, FieldNormalizer
 
 
 MIB = 1024**2
 
 
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument(
+        "--architecture-only",
+        action="store_true",
+        help="benchmark the real architecture with random weights and synthetic inputs",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-views", type=int, choices=(2, 3))
@@ -46,6 +57,194 @@ def validate_common_args(args: argparse.Namespace) -> torch.device:
     return device
 
 
+def architecture_only_config(num_views: int) -> dict[str, Any]:
+    """Minimal explicit config describing the requested random-weight architecture."""
+    camera_views = [f"camera_{index + 1}" for index in range(num_views)]
+    return {
+        "runtime": {"device": "cuda"},
+        "data": {
+            "window_size": 16,
+            "image_size": 224,
+            "action_type": "joint",
+            "action_representation": "absolute",
+            "action_horizon": 64,
+            "use_tactile": False,
+            "camera_views": camera_views,
+            "memory": {
+                "enabled": True,
+                "history_frames": 64,
+                "recent_frame": 4,
+                "sample_stride": 4,
+            },
+        },
+        "models": {
+            "fm": {
+                "n_image_views": num_views,
+                "image_encoder_name": "dinov2",
+                "dino_model_name": "vit_small_patch14_dinov2.lvd142m",
+                "image_pretrained": False,
+                "freeze_image_encoder": True,
+                "image_feat_dim": 256,
+                "cond_dim": 256,
+                "use_tactile": False,
+                "action_horizon": 64,
+                "n_action_steps": 32,
+                "velocity_model": "unet",
+                "num_inference_steps": 32,
+                "solver": "euler",
+            },
+            "memory": {
+                "method": "fusion",
+                "injection": "concat_global_cond",
+                "dim": 256,
+                "visual_layers": 2,
+                "visual_heads": 4,
+                "state_mem_dim": 64,
+                "dropout": 0.0,
+            },
+        },
+        "benchmark": {
+            "mode": "architecture_only",
+            "checkpoint_loaded": False,
+            "policy_weights": "random_initialization",
+            "memory_weights": "random_initialization",
+            "synthetic_inputs": True,
+            "latency_only": True,
+            "task_quality_not_measured": True,
+        },
+    }
+
+
+class ArchitectureOnlyRuntimeAdapter:
+    """Only the small Runtime surface used by latency benchmarks."""
+
+    def __init__(self, policy: FlowMatchingPolicy, device: torch.device, config: dict):
+        self.device = device
+        self.policy = policy
+        self.cfg = config
+        self.policy_cfg = config
+        self.run_dir = None
+        self.checkpoint_path = None
+        self.window_size = 16
+        self.n_image_views = int(policy.condition_encoder.image_encoder.n_views)
+        self.num_inference_steps = 32
+        self.solver = "euler"
+        self.action_horizon = 64
+        self.use_tactile = False
+        self.velocity_model = "unet"
+        self.memory_visual_offsets = torch.arange(
+            -64, 0, 4, device=device, dtype=torch.long
+        )
+        identity = FieldNormalizer.identity(policy.state_dim)
+        self.normalizer = DatasetNormalizer(
+            state=identity,
+            action=FieldNormalizer.identity(policy.action_dim),
+            tactile=None,
+            action_type="joint",
+            action_representation="absolute",
+        )
+        self.async_dino_buffer: AsyncDinoBuffer | None = None
+        self.async_dino_preprocess: PreprocessConfig | None = None
+        self.load_timing_ms: dict[str, float] = {}
+        self.load_cuda_memory: dict[str, dict[str, float]] = {}
+
+    @property
+    def action_dim(self) -> int:
+        return self.policy.action_dim
+
+    def start_async_dino(
+        self,
+        *,
+        preprocess: PreprocessConfig | None = None,
+        sample_interval_frames: int = 4,
+        deadline_ms: float = 132.0,
+    ) -> AsyncDinoBuffer:
+        if self.async_dino_buffer is not None:
+            self.async_dino_buffer.stop()
+        views = tuple(self.policy_cfg["data"]["camera_views"])
+        self.async_dino_preprocess = preprocess or PreprocessConfig(
+            action_type="joint", camera_views=views, image_size=224, use_tactile=False
+        )
+        dino = self.policy.condition_encoder.image_encoder.encoder
+        self.async_dino_buffer = AsyncDinoBuffer(
+            dino,
+            device=str(self.device),
+            sample_interval_frames=sample_interval_frames,
+            deadline_ms=deadline_ms,
+        )
+        self.async_dino_buffer.start()
+        return self.async_dino_buffer
+
+    def stop_async_dino(self) -> None:
+        if self.async_dino_buffer is not None:
+            self.async_dino_buffer.stop()
+
+    def submit_async_dino_frame(
+        self, frame_id: int, frame: Any, capture_time: float | None = None
+    ) -> bool:
+        if self.async_dino_buffer is None or self.async_dino_preprocess is None:
+            raise RuntimeError("call start_async_dino() first")
+        images = build_dino_images(frame, self.async_dino_preprocess)
+        return self.async_dino_buffer.submit_frame(
+            frame_id, *images, capture_time=capture_time
+        )
+
+    @torch.inference_mode()
+    def predict_rot6d_abs(
+        self,
+        obs: Mapping[str, Any],
+        *,
+        state_raw: np.ndarray,
+        memory_state_raw: np.ndarray | None = None,
+        num_inference_steps: int | None = None,
+        solver: str | None = None,
+    ) -> np.ndarray:
+        state_raw = as_float32_array(state_raw, name="state_raw")
+        expected_state = (self.window_size, self.policy.state_dim)
+        if state_raw.shape != expected_state:
+            raise ValueError(f"state_raw shape {state_raw.shape} != {expected_state}")
+        obs_torch = numpy_obs_to_torch(
+            obs,
+            self.device,
+            use_tactile=False,
+            normalizer=self.normalizer,
+            window_size=self.window_size,
+        )
+        feature_window = (
+            None
+            if self.async_dino_buffer is None
+            else self.async_dino_buffer.get_feature_window()
+        )
+        if feature_window is None:
+            raise RuntimeError("memory not ready: DINO buffer needs 16 processed samples")
+        if memory_state_raw is None:
+            raise ValueError("memory_state_raw is required")
+        memory_state = as_float32_array(memory_state_raw, name="memory_state_raw")
+        expected_memory = (self.policy.memory_history_frames, self.policy.state_dim)
+        if memory_state.shape != expected_memory:
+            raise ValueError(
+                f"memory_state_raw shape {memory_state.shape} != {expected_memory}"
+            )
+        obs_torch.update(
+            {
+                "memory_image_backbone_feat": feature_window,
+                "memory_state": torch.from_numpy(memory_state).unsqueeze(0).to(self.device),
+                "memory_visual_offsets": self.memory_visual_offsets,
+            }
+        )
+        result = self.policy.predict_action(
+            obs_torch,
+            num_inference_steps=(
+                self.num_inference_steps
+                if num_inference_steps is None
+                else int(num_inference_steps)
+            ),
+            solver=self.solver if solver is None else str(solver),
+        )
+        output = result["action_pred_normalized"].detach().cpu().numpy()
+        return output[0] if output.ndim == 3 else output
+
+
 def cuda_memory(label: str, device: torch.device) -> dict[str, Any]:
     torch.cuda.synchronize(device)
     return {
@@ -59,6 +258,8 @@ def cuda_memory(label: str, device: torch.device) -> dict[str, Any]:
 
 def load_runtime(args: argparse.Namespace) -> tuple[FMInferenceRuntime, float, list[dict]]:
     device = validate_common_args(args)
+    if args.run_dir is None:
+        raise ValueError("--run-dir is required unless --architecture-only is used")
     cfg = load_run_config(args.run_dir)
     if not isinstance(cfg.get("models"), dict) or not isinstance(
         cfg["models"].get("fm"), dict
@@ -89,6 +290,98 @@ def load_runtime(args: argparse.Namespace) -> tuple[FMInferenceRuntime, float, l
     assert_model_device(runtime.policy, device)
     print(f"runtime_load_timing_ms = {runtime.load_timing_ms}")
     return runtime, load_seconds, snapshots
+
+
+def build_architecture_only_context(
+    args: argparse.Namespace,
+) -> tuple[ArchitectureOnlyRuntimeAdapter, float, list[dict]]:
+    if args.checkpoint is not None:
+        raise ValueError("--checkpoint cannot be used with --architecture-only")
+    device = validate_common_args(args)
+    views = 3 if args.num_views is None else int(args.num_views)
+    config = architecture_only_config(views)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+    snapshots = [cuda_memory("before_load", device)]
+
+    start = time.perf_counter()
+    policy = FlowMatchingPolicy(
+        action_dim=14,
+        state_dim=14,
+        cond_steps=16,
+        cond_dim=256,
+        use_tactile=False,
+        action_horizon=64,
+        n_action_steps=32,
+        image_encoder_name="dinov2",
+        dino_model_name="vit_small_patch14_dinov2.lvd142m",
+        freeze_image_encoder=True,
+        image_pretrained=False,
+        image_feat_dim=256,
+        n_image_views=views,
+        velocity_model="unet",
+        memory_enabled=True,
+        memory_method="fusion",
+        memory_injection="concat_global_cond",
+        memory_dim=256,
+        memory_history_frames=64,
+        memory_recent_frame=4,
+        memory_visual_layers=2,
+        memory_visual_heads=4,
+        memory_state_mem_dim=64,
+        memory_dropout=0.0,
+        num_inference_steps=32,
+        solver="euler",
+    ).to(device).eval()
+    torch.cuda.synchronize(device)
+    load_seconds = time.perf_counter() - start
+    runtime = ArchitectureOnlyRuntimeAdapter(policy, device, config)
+    after_model = cuda_memory("after_model_load", device)
+    snapshots.append(after_model)
+    snapshots.append({**after_model, "stage": "after_checkpoint_load"})
+    runtime.load_cuda_memory = {
+        "after_model_load": {key: value for key, value in after_model.items() if key != "stage"},
+        "after_checkpoint_load": {
+            key: value for key, value in after_model.items() if key != "stage"
+        },
+    }
+    runtime.load_timing_ms = {
+        "config_load": 0.0,
+        "checkpoint_deserialize": 0.0,
+        "model_build_to_device": load_seconds * 1000.0,
+        "checkpoint_apply": 0.0,
+        "runtime_total": load_seconds * 1000.0,
+    }
+    assert_model_device(policy, device)
+    print_architecture_only_notice()
+    return runtime, load_seconds, snapshots
+
+
+def load_benchmark_context(args: argparse.Namespace):
+    if args.architecture_only:
+        return build_architecture_only_context(args)
+    return load_runtime(args)
+
+
+def load_benchmark_config(args: argparse.Namespace) -> dict[str, Any]:
+    if args.architecture_only:
+        views = 3 if args.num_views is None else int(args.num_views)
+        return architecture_only_config(views)
+    if args.run_dir is None:
+        raise ValueError("--run-dir is required unless --architecture-only is used")
+    return load_run_config(args.run_dir)
+
+
+def print_architecture_only_notice() -> None:
+    print("benchmark_mode = architecture_only")
+    print("checkpoint_loaded = false")
+    print("policy_weights = random_initialization")
+    print("memory_weights = random_initialization")
+    print("synthetic_inputs = true")
+    print("latency_only = true")
+    print("task_quality_not_measured = true")
 
 
 def assert_model_device(model: torch.nn.Module, device: torch.device) -> None:
@@ -208,7 +501,7 @@ def _git_value(args: list[str], cwd: Path) -> str:
 
 
 def runtime_metadata(
-    runtime: FMInferenceRuntime,
+    runtime: Any,
     args: argparse.Namespace,
     *,
     benchmark: str,
@@ -220,7 +513,8 @@ def runtime_metadata(
     props = torch.cuda.get_device_properties(device)
     parameter_count = sum(value.numel() for value in runtime.policy.parameters())
     dtype = str(next(runtime.policy.parameters()).dtype)
-    return {
+    architecture_only = bool(args.architecture_only)
+    metadata = {
         "benchmark": benchmark,
         "hostname": socket.gethostname(),
         "git_commit": _git_value(["rev-parse", "HEAD"], repo),
@@ -235,9 +529,15 @@ def runtime_metadata(
         "gpu_total_memory_mib": props.total_memory / MIB,
         "device_index": device.index if device.index is not None else torch.cuda.current_device(),
         "device": str(device),
-        "checkpoint_path": str(runtime.checkpoint_path),
-        "run_dir": str(runtime.run_dir),
-        "config_path": str(runtime.run_dir / "resolved_config.yaml"),
+        "checkpoint_path": (
+            None if runtime.checkpoint_path is None else str(runtime.checkpoint_path)
+        ),
+        "run_dir": None if runtime.run_dir is None else str(runtime.run_dir),
+        "config_path": (
+            None
+            if runtime.run_dir is None
+            else str(runtime.run_dir / "resolved_config.yaml")
+        ),
         "batch_size": int(args.batch_size),
         "number_of_views": int(runtime.n_image_views),
         "dtype": dtype,
@@ -249,6 +549,24 @@ def runtime_metadata(
         "runtime_load_timing_ms": dict(runtime.load_timing_ms),
         "timestamp": datetime.now().astimezone().isoformat(),
     }
+    metadata.update(
+        {
+            "benchmark_mode": (
+                "architecture_only" if architecture_only else "checkpoint"
+            ),
+            "checkpoint_loaded": not architecture_only,
+            "policy_weights": (
+                "random_initialization" if architecture_only else "checkpoint"
+            ),
+            "memory_weights": (
+                "random_initialization" if architecture_only else "checkpoint"
+            ),
+            "synthetic_inputs": True,
+            "latency_only": architecture_only,
+            "task_quality_not_measured": architecture_only,
+        }
+    )
+    return metadata
 
 
 def create_result_dir(args: argparse.Namespace, benchmark: str) -> Path:

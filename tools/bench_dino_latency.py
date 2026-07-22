@@ -10,7 +10,7 @@ from tools.latency_benchmark_utils import (
     create_result_dir,
     cuda_memory,
     finalize_memory_snapshots,
-    load_runtime,
+    load_benchmark_context,
     runtime_metadata,
     save_results,
     tensor_description,
@@ -25,7 +25,7 @@ def main() -> None:
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
-    runtime, load_seconds, memory_snapshots = load_runtime(args)
+    runtime, load_seconds, memory_snapshots = load_benchmark_context(args)
     device = runtime.device
     model = runtime.policy.condition_encoder.image_encoder.encoder.eval()
     views = runtime.n_image_views

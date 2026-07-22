@@ -13,6 +13,10 @@ while [[ $# -gt 0 ]]; do
             skip_stress=1
             shift
             ;;
+        --architecture-only)
+            common_args+=("$1")
+            shift
+            ;;
         --only)
             only="$2"
             shift 2
@@ -37,13 +41,17 @@ case "$only" in
 esac
 
 has_run_dir=0
+architecture_only=0
 for value in "${common_args[@]}"; do
     if [[ "$value" == "--run-dir" ]]; then
         has_run_dir=1
     fi
+    if [[ "$value" == "--architecture-only" ]]; then
+        architecture_only=1
+    fi
 done
-if [[ $has_run_dir -eq 0 ]]; then
-    echo "--run-dir is required" >&2
+if [[ $has_run_dir -eq 0 && $architecture_only -eq 0 ]]; then
+    echo "--run-dir is required unless --architecture-only is used" >&2
     exit 2
 fi
 

@@ -12,7 +12,6 @@ import numpy as np
 import torch
 import torch.multiprocessing as mp
 
-from infer.config import load_run_config
 from infer.runtime import random_smoke_obs
 from infer.tensor import numpy_obs_to_torch
 from tools.async_dino_buffer import AsyncDinoBuffer
@@ -23,7 +22,8 @@ from tools.latency_benchmark_utils import (
     create_result_dir,
     cuda_memory,
     distribution,
-    load_runtime,
+    load_benchmark_config,
+    load_benchmark_context,
     runtime_metadata,
     save_results,
 )
@@ -109,7 +109,7 @@ def worker(role, phase, args, barrier, result_queue, launched_at):
     runtime = None
     try:
         startup_seconds = time.perf_counter() - launched_at
-        runtime, load_seconds, memory_snapshots = load_runtime(args)
+        runtime, load_seconds, memory_snapshots = load_benchmark_context(args)
         device = runtime.device
         run_once, shapes = prepare_role(role, runtime, args)
         process_metadata = runtime_metadata(
@@ -335,14 +335,18 @@ def main() -> None:
     metadata.update({
         "benchmark": "concurrent_latency",
         "scenario": "three_process_stress" if args.scenario == "stress" else "realistic",
-        "run_dir": str(args.run_dir),
-        "checkpoint": str(args.checkpoint) if args.checkpoint else "auto latest.pt",
+        "run_dir": None if args.run_dir is None else str(args.run_dir),
+        "checkpoint": (
+            None
+            if args.architecture_only
+            else str(args.checkpoint) if args.checkpoint else "auto latest.pt"
+        ),
         "start_method": "spawn",
         "duration_seconds": args.duration_seconds,
         "roles": roles,
         "timestamp": datetime.now().astimezone().isoformat(),
     })
-    config = load_run_config(args.run_dir)
+    config = load_benchmark_config(args)
     standard_summary = {}
     for role in roles:
         if role in summary:

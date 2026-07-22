@@ -17,7 +17,7 @@ from tools.latency_benchmark_utils import (
     cuda_memory,
     distribution,
     finalize_memory_snapshots,
-    load_runtime,
+    load_benchmark_context,
     runtime_metadata,
     save_results,
 )
@@ -77,11 +77,11 @@ def main() -> None:
     parser.add_argument("--dino-sample-interval-frames", type=int, default=4)
     args = parser.parse_args()
     if args.batch_size != 1:
-        raise ValueError("FMInferenceRuntime deployment entry currently requires batch-size=1")
+        raise ValueError("full pipeline deployment entry currently requires batch-size=1")
 
-    runtime, load_seconds, memory_snapshots = load_runtime(args)
+    runtime, load_seconds, memory_snapshots = load_benchmark_context(args)
     if not runtime.policy.memory_enabled:
-        raise RuntimeError("checkpoint policy does not enable Memory")
+        raise RuntimeError("benchmark policy does not enable Memory")
     device = runtime.device
     buffer = runtime.start_async_dino(
         sample_interval_frames=args.dino_sample_interval_frames,
@@ -108,7 +108,7 @@ def main() -> None:
     memory_state_raw = rng.normal(
         0.0,
         0.05,
-        (runtime.policy.memory_history_frames, runtime.action_dim),
+        (runtime.policy.memory_history_frames, runtime.policy.state_dim),
     ).astype(np.float32)
     action = runtime.predict_rot6d_abs(
         obs,
