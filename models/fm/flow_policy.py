@@ -286,15 +286,19 @@ class FlowMatchingPolicy(nn.Module):
     def _build_memory(self, obs: Dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         if self.memory_encoder is None or self.memory_token_proj is None:
             raise RuntimeError("memory encoder is not configured")
-        required = ("memory_image_backbone_feat", "memory_state", "memory_visual_offsets")
+        required = ("memory_state", "memory_visual_offsets")
         missing = [key for key in required if key not in obs]
+        if "memory_visual_tokens" not in obs and "memory_image_backbone_feat" not in obs:
+            missing.append("memory_visual_tokens or memory_image_backbone_feat")
         if missing:
             raise KeyError(
                 "memory is enabled but obs is missing required keys: " + ", ".join(missing)
             )
-        visual_tokens = self.condition_encoder.encode_image_sequence_from_backbone_feat(
-            obs["memory_image_backbone_feat"]
-        )
+        visual_tokens = obs.get("memory_visual_tokens")
+        if visual_tokens is None:
+            visual_tokens = self.condition_encoder.encode_image_sequence_from_backbone_feat(
+                obs["memory_image_backbone_feat"]
+            )
         mem_out = self.memory_encoder(
             visual_tokens=visual_tokens,
             visual_offsets=obs["memory_visual_offsets"],

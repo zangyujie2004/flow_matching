@@ -17,7 +17,12 @@ from infer.config import (
     policy_config_from_checkpoint_state,
 )
 from infer.postprocess import apply_action_process
-from infer.preprocess import build_dino_images, build_obs_from_frames, parse_preprocess_config
+from infer.preprocess import (
+    build_dino_images,
+    build_obs_from_frames,
+    build_policy_memory_input,
+    parse_preprocess_config,
+)
 from infer.tensor import as_float32_array, default_tactile_norm, numpy_obs_to_torch
 from infer.types import InferenceChunk, PreprocessConfig
 from tools.normalizer import DatasetNormalizer
@@ -85,6 +90,16 @@ class FMInferenceRuntime:
         self.async_dino_buffer: AsyncDinoBuffer | None = None
         self.async_dino_preprocess: PreprocessConfig | None = None
 
+        memory_cfg = dict(data_cfg.get("memory") or {})
+        stride = max(1, int(memory_cfg.get("sample_stride", 4)))
+        recent = int(self.policy.memory_recent_frame)
+        history = int(self.policy.memory_history_frames)
+        token_count = max(1, int(np.ceil(history / stride)))
+        start = -recent - stride * (token_count - 1)
+        self.memory_visual_offsets = torch.arange(
+            start, -recent + 1, stride, device=self.device, dtype=torch.long
+        )
+
         if warmup:
             self._warmup()
 
@@ -93,6 +108,9 @@ class FMInferenceRuntime:
         return action_dim_for_config(self.policy_cfg)
 
     def _warmup(self) -> None:
+        # Memory inference needs real history. Do not hide a missing history with zeros.
+        if self.policy.memory_enabled:
+            return
         image_size = int(cfg_get(self.policy_cfg, "data.image_size", 224))
         n_views = self.n_image_views
         dummy_obs = {
@@ -124,6 +142,7 @@ class FMInferenceRuntime:
         obs: Mapping[str, Any],
         *,
         state_raw: np.ndarray,
+        memory_state_raw: np.ndarray | None = None,
         num_inference_steps: int | None = None,
         solver: str | None = None,
     ) -> np.ndarray:
@@ -141,6 +160,11 @@ class FMInferenceRuntime:
             normalizer=self.normalizer,
             window_size=self.window_size,
         )
+        if self.policy.memory_enabled:
+            memory_obs = self._get_async_memory_obs(memory_state_raw)
+            if memory_obs is None:
+                raise RuntimeError("memory not ready: DINO buffer needs 16 processed samples")
+            obs_torch.update(memory_obs)
         steps = self.num_inference_steps if num_inference_steps is None else int(num_inference_steps)
         solver_name = self.solver if solver is None else str(solver)
 
@@ -154,6 +178,63 @@ class FMInferenceRuntime:
             pred_norm = pred_norm[0]
         pred_abs = self.normalizer.unnormalize_action_np(pred_norm, state_raw)
         return as_float32_array(pred_abs, name="pred_abs")
+
+    @torch.inference_mode()
+    def _get_async_memory_obs(
+        self,
+        memory_state_raw: np.ndarray | None,
+    ) -> dict[str, torch.Tensor] | None:
+        if self.async_dino_buffer is None:
+            return None
+        feature_window = self.async_dino_buffer.get_feature_window()
+        if feature_window is None:
+            return None
+        if memory_state_raw is None:
+            raise ValueError("memory_state_raw is required when policy memory is enabled")
+
+        state = as_float32_array(memory_state_raw, name="memory_state_raw")
+        expected = (self.policy.memory_history_frames, self.policy.state_dim)
+        if state.shape != expected:
+            raise ValueError(f"memory_state_raw shape {state.shape} != {expected}")
+        state_norm = self.normalizer.normalize_state_np(state).astype(np.float32, copy=False)
+
+        b, t, v, c = feature_window.shape
+        image_encoder = self.policy.condition_encoder.image_encoder
+        expected_c = int(image_encoder.encoder.head[0].normalized_shape[0])
+        if (t, v, c) != (16, image_encoder.n_views, expected_c):
+            raise ValueError(
+                "async DINO window shape must be "
+                f"(B,16,{image_encoder.n_views},{expected_c}), got {tuple(feature_window.shape)}"
+            )
+        projected = image_encoder.encoder.forward_from_backbone_feat(
+            feature_window.reshape(b * t * v, c)
+        )
+        # Keep all views: (B,T,V,C') -> (B,T*V,C').
+        visual_tokens = projected.reshape(b, t * v, -1)
+        return {
+            "memory_visual_tokens": visual_tokens,
+            "memory_state": torch.from_numpy(state_norm).unsqueeze(0).to(self.device),
+            "memory_visual_offsets": self.memory_visual_offsets.repeat_interleave(v),
+        }
+
+    @torch.inference_mode()
+    def build_async_policy_memory(
+        self,
+        memory_state_raw: np.ndarray,
+        measure_cuda_memory: bool = False,
+    ) -> dict[str, Any] | None:
+        """Return the real Policy Memory intermediates, or None until 16 samples exist."""
+        memory_obs = self._get_async_memory_obs(memory_state_raw)
+        if memory_obs is None:
+            return None
+        feature_window = self.async_dino_buffer.get_feature_window()
+        return build_policy_memory_input(
+            feature_window,
+            self.policy,
+            memory_obs["memory_state"],
+            self.memory_visual_offsets,
+            measure_cuda_memory=measure_cuda_memory,
+        )
 
     @torch.inference_mode()
     def predict_rot6d_abs_batch(
@@ -201,6 +282,16 @@ class FMInferenceRuntime:
         if self.async_dino_buffer is not None:
             self.async_dino_buffer.stop()
         self.async_dino_preprocess = preprocess or parse_preprocess_config(self.cfg)
+        if len(self.async_dino_preprocess.camera_views) != self.n_image_views:
+            raise ValueError(
+                "async camera count must match policy n_image_views: "
+                f"{len(self.async_dino_preprocess.camera_views)} != {self.n_image_views}"
+            )
+        if self.policy.memory_enabled and self.memory_visual_offsets.numel() != 16:
+            raise ValueError(
+                "Async DINO buffer is fixed at 16 samples, but policy config expects "
+                f"{self.memory_visual_offsets.numel()} visual memory tokens"
+            )
         dino_model = self.policy.condition_encoder.image_encoder.encoder
         self.async_dino_buffer = AsyncDinoBuffer(
             dino_model=dino_model,
@@ -234,6 +325,7 @@ class FMInferenceRuntime:
         self,
         frames: Sequence[Any],
         *,
+        memory_state_raw: np.ndarray | None = None,
         preprocess: PreprocessConfig | None = None,
         robot: Mapping[str, Any] | None = None,
         num_inference_steps: int | None = None,
@@ -261,6 +353,7 @@ class FMInferenceRuntime:
         pred_rot6d = self.predict_rot6d_abs(
             obs,
             state_raw=state_raw,
+            memory_state_raw=memory_state_raw,
             num_inference_steps=num_inference_steps,
             solver=solver,
         )

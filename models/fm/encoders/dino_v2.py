@@ -93,6 +93,33 @@ class DinoV2SmallEncoder(nn.Module):
             feat = self.backbone(x)
         return self._pool_backbone_output(feat)
 
+    def forward_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        """Return timm tokens ordered as CLS, registers, then patch tokens."""
+        x = self._imagenet_normalize(x)
+        tokens = self.backbone.forward_features(x)
+        if not torch.is_tensor(tokens) or tokens.ndim != 3:
+            raise TypeError(
+                "timm DINO forward_features must return a (B,prefix+N,C) Tensor, "
+                f"got {type(tokens).__name__}"
+            )
+        return tokens
+
+    def patch_tokens_from_output(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Remove CLS/register prefix tokens and return (B,N,C) patch tokens."""
+        prefix_count = int(getattr(self.backbone, "num_prefix_tokens", 0))
+        if tokens.ndim != 3 or tokens.shape[1] <= prefix_count:
+            raise ValueError(
+                f"invalid DINO token shape {tuple(tokens.shape)} with {prefix_count} prefix tokens"
+            )
+        return tokens[:, prefix_count:]
+
+    def extract_local_global_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Return detached patch-local (B,N,C) and patch-average global (B,1,C)."""
+        tokens = self.forward_tokens(x)
+        local = self.patch_tokens_from_output(tokens).detach()
+        global_feature = local.mean(dim=1, keepdim=True).detach()
+        return {"local": local, "global": global_feature}
+
     def forward_from_backbone_feat(self, feat: torch.Tensor) -> torch.Tensor:
         return self.head(feat)
 

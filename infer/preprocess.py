@@ -366,6 +366,114 @@ def build_dino_images(frame: Any, cfg: PreprocessConfig) -> list[torch.Tensor]:
         images.append(image.unsqueeze(0))
     return images
 
+
+@torch.inference_mode()
+def build_policy_memory_input(
+    feature_window: torch.Tensor,
+    policy: Any,
+    memory_state: torch.Tensor,
+    visual_offsets: torch.Tensor,
+    measure_cuda_memory: bool = False,
+) -> dict[str, Any]:
+    """Run the repository's real image-head and memory path with explicit shapes."""
+    if feature_window.ndim != 4:
+        raise ValueError(
+            "feature_window must be (B,T,V,C_backbone), got "
+            f"{tuple(feature_window.shape)}"
+        )
+    b, t, v, c = feature_window.shape
+    image_encoder = policy.condition_encoder.image_encoder
+    if v != image_encoder.n_views:
+        raise ValueError(f"buffer has {v} views but policy expects {image_encoder.n_views}")
+    expected_c = int(image_encoder.encoder.head[0].normalized_shape[0])
+    if c != expected_c:
+        raise ValueError(
+            f"buffer backbone dim is {c}, but DINO projection head expects {expected_c}"
+        )
+    policy_device = next(policy.parameters()).device
+    if feature_window.device != policy_device:
+        raise ValueError(
+            f"feature_window is on {feature_window.device}, policy is on {policy_device}"
+        )
+    if memory_state.ndim != 3 or memory_state.shape[0] != b:
+        raise ValueError(
+            f"memory_state must be (B,T_state,D_state), got {tuple(memory_state.shape)}"
+        )
+    if policy.memory_encoder is None or policy.memory_token_proj is None:
+        raise RuntimeError("policy memory is not enabled")
+
+    # (B,T,V,C) -> (B,T*V,C), useful only for checking the 48 view-time tokens.
+    flattened = feature_window.reshape(b, t * v, c)
+    # The real DINO head is 2D: (B*T*V,C) -> (B*T*V,C').
+    head_input = flattened.reshape(b * t * v, c)
+    projected = image_encoder.encoder.forward_from_backbone_feat(head_input)
+    projected_features = projected.reshape(b, t, v, -1)  # (B,T,V,C')
+    view_concat = projected_features.reshape(b, t, -1)  # (B,T,V*C')
+    after_projection_head = (
+        cuda_memory_snapshot("after_projection_head", feature_window.device)
+        if measure_cuda_memory else None
+    )
+
+    # Preserve every view for Memory: (B,T,V,C') -> (B,T*V,C').
+    transformer_input = projected_features.reshape(b, t * v, -1)
+    if visual_offsets.ndim == 1 and visual_offsets.shape[0] == t:
+        transformer_offsets = visual_offsets.repeat_interleave(v)
+    elif visual_offsets.ndim == 2 and visual_offsets.shape == (b, t):
+        transformer_offsets = visual_offsets.repeat_interleave(v, dim=1)
+    else:
+        raise ValueError(
+            f"visual_offsets must be (T,) or (B,T), got {tuple(visual_offsets.shape)}"
+        )
+
+    # Optional separate view-fusion branch. Current mean-pool policies have no view_proj.
+    projection_output = None
+    if image_encoder.view_proj is not None:
+        projection_output = image_encoder.view_proj(view_concat)  # (B,T,C')
+
+    memory_out = policy.memory_encoder(
+        visual_tokens=transformer_input,
+        visual_offsets=transformer_offsets,
+        state=memory_state,
+    )
+    memory_tokens = policy.memory_token_proj(memory_out.tokens)  # (B,N,cond_dim)
+    memory_global = policy.memory_token_proj(memory_out.memory_global)  # (B,cond_dim)
+    after_transformer = (
+        cuda_memory_snapshot("after_transformer", feature_window.device)
+        if measure_cuda_memory else None
+    )
+    return {
+        "flattened": flattened,
+        "head_input": head_input,
+        "projected_features": projected_features,
+        "view_concat": view_concat,
+        "projection_output": projection_output,
+        "transformer_input": transformer_input,
+        "memory_tokens": memory_tokens,
+        "memory_global": memory_global,
+        "cuda_after_projection_head": after_projection_head,
+        "cuda_after_transformer": after_transformer,
+    }
+
+
+def tensor_mib(tensor: torch.Tensor) -> float:
+    """The tensor's own storage size; unlike CUDA reserved memory, this is exact."""
+    return tensor.numel() * tensor.element_size() / (1024**2)
+
+
+def cuda_memory_snapshot(label: str, device: torch.device) -> dict[str, float | str]:
+    """Read PyTorch CUDA allocator counters in MiB."""
+    if device.type != "cuda":
+        return {"stage": label, "allocated_mib": 0.0, "reserved_mib": 0.0, "peak_mib": 0.0}
+    torch.cuda.synchronize(device)
+    mib = 1024**2
+    return {
+        "stage": label,
+        "allocated_mib": torch.cuda.memory_allocated(device) / mib,
+        "reserved_mib": torch.cuda.memory_reserved(device) / mib,
+        "peak_mib": torch.cuda.max_memory_allocated(device) / mib,
+    }
+
+
 def build_obs_from_frames(
     frames: Sequence[Any],
     cfg: PreprocessConfig,
