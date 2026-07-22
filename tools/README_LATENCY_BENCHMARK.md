@@ -144,7 +144,9 @@ python -m tools.bench_policy_latency \
 - Memory encoder；
 - condition fusion；
 - 单次 UNet/DiT velocity forward；
-- condition + Memory + 单次 velocity forward；
+- 原始当前图像 + condition + Memory + 单次 velocity forward；
+- `one_forward_cached_current_DINO_ms`：缓存的当前 DINO feature + 状态条件 +
+  Memory + condition fusion + 单次 velocity forward（不含 DINO backbone 和 solver）；
 - 完整 solver；
 - `policy.predict_action()` 总时间。
 

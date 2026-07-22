@@ -62,7 +62,11 @@ def main() -> None:
         "memory_visual_offsets": runtime.memory_visual_offsets,
     }
     obs.update(memory_obs)
-    for name, tensor in obs.items():
+    cached_obs = {name: value for name, value in obs.items() if name != "image"}
+    cached_obs["image_backbone_feat"] = torch.randn(
+        b, 1, v, c, device=device
+    )
+    for name, tensor in {**obs, **cached_obs}.items():
         if torch.is_tensor(tensor) and tensor.device != device:
             raise AssertionError(f"{name} is on {tensor.device}, expected {device}")
 
@@ -91,6 +95,9 @@ def main() -> None:
         global_cond=global_cond,
         condition_tokens=condition_tokens,
     )
+    cached_velocity = _condition_and_velocity(
+        policy, cached_obs, sample, timestep
+    )
     prediction = policy.predict_action(
         obs,
         num_inference_steps=policy.num_inference_steps,
@@ -98,6 +105,10 @@ def main() -> None:
     )
     if velocity.shape != sample.shape:
         raise AssertionError(f"velocity shape {velocity.shape} != sample {sample.shape}")
+    if cached_velocity.shape != sample.shape:
+        raise AssertionError(
+            f"cached velocity shape {cached_velocity.shape} != sample {sample.shape}"
+        )
     expected_action = (b, policy.action_horizon, policy.action_dim)
     if prediction["action_pred_normalized"].shape != expected_action:
         raise AssertionError(
@@ -135,6 +146,10 @@ def main() -> None:
         "single_network_forward_total_ms",
         lambda: _condition_and_velocity(policy, obs, sample, timestep),
     )
+    run(
+        "one_forward_cached_current_DINO_ms",
+        lambda: _condition_and_velocity(policy, cached_obs, sample, timestep),
+    )
     full_iterations = max(10, args.iterations // 4)
     policy._build_condition = lambda _obs: (global_cond, condition_tokens)
     run(
@@ -159,6 +174,9 @@ def main() -> None:
 
     shapes = {
         "current_image": list(obs["image"].shape),
+        "cached_current_image_backbone_feat": list(
+            cached_obs["image_backbone_feat"].shape
+        ),
         "current_state": list(obs["state"].shape),
         "memory_image_backbone_feat": list(memory_obs["memory_image_backbone_feat"].shape),
         "memory_state": list(memory_obs["memory_state"].shape),
@@ -188,6 +206,11 @@ def main() -> None:
             "number_of_action_steps": policy.n_action_steps,
             "action_horizon": policy.action_horizon,
             "solver_total_excludes_condition_build": True,
+            "one_forward_cached_current_DINO_scope": (
+                "cached current DINO feature + observation/state condition + Memory "
+                "+ condition fusion + one velocity-model forward; excludes DINO "
+                "backbone and solver loop"
+            ),
         }
     )
     print(f"velocity_model = {policy.velocity_model}")
@@ -200,7 +223,8 @@ def main() -> None:
     result_dir = create_result_dir(args, "policy")
     config = runtime.policy_cfg
     finalize_memory_snapshots(memory_snapshots, device)
-    del runtime, policy, obs, memory_obs, prediction, velocity
+    del runtime, policy, obs, cached_obs, memory_obs, prediction, velocity
+    del cached_velocity
     del obs_cond, memory_tokens, memory_global, global_cond, sample, timestep
     del fusion_function
     gc.collect()
