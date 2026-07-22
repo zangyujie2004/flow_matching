@@ -113,12 +113,21 @@ class DinoV2SmallEncoder(nn.Module):
             )
         return tokens[:, prefix_count:]
 
+    def cls_token_from_output(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Return the image's own DINO CLS token as (B,1,C)."""
+        if getattr(self.backbone, "cls_token", None) is None:
+            raise RuntimeError("this DINO backbone does not provide a CLS token")
+        if tokens.ndim != 3 or tokens.shape[1] < 1:
+            raise ValueError(f"invalid DINO token shape {tuple(tokens.shape)}")
+        return tokens[:, :1]
+
     def extract_local_global_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Return detached patch-local (B,N,C) and patch-average global (B,1,C)."""
+        """Return detached patch-local, DINO CLS global, and patch-average features."""
         tokens = self.forward_tokens(x)
         local = self.patch_tokens_from_output(tokens).detach()
-        global_feature = local.mean(dim=1, keepdim=True).detach()
-        return {"local": local, "global": global_feature}
+        global_feature = self.cls_token_from_output(tokens).detach()
+        avg_global = local.mean(dim=1, keepdim=True).detach()
+        return {"local": local, "global": global_feature, "avg_global": avg_global}
 
     def forward_from_backbone_feat(self, feat: torch.Tensor) -> torch.Tensor:
         return self.head(feat)

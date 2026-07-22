@@ -42,9 +42,12 @@ class FMInferenceRuntime:
         device: str | None = None,
         warmup: bool = True,
     ):
+        init_start = time.perf_counter()
         self.run_dir = Path(run_dir).expanduser().resolve()
+        config_start = time.perf_counter()
         self.cfg = load_run_config(self.run_dir)
         self.deploy = parse_deploy_config(self.cfg)
+        config_load_ms = (time.perf_counter() - config_start) * 1000.0
 
         device_name = device or cfg_get(self.cfg, "runtime.device", "cuda" if torch.cuda.is_available() else "cpu")
         self.device = torch.device(device_name)
@@ -58,20 +61,41 @@ class FMInferenceRuntime:
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         self.checkpoint_path = checkpoint_path
 
+        checkpoint_start = time.perf_counter()
         ckpt_state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        checkpoint_deserialize_ms = (time.perf_counter() - checkpoint_start) * 1000.0
         policy_cfg = policy_config_from_checkpoint_state(ckpt_state, self.cfg)
         self.policy_cfg = policy_cfg
+        model_start = time.perf_counter()
         self.policy = build_policy_from_cfg(
             policy_cfg,
             match_training=True,
             policy_state_dict=ckpt_state.get("policy_state_dict"),
         ).to(self.device)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        model_build_ms = (time.perf_counter() - model_start) * 1000.0
+        self.load_cuda_memory = {
+            "after_model_load": self._cuda_memory_counters(),
+        }
         self.normalizer = DatasetNormalizer.load_state_dict(ckpt_state["normalizer_state_dict"])
+        apply_start = time.perf_counter()
         load_policy_state_dict_checked(
             self.policy,
             ckpt_state["policy_state_dict"],
             checkpoint_path,
         )
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        checkpoint_apply_ms = (time.perf_counter() - apply_start) * 1000.0
+        self.load_cuda_memory["after_checkpoint_load"] = self._cuda_memory_counters()
+        self.load_timing_ms = {
+            "config_load": config_load_ms,
+            "checkpoint_deserialize": checkpoint_deserialize_ms,
+            "model_build_to_device": model_build_ms,
+            "checkpoint_apply": checkpoint_apply_ms,
+            "runtime_total": (time.perf_counter() - init_start) * 1000.0,
+        }
         self.policy.eval()
         self.use_tactile = bool(self.policy.use_tactile)
         if self.use_tactile and self.normalizer.tactile is None:
@@ -99,9 +123,26 @@ class FMInferenceRuntime:
         self.memory_visual_offsets = torch.arange(
             start, -recent + 1, stride, device=self.device, dtype=torch.long
         )
+        self.load_timing_ms["runtime_total"] = (time.perf_counter() - init_start) * 1000.0
 
         if warmup:
             self._warmup()
+
+    def _cuda_memory_counters(self) -> dict[str, float]:
+        if self.device.type != "cuda":
+            return {
+                "allocated_mib": 0.0,
+                "reserved_mib": 0.0,
+                "peak_allocated_mib": 0.0,
+                "peak_reserved_mib": 0.0,
+            }
+        mib = 1024**2
+        return {
+            "allocated_mib": torch.cuda.memory_allocated(self.device) / mib,
+            "reserved_mib": torch.cuda.memory_reserved(self.device) / mib,
+            "peak_allocated_mib": torch.cuda.max_memory_allocated(self.device) / mib,
+            "peak_reserved_mib": torch.cuda.max_memory_reserved(self.device) / mib,
+        }
 
     @property
     def action_dim(self) -> int:

@@ -1,4 +1,4 @@
-"""Measure DINO patch-local and patch-average global feature storage on CUDA."""
+"""Measure DINO patch-local and per-image CLS global feature storage on CUDA."""
 
 import sys
 import time
@@ -49,7 +49,7 @@ def print_timing(stats: dict) -> None:
     names = (
         "backbone_forward_ms",
         "patch_extract_ms",
-        "pooling_ms",
+        "global_extract_ms",
         "view_stack_ms",
         "buffer_append_ms",
         "sample_total_ms",
@@ -112,13 +112,15 @@ def main() -> None:
     print("CLS token shape:", None if cls_token is None else tuple(cls_token.shape))
     print("register token shape:", tuple(register_tokens.shape))
     print("existing CLS global shape:", tuple(current_global.shape))
-    print("average-pooled global shape:", tuple(features["global"].shape))
+    print("DINO CLS global shape:", tuple(features["global"].shape))
+    print("average-pooled patch shape:", tuple(features["avg_global"].shape))
     if backbone.global_pool == "token":
         assert cls_token is not None
         assert torch.allclose(current_global, cls_token, atol=1e-5, rtol=1e-4)
+    assert torch.allclose(features["global"], cls_token, atol=1e-5, rtol=1e-4)
     assert features["local"].shape[1] == expected_patches
     assert torch.allclose(
-        features["global"],
+        features["avg_global"],
         features["local"].mean(dim=1, keepdim=True),
         atol=1e-5,
         rtol=1e-4,
@@ -167,7 +169,6 @@ def main() -> None:
     assert not local_window.requires_grad and local_window.grad_fn is None
     assert not global_window.requires_grad and global_window.grad_fn is None
     assert local_window.device.type == global_window.device.type == "cuda"
-    assert torch.allclose(global_window, local_window.mean(dim=3), atol=1e-5, rtol=1e-4)
 
     describe_tensor("local_single_view_single_frame", latest["local_feature"][:, 0])
     describe_tensor("global_single_view_single_frame", latest["global_feature"][:, 0])
@@ -195,7 +196,7 @@ def main() -> None:
     cleared_snapshot = cuda_memory_snapshot("buffers_cleared", device)
     print(cleared_snapshot)
     print("DINO local = patch-level [B,T,V,N,C]")
-    print("DINO global = average-pooled image feature [B,T,V,C]")
+    print("DINO global = per-image CLS feature [B,T,V,C]")
     print("This is a shape/memory smoke test, not a realtime drop-pressure test.")
 
 

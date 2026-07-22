@@ -173,6 +173,11 @@ def load_policy_state_dict_checked(
                 "The configured view_fusion_proj requires matching view-count weights; "
                 "train or fine-tune it."
             )
+        if any(key.endswith("visual_encoder.cls_token") for key in unexpected):
+            lines.append(
+                "The temporal learned CLS token was removed; the model now pools the "
+                "16 transformed per-frame DINO CLS tokens and requires fine-tuning."
+            )
         message = "\n".join(lines)
         print(message)
         raise RuntimeError(message)

@@ -1,4 +1,4 @@
-"""Fusion memory: CLS visual + Conv state → single token."""
+"""Fusion memory: temporal visual pooling + Conv state → single token."""
 
 from __future__ import annotations
 
@@ -82,7 +82,6 @@ class VisualTemporalMemoryEncoder(nn.Module):
         super().__init__()
         self.visual_dim = int(visual_dim)
         self.time_embed = nn.Embedding(int(max_time_offset) + 1, self.visual_dim)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.visual_dim))
         if int(layers) > 0:
             layer = nn.TransformerEncoderLayer(
                 d_model=self.visual_dim,
@@ -98,7 +97,6 @@ class VisualTemporalMemoryEncoder(nn.Module):
             self.encoder = nn.Identity()
         self.norm = nn.LayerNorm(self.visual_dim)
         self.proj = nn.Linear(self.visual_dim, int(out_dim))
-        nn.init.normal_(self.cls_token, std=0.02)
 
     def forward(
         self,
@@ -117,27 +115,27 @@ class VisualTemporalMemoryEncoder(nn.Module):
         distances = offsets.to(device=visual_tokens.device).abs().long()
         distances = distances.clamp_(0, self.time_embed.num_embeddings - 1)
         x = visual_tokens + self.time_embed(distances).to(dtype=visual_tokens.dtype)
-        cls = self.cls_token.to(dtype=x.dtype).expand(x.shape[0], -1, -1)
-        x = torch.cat([cls, x], dim=1)
 
         key_padding_mask = None
         if valid is not None:
-            # TransformerEncoder: True = ignore. CLS always valid.
-            pad = ~valid.to(device=x.device, dtype=torch.bool)
-            key_padding_mask = torch.cat(
-                [torch.zeros(x.shape[0], 1, dtype=torch.bool, device=x.device), pad],
-                dim=1,
-            )
+            # TransformerEncoder: True means this history timestep is ignored.
+            key_padding_mask = ~valid.to(device=x.device, dtype=torch.bool)
 
         if isinstance(self.encoder, nn.Identity):
             x = self.encoder(x)
         else:
             x = self.encoder(x, src_key_padding_mask=key_padding_mask)
-        return self.proj(self.norm(x[:, 0]))
+        x = self.norm(x)
+        if valid is None:
+            pooled = x.mean(dim=1)
+        else:
+            weights = valid.to(device=x.device, dtype=x.dtype).unsqueeze(-1)
+            pooled = (x * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+        return self.proj(pooled)
 
 
 class MemoryEncoder(nn.Module):
-    """Shared per-view temporal CLS encoders + view/state fusion."""
+    """Shared per-view temporal encoders + view/state fusion."""
 
     def __init__(
         self,
@@ -200,7 +198,7 @@ class MemoryEncoder(nn.Module):
         batch_size: int,
         num_views: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Encode B*V independent length-T histories, then fuse their CLS summaries."""
+        """Encode B*V independent length-T histories, then fuse their summaries."""
         if visual_tokens.ndim != 3:
             raise ValueError(f"expected visual tokens (B*V,T,D), got {visual_tokens.shape}")
         bv, t, _ = visual_tokens.shape

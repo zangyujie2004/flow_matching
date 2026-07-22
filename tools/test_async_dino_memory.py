@@ -74,12 +74,18 @@ def main() -> None:
     memory_state = torch.randn(b, state_history, state_dim, device=device)
     offsets = torch.arange(-64, -3, 4, device=device)
     assert offsets.shape == (t,)
+    temporal_input_shapes = []
+    temporal_encoder = policy.memory_encoder.visual_encoder.encoder
+    hook = temporal_encoder.register_forward_pre_hook(
+        lambda _module, args: temporal_input_shapes.append(tuple(args[0].shape))
+    )
     result = build_policy_memory_input(
         feature_window,
         policy,
         memory_state,
         offsets,
     )
+    hook.remove()
 
     assert result["after_permute"].shape == (b, v, t, c)
     assert result["view_batch_input"].shape == (b * v, t, c)
@@ -91,6 +97,7 @@ def main() -> None:
     assert result["visual_global"].shape == (b, memory_dim)
     assert result["state_global"].shape == (b, 64)
     assert result["memory_global"].shape == (b, memory_dim)
+    assert temporal_input_shapes == [(b * v, t, projected_dim)]
 
     # The standard Policy path must produce exactly the same Memory output.
     memory_obs = {
@@ -113,6 +120,7 @@ def main() -> None:
     shared_temporal = policy.memory_encoder.visual_encoder
     assert sum(module is shared_head for module in policy.modules()) == 1
     assert sum(module is shared_temporal for module in policy.modules()) == 1
+    assert not hasattr(shared_temporal, "cls_token")
     expected_projected = shared_head(result["view_batch_input"])
     assert torch.allclose(result["projected_features"], expected_projected)
     summaries = result["restored_view_summary"]
@@ -130,7 +138,8 @@ def main() -> None:
     print("view-as-batch input:", tuple(result["view_batch_input"].shape))
     print("after shared DINO projection:", tuple(result["projected_features"].shape))
     print("Transformer input:", tuple(result["transformer_input"].shape))
-    print("per-view CLS summaries:", tuple(result["view_summary"].shape))
+    print("per-view temporal summaries:", tuple(result["view_summary"].shape))
+    print("Temporal Transformer sequence length:", temporal_input_shapes[0][1])
     print("restored view summaries:", tuple(result["restored_view_summary"].shape))
     print("view concatenation:", tuple(result["view_concat"].shape))
     print("visual_global:", tuple(result["visual_global"].shape))

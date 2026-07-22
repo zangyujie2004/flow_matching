@@ -35,7 +35,7 @@ class AsyncDinoBuffer:
         self.stage_wall_times = []
         self.end_to_end_times = []
         self.patch_extract_times = []
-        self.pooling_times = []
+        self.global_extract_times = []
         self.view_stack_times = []
         self.buffer_append_times = []
         self.sample_total_times = []
@@ -93,7 +93,7 @@ class AsyncDinoBuffer:
         return self.get_global_feature_window()
 
     def get_global_feature_window(self):
-        """Return detached patch-average features as (B,T=16,V,C), or None."""
+        """Return detached per-image DINO CLS features as (B,T=16,V,C), or None."""
         with self.lock:
             if len(self.buffer) < self.buffer.maxlen:
                 return None
@@ -140,7 +140,7 @@ class AsyncDinoBuffer:
                 "stage_wall_ms": list(self.stage_wall_times),
                 "end_to_end_ms": list(self.end_to_end_times),
                 "patch_extract_ms": list(self.patch_extract_times),
-                "pooling_ms": list(self.pooling_times),
+                "global_extract_ms": list(self.global_extract_times),
                 "view_stack_ms": list(self.view_stack_times),
                 "buffer_append_ms": list(self.buffer_append_times),
                 "sample_total_ms": list(self.sample_total_times),
@@ -180,7 +180,7 @@ class AsyncDinoBuffer:
             ready_time = time.perf_counter()
             entry = {
                 "frame_id": frame_id,
-                # Old callers use "feature"; it now means patch-average global feature.
+                # Old callers use "feature"; it now means the per-image DINO CLS feature.
                 "feature": global_feature,
                 "global_feature": global_feature,
                 "local_feature": local_feature,
@@ -200,7 +200,7 @@ class AsyncDinoBuffer:
                     self.forward_3_times.append(forward_times[2])
                 self.gpu_total_times.append(sum(forward_times))
                 self.patch_extract_times.append(timing["patch_extract_ms"])
-                self.pooling_times.append(timing["pooling_ms"])
+                self.global_extract_times.append(timing["global_extract_ms"])
                 self.view_stack_times.append(timing["view_stack_ms"])
                 self.buffer_append_times.append(append_ms)
                 self.sample_total_times.append((time.perf_counter() - sample_start) * 1000)
@@ -215,9 +215,9 @@ class AsyncDinoBuffer:
         local_features = []
         global_features = []
         forward_events = []
-        pooling_events = []
+        global_events = []
         forward_times = []
-        pooling_times = []
+        global_times = []
         patch_extract_ms = 0.0
         has_patch_api = hasattr(self.dino_model, "patch_tokens_from_output")
         with torch.inference_mode():
@@ -248,17 +248,20 @@ class AsyncDinoBuffer:
                 else:
                     local = tokens.detach()
                 patch_extract_ms += (time.perf_counter() - extract_start) * 1000
-                pool_start = time.perf_counter()
+                global_start = time.perf_counter()
                 if self.device.type == "cuda":
                     begin = torch.cuda.Event(enable_timing=True)
                     end = torch.cuda.Event(enable_timing=True)
                     begin.record()
-                global_feature = local.mean(dim=1, keepdim=True).detach()  # (B,1,C)
+                if has_patch_api:
+                    global_feature = self.dino_model.cls_token_from_output(tokens).detach()
+                else:
+                    global_feature = tokens[:, :1].detach()
                 if self.device.type == "cuda":
                     end.record()
-                    pooling_events.append((begin, end))
+                    global_events.append((begin, end))
                 else:
-                    pooling_times.append((time.perf_counter() - pool_start) * 1000)
+                    global_times.append((time.perf_counter() - global_start) * 1000)
                 local_features.append(local)
                 global_features.append(global_feature.squeeze(1))  # (B,C)
 
@@ -275,7 +278,7 @@ class AsyncDinoBuffer:
                 stack_end.record()
                 torch.cuda.synchronize(self.device)
                 forward_times = [a.elapsed_time(b) for a, b in forward_events]
-                pooling_times = [a.elapsed_time(b) for a, b in pooling_events]
+                global_times = [a.elapsed_time(b) for a, b in global_events]
                 view_stack_ms = stack_begin.elapsed_time(stack_end)
             else:
                 view_stack_ms = (time.perf_counter() - stack_start) * 1000
@@ -283,7 +286,7 @@ class AsyncDinoBuffer:
         timing = {
             "forward_times": forward_times,
             "patch_extract_ms": patch_extract_ms,
-            "pooling_ms": sum(pooling_times),
+            "global_extract_ms": sum(global_times),
             "view_stack_ms": view_stack_ms,
             "stage_wall_ms": (time.perf_counter() - stage_start) * 1000,
         }
