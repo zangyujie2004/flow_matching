@@ -445,6 +445,37 @@ class FMInferenceRuntime:
         if self.async_dino_buffer is not None:
             self.async_dino_buffer.stop()
 
+    def async_memory_status(self) -> dict[str, Any]:
+        """Return a lightweight status snapshot for realtime Memory health checks."""
+        enabled = bool(getattr(self.policy, "memory_enabled", False))
+        if self.async_dino_buffer is None:
+            return {
+                "enabled": enabled,
+                "running": False,
+                "memory_ready": False,
+                "memory_lag_ms": None,
+                "history_length": self.memory_visual_history_length,
+                "sample_interval_frames": self.dino_sample_interval_frames,
+            }
+
+        stats = dict(self.async_dino_buffer.get_stats())
+        latest_capture_time = stats.get("latest_capture_time")
+        memory_lag_ms = (
+            None
+            if latest_capture_time is None
+            else (time.perf_counter() - float(latest_capture_time)) * 1000.0
+        )
+        stats.update(
+            {
+                "enabled": enabled,
+                "running": True,
+                "memory_lag_ms": memory_lag_ms,
+                "history_length": self.memory_visual_history_length,
+                "sample_interval_frames": self.dino_sample_interval_frames,
+            }
+        )
+        return stats
+
     def infer_from_window(
         self,
         frames: Sequence[Any],

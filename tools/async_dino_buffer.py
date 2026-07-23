@@ -179,6 +179,7 @@ class AsyncDinoBuffer:
 
     def get_stats(self):
         with self.lock:
+            latest = None if not self.buffer else self.buffer[-1]
             timing_lists = {
                 "backbone_forward_ms": list(
                     self.forward_1_times + self.forward_2_times + self.forward_3_times
@@ -200,6 +201,11 @@ class AsyncDinoBuffer:
                 "processed_count": self.processed_count,
                 "dropped_count": self.dropped_count,
                 "buffer_length": len(self.buffer),
+                "memory_ready": latest is not None,
+                "latest_frame_id": None if latest is None else int(latest["frame_id"]),
+                "latest_capture_time": None if latest is None else float(latest["capture_time"]),
+                "latest_ready_time": None if latest is None else float(latest["ready_time"]),
+                "latest_has_state": False if latest is None else latest["robot_state"] is not None,
             }
 
         stats = {}
