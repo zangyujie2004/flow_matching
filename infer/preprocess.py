@@ -345,6 +345,137 @@ def ros_image_to_rgb(msg: Any) -> np.ndarray:
         return image[:, :, 2::-1].copy()
     raise ValueError(f"unsupported RGB image encoding {msg.encoding!r}")
 
+
+def build_dino_images(frame: Any, cfg: PreprocessConfig) -> list[torch.Tensor]:
+    """Convert the configured two or three camera images to NCHW uint8 tensors."""
+
+    if len(cfg.camera_views) not in {2, 3}:
+        raise ValueError("Async DINO needs two or three camera views")
+    samples = _frame_samples(frame)
+    images = []
+    for name in cfg.camera_views:
+        if name not in samples:
+            raise KeyError(f"frame missing camera stream {name!r}")
+        sample = samples[name]
+        if hasattr(sample, "data"):
+            rgb = np.asarray(sample.data, dtype=np.uint8)
+        else:
+            rgb = ros_image_to_rgb(sample.msg)
+        resized = resize_rgb_like_training(rgb, cfg.image_size)
+        image = torch.from_numpy(np.ascontiguousarray(resized.transpose(2, 0, 1)))
+        images.append(image.unsqueeze(0))
+    return images
+
+
+@torch.inference_mode()
+def build_policy_memory_input(
+    feature_window: torch.Tensor,
+    policy: Any,
+    memory_state: torch.Tensor,
+    visual_offsets: torch.Tensor,
+    measure_cuda_memory: bool = False,
+) -> dict[str, Any]:
+    """Run the repository's real image-head and memory path with explicit shapes."""
+    if feature_window.ndim != 4:
+        raise ValueError(
+            "feature_window must be (B,T,V,C_backbone), got "
+            f"{tuple(feature_window.shape)}"
+        )
+    b, t, v, c = feature_window.shape
+    image_encoder = policy.condition_encoder.image_encoder
+    if v != image_encoder.n_views:
+        raise ValueError(f"buffer has {v} views but policy expects {image_encoder.n_views}")
+    expected_c = int(image_encoder.encoder.head[0].normalized_shape[0])
+    if c != expected_c:
+        raise ValueError(
+            f"buffer backbone dim is {c}, but DINO projection head expects {expected_c}"
+        )
+    policy_device = next(policy.parameters()).device
+    if feature_window.device != policy_device:
+        raise ValueError(
+            f"feature_window is on {feature_window.device}, policy is on {policy_device}"
+        )
+    if memory_state.ndim != 3 or memory_state.shape[0] != b:
+        raise ValueError(
+            f"memory_state must be (B,T_state,D_state), got {tuple(memory_state.shape)}"
+        )
+    if policy.memory_encoder is None or policy.memory_token_proj is None:
+        raise RuntimeError("policy memory is not enabled")
+
+    if visual_offsets.ndim == 1 and visual_offsets.shape[0] != t:
+        raise ValueError(f"visual_offsets length {visual_offsets.shape[0]} != T={t}")
+    if visual_offsets.ndim == 2 and visual_offsets.shape != (b, t):
+        raise ValueError(f"visual_offsets shape {tuple(visual_offsets.shape)} != ({b},{t})")
+    if visual_offsets.ndim not in {1, 2}:
+        raise ValueError(f"visual_offsets must be (T,) or (B,T), got {visual_offsets.shape}")
+    if not hasattr(policy.memory_encoder, "encode_visual_views"):
+        raise RuntimeError("build_policy_memory_input requires fusion MemoryEncoder")
+
+    # Never reshape B,T,V,C directly: view must precede time before V enters batch.
+    after_permute = feature_window.permute(0, 2, 1, 3).contiguous()  # (B,V,T,C)
+    view_batch_input = after_permute.reshape(b * v, t, c)  # (B*V,T,C)
+    projected_features = image_encoder.project_view_histories_from_backbone_feat(
+        feature_window
+    )  # (B*V,T,C')
+    after_projection_head = (
+        cuda_memory_snapshot("after_projection_head", feature_window.device)
+        if measure_cuda_memory else None
+    )
+
+    visual_global, view_summary, restored, view_concat = (
+        policy.memory_encoder.encode_visual_views(
+            projected_features,
+            visual_offsets,
+            batch_size=b,
+            num_views=v,
+        )
+    )
+    state_global = policy.memory_encoder.state_encoder(memory_state)  # (B,state_mem_dim)
+    fused = policy.memory_encoder.fusion(
+        torch.cat([visual_global, state_global], dim=-1)
+    )  # (B,memory_dim)
+    memory_tokens = policy.memory_token_proj(fused.unsqueeze(1))  # (B,1,cond_dim)
+    memory_global = policy.memory_token_proj(fused)  # (B,cond_dim)
+    after_transformer = (
+        cuda_memory_snapshot("after_transformer", feature_window.device)
+        if measure_cuda_memory else None
+    )
+    return {
+        "after_permute": after_permute,
+        "view_batch_input": view_batch_input,
+        "projected_features": projected_features,
+        "transformer_input": projected_features,
+        "view_summary": view_summary,
+        "restored_view_summary": restored,
+        "view_concat": view_concat,
+        "visual_global": visual_global,
+        "state_global": state_global,
+        "memory_tokens": memory_tokens,
+        "memory_global": memory_global,
+        "cuda_after_projection_head": after_projection_head,
+        "cuda_after_transformer": after_transformer,
+    }
+
+
+def tensor_mib(tensor: torch.Tensor) -> float:
+    """The tensor's own storage size; unlike CUDA reserved memory, this is exact."""
+    return tensor.numel() * tensor.element_size() / (1024**2)
+
+
+def cuda_memory_snapshot(label: str, device: torch.device) -> dict[str, float | str]:
+    """Read PyTorch CUDA allocator counters in MiB."""
+    if device.type != "cuda":
+        return {"stage": label, "allocated_mib": 0.0, "reserved_mib": 0.0, "peak_mib": 0.0}
+    torch.cuda.synchronize(device)
+    mib = 1024**2
+    return {
+        "stage": label,
+        "allocated_mib": torch.cuda.memory_allocated(device) / mib,
+        "reserved_mib": torch.cuda.memory_reserved(device) / mib,
+        "peak_mib": torch.cuda.max_memory_allocated(device) / mib,
+    }
+
+
 def build_obs_from_frames(
     frames: Sequence[Any],
     cfg: PreprocessConfig,

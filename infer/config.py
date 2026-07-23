@@ -143,6 +143,70 @@ def policy_config_from_checkpoint_state(state: Mapping[str, Any], fallback: Mapp
     return dict(fallback)
 
 
+def load_policy_state_dict_checked(
+    policy: FlowMatchingPolicy,
+    state_dict: Mapping[str, Any],
+    checkpoint_path: Path | str,
+) -> None:
+    """Reject and clearly report missing, unexpected, or size-mismatched weights."""
+    model_state = policy.state_dict()
+    missing = sorted(key for key in model_state if key not in state_dict)
+    unexpected = sorted(key for key in state_dict if key not in model_state)
+    mismatched = sorted(
+        (
+            key,
+            tuple(state_dict[key].shape),
+            tuple(model_state[key].shape),
+        )
+        for key in model_state.keys() & state_dict.keys()
+        if tuple(state_dict[key].shape) != tuple(model_state[key].shape)
+    )
+    if missing or unexpected or mismatched:
+        lines = [f"Checkpoint is incompatible with current policy: {checkpoint_path}"]
+        lines.append(f"Missing keys: {missing}")
+        lines.append(f"Unexpected keys: {unexpected}")
+        lines.append(f"Size mismatches: {mismatched}")
+        # Legacy concat-fusion checkpoints carried a `memory_cond_fusion` MLP that
+        # compressed [obs_cond|memory_global] 512->256. The current path feeds the
+        # raw 512-wide condition straight into the velocity model, so those params
+        # no longer exist. Never load such a checkpoint with strict=False.
+        if any("memory_cond_fusion" in key for key in unexpected):
+            lines.append(
+                "Detected legacy `memory_cond_fusion` parameters: this checkpoint was "
+                "trained with the old 512->256 fusion MLP, which has been removed. The "
+                "current model concatenates [obs_cond | memory_global] into a 512-wide "
+                "global_cond directly. Retrain/fine-tune; do NOT load with strict=False."
+            )
+        # global_cond width changes (e.g. 256->512 when concat_global_cond is enabled)
+        # land on the UNet FiLM first block or the DiT cond_proj input dimension.
+        if any(
+            ("cond_encoder" in key or "cond_proj" in key)
+            for key, _, _ in mismatched
+        ):
+            lines.append(
+                "Velocity-model condition input dim mismatch (UNet FiLM / DiT cond_proj): "
+                "the checkpoint's global_cond width differs from this model "
+                "(memory_injection / concat_global_cond changes cond_dim*2). "
+                "Rebuild the policy with the matching config; do NOT load with strict=False."
+            )
+        if any("view_fusion_proj" in key for key in missing) or any(
+            "view_fusion_proj" in key for key, _, _ in mismatched
+        ):
+            lines.append(
+                "The configured view_fusion_proj requires matching view-count weights; "
+                "train or fine-tune it."
+            )
+        if any(key.endswith("visual_encoder.cls_token") for key in unexpected):
+            lines.append(
+                "The temporal learned CLS token was removed; the model now pools the "
+                "16 transformed per-frame DINO CLS tokens and requires fine-tuning."
+            )
+        message = "\n".join(lines)
+        print(message)
+        raise RuntimeError(message)
+    policy.load_state_dict(state_dict)
+
+
 def load_runtime_checkpoint(
     path: Path | str,
     cfg: Mapping[str, Any],
@@ -156,12 +220,7 @@ def load_runtime_checkpoint(
         match_training=match_training,
         policy_state_dict=state.get("policy_state_dict"),
     )
-    try:
-        policy.load_state_dict(state["policy_state_dict"])
-    except RuntimeError as exc:
-        raise RuntimeError(
-            f"Failed to load checkpoint into {policy.velocity_model} backbone: {path}"
-        ) from exc
+    load_policy_state_dict_checked(policy, state["policy_state_dict"], path)
     normalizer = DatasetNormalizer.load_state_dict(state["normalizer_state_dict"])
     policy.eval()
     return policy, normalizer, state

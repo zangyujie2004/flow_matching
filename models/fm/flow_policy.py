@@ -56,6 +56,9 @@ class FlowMatchingPolicy(nn.Module):
         memory_dim: int = 256,
         memory_history_frames: int = 64,
         memory_recent_frame: int = 2,
+        memory_visual_history_length: int = 128,
+        memory_visual_sample_stride: int = 8,
+        memory_visual_recent_frame: int = 0,
         memory_visual_layers: int = 2,
         memory_visual_heads: int = 4,
         memory_state_channels: int = 128,
@@ -82,6 +85,15 @@ class FlowMatchingPolicy(nn.Module):
         self.memory_method = str(memory_method)
         self.memory_history_frames = int(memory_history_frames)
         self.memory_recent_frame = int(memory_recent_frame)
+        self.memory_visual_history_length = int(memory_visual_history_length)
+        self.memory_visual_sample_stride = int(memory_visual_sample_stride)
+        self.memory_visual_recent_frame = int(memory_visual_recent_frame)
+        if self.memory_visual_history_length < 1:
+            raise ValueError("memory_visual_history_length must be positive")
+        if self.memory_visual_sample_stride < 1:
+            raise ValueError("memory_visual_sample_stride must be positive")
+        if self.memory_visual_recent_frame < 0:
+            raise ValueError("memory_visual_recent_frame must be non-negative")
         self.memory_injection = str(memory_injection).lower()
         if self.memory_injection not in {"cross_attn", "concat_global_cond"}:
             raise ValueError(
@@ -122,7 +134,6 @@ class FlowMatchingPolicy(nn.Module):
 
         self.memory_encoder = None
         self.memory_token_proj = None
-        self.memory_cond_fusion = None
         if self.memory_enabled:
             self.memory_encoder = build_memory_encoder(
                 self.memory_method,
@@ -131,6 +142,11 @@ class FlowMatchingPolicy(nn.Module):
                 memory_dim=int(memory_dim),
                 history_frames=self.memory_history_frames,
                 recent_frame=self.memory_recent_frame,
+                max_visual_time_offset=(
+                    self.memory_visual_recent_frame
+                    + self.memory_visual_sample_stride
+                    * (self.memory_visual_history_length - 1)
+                ),
                 visual_layers=memory_visual_layers,
                 visual_heads=memory_visual_heads,
                 state_channels=memory_state_channels,
@@ -139,6 +155,7 @@ class FlowMatchingPolicy(nn.Module):
                 num_queries=memory_num_queries,
                 state_hidden_dim=memory_state_hidden_dim,
                 state_heads=memory_state_heads,
+                n_views=n_image_views,
                 dropout=memory_dropout,
             )
             self.memory_token_proj = (
@@ -146,20 +163,18 @@ class FlowMatchingPolicy(nn.Module):
                 if int(memory_dim) == self.cond_dim
                 else nn.Linear(int(memory_dim), self.cond_dim)
             )
-            if self.memory_injection == "concat_global_cond":
-                self.memory_cond_fusion = nn.Sequential(
-                    nn.LayerNorm(self.cond_dim * 2),
-                    nn.Linear(self.cond_dim * 2, self.cond_dim),
-                    nn.SiLU(),
-                    nn.Dropout(memory_dropout),
-                    nn.Linear(self.cond_dim, self.cond_dim),
-                )
+
+        # concat_global_cond keeps [obs_cond ; memory_global] at 2*cond_dim (no
+        # compression MLP); every other path stays at cond_dim.
+        self.global_cond_dim = self.cond_dim
+        if self.memory_enabled and self.memory_injection == "concat_global_cond":
+            self.global_cond_dim = self.cond_dim * 2
 
         if self.velocity_model == "unet":
             self.model = ConditionalUnet1D(
                 input_dim=self.action_dim,
                 local_cond_dim=None,
-                global_cond_dim=self.cond_dim,
+                global_cond_dim=self.global_cond_dim,
                 diffusion_step_embed_dim=diffusion_step_embed_dim,
                 down_dims=tuple(down_dims),
                 kernel_size=kernel_size,
@@ -170,7 +185,7 @@ class FlowMatchingPolicy(nn.Module):
             self.model = ActionDiT(
                 input_dim=self.action_dim,
                 action_horizon=self.action_horizon,
-                global_cond_dim=self.cond_dim,
+                global_cond_dim=self.global_cond_dim,
                 diffusion_step_embed_dim=diffusion_step_embed_dim,
                 hidden_dim=dit_hidden_dim,
                 depth=dit_depth,
@@ -233,6 +248,24 @@ class FlowMatchingPolicy(nn.Module):
             kwargs["memory_recent_frame"] = int(
                 data_mem.get("recent_frame", kwargs.get("memory_recent_frame", 2))
             )
+            kwargs["memory_visual_history_length"] = int(
+                data_mem.get(
+                    "visual_history_length",
+                    kwargs.get("memory_visual_history_length", 128),
+                )
+            )
+            kwargs["memory_visual_sample_stride"] = int(
+                data_mem.get(
+                    "sample_stride",
+                    kwargs.get("memory_visual_sample_stride", 8),
+                )
+            )
+            kwargs["memory_visual_recent_frame"] = int(
+                data_mem.get(
+                    "visual_recent_frame",
+                    kwargs.get("memory_visual_recent_frame", 0),
+                )
+            )
             kwargs["memory_visual_layers"] = int(
                 mem_cfg.get("visual_layers", kwargs.get("memory_visual_layers", 2))
             )
@@ -294,21 +327,40 @@ class FlowMatchingPolicy(nn.Module):
     def _build_memory(self, obs: Dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         if self.memory_encoder is None or self.memory_token_proj is None:
             raise RuntimeError("memory encoder is not configured")
-        required = ("memory_image_backbone_feat", "memory_state", "memory_visual_offsets")
+        required = ("memory_state", "memory_visual_offsets")
         missing = [key for key in required if key not in obs]
+        if "memory_visual_tokens" not in obs and "memory_image_backbone_feat" not in obs:
+            missing.append("memory_visual_tokens or memory_image_backbone_feat")
         if missing:
             raise KeyError(
                 "memory is enabled but obs is missing required keys: " + ", ".join(missing)
             )
-        visual_tokens = self.condition_encoder.encode_image_sequence_from_backbone_feat(
-            obs["memory_image_backbone_feat"]
-        )
+        visual_tokens = obs.get("memory_visual_tokens")
+        num_views = None
+        if visual_tokens is None:
+            backbone_feat = obs["memory_image_backbone_feat"]
+            if self.memory_method == "fusion":
+                if backbone_feat.ndim != 4:
+                    raise ValueError(
+                        f"memory backbone features must be (B,T,V,C), got {backbone_feat.shape}"
+                    )
+                num_views = int(backbone_feat.shape[2])
+                visual_tokens = (
+                    self.condition_encoder.image_encoder
+                    .project_view_histories_from_backbone_feat(backbone_feat)
+                )
+            else:
+                visual_tokens = self.condition_encoder.encode_image_sequence_from_backbone_feat(
+                    backbone_feat
+                )
+        memory_kwargs = {"num_views": num_views} if self.memory_method == "fusion" else {}
         mem_out = self.memory_encoder(
             visual_tokens=visual_tokens,
             visual_offsets=obs["memory_visual_offsets"],
             state=obs["memory_state"],
             visual_valid=obs.get("memory_visual_valid"),
             state_valid=obs.get("memory_state_valid"),
+            **memory_kwargs,
         )
         tokens = self.memory_token_proj(mem_out.tokens)
         memory_global = self.memory_token_proj(mem_out.memory_global)
@@ -325,9 +377,9 @@ class FlowMatchingPolicy(nn.Module):
         if self.memory_injection == "cross_attn":
             # Locked: memory only in condition_tokens; obs stays in global_cond / AdaLN.
             return obs_cond, tokens
-        if self.memory_cond_fusion is None:
-            raise RuntimeError("memory_cond_fusion is required for concat_global_cond mode")
-        global_cond = self.memory_cond_fusion(torch.cat([obs_cond, memory_global], dim=-1))
+        # concat_global_cond: keep the raw [obs_cond ; memory_global] at 2*cond_dim.
+        # Order is fixed (obs first, memory second) and must match at train / infer time.
+        global_cond = torch.cat([obs_cond, memory_global], dim=-1)
         return global_cond, None
 
     def _model_forward(

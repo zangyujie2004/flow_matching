@@ -13,14 +13,21 @@ from infer.config import (
     action_dim_for_config,
     build_policy_from_cfg,
     load_run_config,
+    load_policy_state_dict_checked,
     parse_deploy_config,
     policy_config_from_checkpoint_state,
 )
 from infer.postprocess import apply_action_process
-from infer.preprocess import build_obs_from_frames, parse_preprocess_config
+from infer.preprocess import (
+    build_dino_images,
+    build_obs_from_frames,
+    build_policy_memory_input,
+    parse_preprocess_config,
+)
 from infer.tensor import as_float32_array, default_tactile_norm, numpy_obs_to_torch
 from infer.types import InferenceChunk, PreprocessConfig
 from tools.normalizer import DatasetNormalizer
+from tools.async_dino_buffer import AsyncDinoBuffer
 from utils.train_utils import cfg_get
 
 _IDENTITY_ROT6D = np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32)
@@ -35,9 +42,12 @@ class FMInferenceRuntime:
         device: str | None = None,
         warmup: bool = True,
     ):
+        init_start = time.perf_counter()
         self.run_dir = Path(run_dir).expanduser().resolve()
+        config_start = time.perf_counter()
         self.cfg = load_run_config(self.run_dir)
         self.deploy = parse_deploy_config(self.cfg)
+        config_load_ms = (time.perf_counter() - config_start) * 1000.0
 
         device_name = device or cfg_get(self.cfg, "runtime.device", "cuda" if torch.cuda.is_available() else "cpu")
         self.device = torch.device(device_name)
@@ -51,21 +61,41 @@ class FMInferenceRuntime:
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         self.checkpoint_path = checkpoint_path
 
+        checkpoint_start = time.perf_counter()
         ckpt_state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        checkpoint_deserialize_ms = (time.perf_counter() - checkpoint_start) * 1000.0
         policy_cfg = policy_config_from_checkpoint_state(ckpt_state, self.cfg)
         self.policy_cfg = policy_cfg
+        model_start = time.perf_counter()
         self.policy = build_policy_from_cfg(
             policy_cfg,
             match_training=True,
             policy_state_dict=ckpt_state.get("policy_state_dict"),
         ).to(self.device)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        model_build_ms = (time.perf_counter() - model_start) * 1000.0
+        self.load_cuda_memory = {
+            "after_model_load": self._cuda_memory_counters(),
+        }
         self.normalizer = DatasetNormalizer.load_state_dict(ckpt_state["normalizer_state_dict"])
-        try:
-            self.policy.load_state_dict(ckpt_state["policy_state_dict"])
-        except RuntimeError as exc:
-            raise RuntimeError(
-                f"Failed to load checkpoint into {self.policy.velocity_model} backbone: {checkpoint_path}"
-            ) from exc
+        apply_start = time.perf_counter()
+        load_policy_state_dict_checked(
+            self.policy,
+            ckpt_state["policy_state_dict"],
+            checkpoint_path,
+        )
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        checkpoint_apply_ms = (time.perf_counter() - apply_start) * 1000.0
+        self.load_cuda_memory["after_checkpoint_load"] = self._cuda_memory_counters()
+        self.load_timing_ms = {
+            "config_load": config_load_ms,
+            "checkpoint_deserialize": checkpoint_deserialize_ms,
+            "model_build_to_device": model_build_ms,
+            "checkpoint_apply": checkpoint_apply_ms,
+            "runtime_total": (time.perf_counter() - init_start) * 1000.0,
+        }
         self.policy.eval()
         self.use_tactile = bool(self.policy.use_tactile)
         if self.use_tactile and self.normalizer.tactile is None:
@@ -81,15 +111,75 @@ class FMInferenceRuntime:
         self.num_inference_steps = int(fm_cfg.get("num_inference_steps", DEFAULT_NUM_INFERENCE_STEPS))
         self.solver = str(fm_cfg.get("solver", DEFAULT_SOLVER))
         self.velocity_model = str(self.policy.velocity_model)
+        self.async_dino_buffer: AsyncDinoBuffer | None = None
+        self.async_dino_preprocess: PreprocessConfig | None = None
+
+        memory_cfg = dict(data_cfg.get("memory") or {})
+        self.memory_visual_history_length = max(
+            1, int(memory_cfg.get("visual_history_length", 128))
+        )
+        self.dino_sample_interval_frames = max(
+            1, int(memory_cfg.get("sample_stride", 8))
+        )
+        self.memory_visual_recent_frame = max(
+            0, int(memory_cfg.get("visual_recent_frame", 0))
+        )
+        start = (
+            -self.memory_visual_recent_frame
+            - self.dino_sample_interval_frames
+            * (self.memory_visual_history_length - 1)
+        )
+        self.memory_visual_offsets = torch.arange(
+            start,
+            -self.memory_visual_recent_frame + 1,
+            self.dino_sample_interval_frames,
+            device=self.device,
+            dtype=torch.long,
+        )
+        if self.policy.memory_enabled:
+            policy_history = int(self.policy.memory_visual_history_length)
+            policy_stride = int(self.policy.memory_visual_sample_stride)
+            policy_recent = int(self.policy.memory_visual_recent_frame)
+            configured = (
+                self.memory_visual_history_length,
+                self.dino_sample_interval_frames,
+                self.memory_visual_recent_frame,
+            )
+            policy_values = (policy_history, policy_stride, policy_recent)
+            if configured != policy_values:
+                raise ValueError(
+                    "runtime visual memory config does not match Policy: "
+                    f"runtime={configured}, policy={policy_values}"
+                )
+        self.load_timing_ms["runtime_total"] = (time.perf_counter() - init_start) * 1000.0
 
         if warmup:
             self._warmup()
+
+    def _cuda_memory_counters(self) -> dict[str, float]:
+        if self.device.type != "cuda":
+            return {
+                "allocated_mib": 0.0,
+                "reserved_mib": 0.0,
+                "peak_allocated_mib": 0.0,
+                "peak_reserved_mib": 0.0,
+            }
+        mib = 1024**2
+        return {
+            "allocated_mib": torch.cuda.memory_allocated(self.device) / mib,
+            "reserved_mib": torch.cuda.memory_reserved(self.device) / mib,
+            "peak_allocated_mib": torch.cuda.max_memory_allocated(self.device) / mib,
+            "peak_reserved_mib": torch.cuda.max_memory_reserved(self.device) / mib,
+        }
 
     @property
     def action_dim(self) -> int:
         return action_dim_for_config(self.policy_cfg)
 
     def _warmup(self) -> None:
+        # Memory inference needs real history. Do not hide a missing history with zeros.
+        if self.policy.memory_enabled:
+            return
         image_size = int(cfg_get(self.policy_cfg, "data.image_size", 224))
         n_views = self.n_image_views
         dummy_obs = {
@@ -121,6 +211,7 @@ class FMInferenceRuntime:
         obs: Mapping[str, Any],
         *,
         state_raw: np.ndarray,
+        memory_state_raw: np.ndarray | None = None,
         num_inference_steps: int | None = None,
         solver: str | None = None,
     ) -> np.ndarray:
@@ -138,6 +229,13 @@ class FMInferenceRuntime:
             normalizer=self.normalizer,
             window_size=self.window_size,
         )
+        if self.policy.memory_enabled:
+            memory_obs = self._get_async_memory_obs(memory_state_raw)
+            if memory_obs is None:
+                raise RuntimeError(
+                    "memory not ready: DINO buffer needs its first processed sample"
+                )
+            obs_torch.update(memory_obs)
         steps = self.num_inference_steps if num_inference_steps is None else int(num_inference_steps)
         solver_name = self.solver if solver is None else str(solver)
 
@@ -151,6 +249,63 @@ class FMInferenceRuntime:
             pred_norm = pred_norm[0]
         pred_abs = self.normalizer.unnormalize_action_np(pred_norm, state_raw)
         return as_float32_array(pred_abs, name="pred_abs")
+
+    @torch.inference_mode()
+    def _get_async_memory_obs(
+        self,
+        memory_state_raw: np.ndarray | None,
+    ) -> dict[str, torch.Tensor] | None:
+        if self.async_dino_buffer is None:
+            return None
+        feature_window = self.async_dino_buffer.get_feature_window()
+        if feature_window is None:
+            return None
+        if memory_state_raw is None:
+            raise ValueError("memory_state_raw is required when policy memory is enabled")
+
+        state = as_float32_array(memory_state_raw, name="memory_state_raw")
+        expected = (self.policy.memory_history_frames, self.policy.state_dim)
+        if state.shape != expected:
+            raise ValueError(f"memory_state_raw shape {state.shape} != {expected}")
+        state_norm = self.normalizer.normalize_state_np(state).astype(np.float32, copy=False)
+
+        _b, t, v, c = feature_window.shape
+        image_encoder = self.policy.condition_encoder.image_encoder
+        expected_c = int(image_encoder.encoder.head[0].normalized_shape[0])
+        if (t, v, c) != (
+            self.memory_visual_history_length,
+            image_encoder.n_views,
+            expected_c,
+        ):
+            raise ValueError(
+                "async DINO window shape must be "
+                f"(B,{self.memory_visual_history_length},"
+                f"{image_encoder.n_views},{expected_c}), got {tuple(feature_window.shape)}"
+            )
+        return {
+            "memory_image_backbone_feat": feature_window,
+            "memory_state": torch.from_numpy(state_norm).unsqueeze(0).to(self.device),
+            "memory_visual_offsets": self.memory_visual_offsets,
+        }
+
+    @torch.inference_mode()
+    def build_async_policy_memory(
+        self,
+        memory_state_raw: np.ndarray,
+        measure_cuda_memory: bool = False,
+    ) -> dict[str, Any] | None:
+        """Return real Policy Memory intermediates after at least one DINO sample."""
+        memory_obs = self._get_async_memory_obs(memory_state_raw)
+        if memory_obs is None:
+            return None
+        feature_window = self.async_dino_buffer.get_feature_window()
+        return build_policy_memory_input(
+            feature_window,
+            self.policy,
+            memory_obs["memory_state"],
+            self.memory_visual_offsets,
+            measure_cuda_memory=measure_cuda_memory,
+        )
 
     @torch.inference_mode()
     def predict_rot6d_abs_batch(
@@ -186,10 +341,86 @@ class FMInferenceRuntime:
         elapsed_ms = (time.perf_counter() - start) * 1000.0 / repeats
         return {"infer_ms": float(elapsed_ms), "repeats": float(repeats)}
 
+    def start_async_dino(
+        self,
+        *,
+        preprocess: PreprocessConfig | None = None,
+        sample_interval_frames: int | None = None,
+        deadline_ms: float | None = None,
+    ) -> AsyncDinoBuffer:
+        """Start a simple two- or three-camera DINO buffer."""
+
+        if self.async_dino_buffer is not None:
+            self.async_dino_buffer.stop()
+        self.async_dino_preprocess = preprocess or parse_preprocess_config(self.cfg)
+        if len(self.async_dino_preprocess.camera_views) != self.n_image_views:
+            raise ValueError(
+                "async camera count must match policy n_image_views: "
+                f"{len(self.async_dino_preprocess.camera_views)} != {self.n_image_views}"
+            )
+        if (
+            self.policy.memory_enabled
+            and self.memory_visual_offsets.numel()
+            != self.memory_visual_history_length
+        ):
+            raise ValueError(
+                "visual offset count does not match configured history length: "
+                f"{self.memory_visual_offsets.numel()} visual memory tokens"
+            )
+        interval = (
+            self.dino_sample_interval_frames
+            if sample_interval_frames is None
+            else int(sample_interval_frames)
+        )
+        if self.policy.memory_enabled and interval != self.dino_sample_interval_frames:
+            raise ValueError(
+                "sample_interval_frames must match configured visual sample_stride: "
+                f"{interval} != {self.dino_sample_interval_frames}"
+            )
+        deadline = 33.0 * interval if deadline_ms is None else float(deadline_ms)
+        dino_model = self.policy.condition_encoder.image_encoder.encoder
+        self.async_dino_buffer = AsyncDinoBuffer(
+            dino_model=dino_model,
+            device=str(self.device),
+            sample_interval_frames=interval,
+            history_length=self.memory_visual_history_length,
+            deadline_ms=deadline,
+        )
+        self.async_dino_buffer.start()
+        print(f"memory_visual_history_length = {self.memory_visual_history_length}")
+        print(f"dino_sample_interval_frames = {interval}")
+        print("visual_token_source = dino_cls")
+        print("startup_padding = repeat_first_frame")
+        print(
+            "memory_visual_input_shape = "
+            f"[B,{self.memory_visual_history_length},{self.n_image_views},384]"
+        )
+        return self.async_dino_buffer
+
+    def submit_async_dino_frame(
+        self,
+        frame_id: int,
+        frame: Any,
+        capture_time: float | None = None,
+    ) -> bool:
+        """Submit one synchronized infer frame at the camera frame rate."""
+
+        if self.async_dino_buffer is None or self.async_dino_preprocess is None:
+            raise RuntimeError("call start_async_dino() first")
+        images = build_dino_images(frame, self.async_dino_preprocess)
+        return self.async_dino_buffer.submit_frame(
+            frame_id, *images, capture_time=capture_time
+        )
+
+    def stop_async_dino(self) -> None:
+        if self.async_dino_buffer is not None:
+            self.async_dino_buffer.stop()
+
     def infer_from_window(
         self,
         frames: Sequence[Any],
         *,
+        memory_state_raw: np.ndarray | None = None,
         preprocess: PreprocessConfig | None = None,
         robot: Mapping[str, Any] | None = None,
         num_inference_steps: int | None = None,
@@ -217,6 +448,7 @@ class FMInferenceRuntime:
         pred_rot6d = self.predict_rot6d_abs(
             obs,
             state_raw=state_raw,
+            memory_state_raw=memory_state_raw,
             num_inference_steps=num_inference_steps,
             solver=solver,
         )

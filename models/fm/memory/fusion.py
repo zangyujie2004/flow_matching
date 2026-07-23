@@ -1,4 +1,4 @@
-"""Fusion memory: CLS visual + Conv state → single token."""
+"""Fusion memory: temporal visual pooling + Conv state → single token."""
 
 from __future__ import annotations
 
@@ -82,7 +82,6 @@ class VisualTemporalMemoryEncoder(nn.Module):
         super().__init__()
         self.visual_dim = int(visual_dim)
         self.time_embed = nn.Embedding(int(max_time_offset) + 1, self.visual_dim)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.visual_dim))
         if int(layers) > 0:
             layer = nn.TransformerEncoderLayer(
                 d_model=self.visual_dim,
@@ -98,7 +97,6 @@ class VisualTemporalMemoryEncoder(nn.Module):
             self.encoder = nn.Identity()
         self.norm = nn.LayerNorm(self.visual_dim)
         self.proj = nn.Linear(self.visual_dim, int(out_dim))
-        nn.init.normal_(self.cls_token, std=0.02)
 
     def forward(
         self,
@@ -117,27 +115,27 @@ class VisualTemporalMemoryEncoder(nn.Module):
         distances = offsets.to(device=visual_tokens.device).abs().long()
         distances = distances.clamp_(0, self.time_embed.num_embeddings - 1)
         x = visual_tokens + self.time_embed(distances).to(dtype=visual_tokens.dtype)
-        cls = self.cls_token.to(dtype=x.dtype).expand(x.shape[0], -1, -1)
-        x = torch.cat([cls, x], dim=1)
 
         key_padding_mask = None
         if valid is not None:
-            # TransformerEncoder: True = ignore. CLS always valid.
-            pad = ~valid.to(device=x.device, dtype=torch.bool)
-            key_padding_mask = torch.cat(
-                [torch.zeros(x.shape[0], 1, dtype=torch.bool, device=x.device), pad],
-                dim=1,
-            )
+            # TransformerEncoder: True means this history timestep is ignored.
+            key_padding_mask = ~valid.to(device=x.device, dtype=torch.bool)
 
         if isinstance(self.encoder, nn.Identity):
             x = self.encoder(x)
         else:
             x = self.encoder(x, src_key_padding_mask=key_padding_mask)
-        return self.proj(self.norm(x[:, 0]))
+        x = self.norm(x)
+        if valid is None:
+            pooled = x.mean(dim=1)
+        else:
+            weights = valid.to(device=x.device, dtype=x.dtype).unsqueeze(-1)
+            pooled = (x * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+        return self.proj(pooled)
 
 
 class MemoryEncoder(nn.Module):
-    """Fusion path: visual CLS + state Conv → single memory vector."""
+    """Shared per-view temporal encoders + view/state fusion."""
 
     def __init__(
         self,
@@ -147,18 +145,25 @@ class MemoryEncoder(nn.Module):
         memory_dim: int,
         history_frames: int = 64,
         recent_frame: int = 2,
+        max_visual_time_offset: int | None = None,
         visual_layers: int = 2,
         visual_heads: int = 4,
         state_channels: int = 128,
         state_layers: int = 2,
         state_mem_dim: int = 64,
+        n_views: int = 3,
         dropout: float = 0.1,
         **_ignored,
     ):
         super().__init__()
         visual_branch_dim = int(memory_dim)
         state_branch_dim = int(state_mem_dim)
-        max_time_offset = int(history_frames) + int(recent_frame)
+        self.n_views = int(n_views)
+        max_time_offset = (
+            int(history_frames) + int(recent_frame)
+            if max_visual_time_offset is None
+            else int(max_visual_time_offset)
+        )
         self.visual_encoder = VisualTemporalMemoryEncoder(
             visual_dim=int(visual_dim),
             out_dim=visual_branch_dim,
@@ -174,6 +179,13 @@ class MemoryEncoder(nn.Module):
             layers=int(state_layers),
             dropout=float(dropout),
         )
+        self.view_fusion_proj = nn.Sequential(
+            nn.LayerNorm(self.n_views * visual_branch_dim),
+            nn.Linear(self.n_views * visual_branch_dim, visual_branch_dim),
+            nn.SiLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(visual_branch_dim, visual_branch_dim),
+        )
         self.fusion = nn.Sequential(
             nn.LayerNorm(visual_branch_dim + state_branch_dim),
             nn.Linear(visual_branch_dim + state_branch_dim, int(memory_dim)),
@@ -181,6 +193,53 @@ class MemoryEncoder(nn.Module):
             nn.Dropout(float(dropout)),
             nn.Linear(int(memory_dim), int(memory_dim)),
         )
+
+    def encode_visual_views(
+        self,
+        visual_tokens: torch.Tensor,
+        visual_offsets: torch.Tensor,
+        visual_valid: torch.Tensor | None = None,
+        *,
+        batch_size: int,
+        num_views: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Encode B*V independent length-T histories, then fuse their summaries."""
+        if visual_tokens.ndim != 3:
+            raise ValueError(f"expected visual tokens (B*V,T,D), got {visual_tokens.shape}")
+        bv, t, _ = visual_tokens.shape
+        if batch_size <= 0 or bv % batch_size != 0:
+            raise ValueError(f"visual batch {bv} is not divisible by state batch {batch_size}")
+        inferred_views = bv // batch_size
+        num_views = inferred_views if num_views is None else int(num_views)
+        if num_views != inferred_views:
+            raise ValueError(f"num_views {num_views} != inferred views {inferred_views}")
+        if num_views != self.n_views:
+            raise ValueError(
+                f"input has {num_views} views, but this model was built for {self.n_views}; "
+                "view_fusion_proj dimensions must match the checkpoint/config"
+            )
+
+        offsets = visual_offsets
+        if offsets.ndim == 2 and offsets.shape == (batch_size, t):
+            offsets = offsets[:, None].expand(-1, num_views, -1).reshape(bv, t)
+        valid = visual_valid
+        if valid is not None:
+            if valid.ndim == 1:
+                valid = valid.unsqueeze(0).expand(bv, -1)
+            elif valid.shape == (batch_size, t):
+                valid = valid[:, None].expand(-1, num_views, -1).reshape(bv, t)
+            valid = _as_batch_valid(
+                valid,
+                batch=bv,
+                seq=t,
+                device=visual_tokens.device,
+            )
+
+        view_summary = self.visual_encoder(visual_tokens, offsets, valid=valid)  # (B*V,D)
+        restored = view_summary.reshape(batch_size, num_views, -1)  # (B,V,D)
+        view_concat = restored.reshape(batch_size, -1)  # (B,V*D)
+        visual_global = self.view_fusion_proj(view_concat)  # (B,D)
+        return visual_global, view_summary, restored, view_concat
 
     def forward(
         self,
@@ -190,13 +249,19 @@ class MemoryEncoder(nn.Module):
         state: torch.Tensor,
         visual_valid: torch.Tensor | None = None,
         state_valid: torch.Tensor | None = None,
+        num_views: int | None = None,
     ) -> MemoryOutput:
-        bsz, tv, _ = visual_tokens.shape
+        bsz = state.shape[0]
         ts = state.shape[1]
-        device = visual_tokens.device
-        vis_valid = _as_batch_valid(visual_valid, batch=bsz, seq=tv, device=device)
+        device = state.device
         st_valid = _as_batch_valid(state_valid, batch=bsz, seq=ts, device=device)
-        visual_mem = self.visual_encoder(visual_tokens, visual_offsets, valid=vis_valid)
+        visual_mem, _, _, _ = self.encode_visual_views(
+            visual_tokens,
+            visual_offsets,
+            visual_valid,
+            batch_size=bsz,
+            num_views=num_views,
+        )
         state_mem = self.state_encoder(state, valid=st_valid)
         token = self.fusion(torch.cat([visual_mem, state_mem], dim=-1))
         tokens = token.unsqueeze(1)

@@ -97,20 +97,54 @@ class DinoV2SmallEncoder(nn.Module):
         std = x.new_tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         return (x - mean) / std
 
-    def extract_backbone_feat(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        """Return timm tokens ordered as CLS, registers, then patch tokens."""
         x = self._imagenet_normalize(x)
         if self.freeze:
             with torch.no_grad():
                 tokens = self.backbone.forward_features(x)
         else:
             tokens = self.backbone.forward_features(x)
-        if tokens.ndim != 3:
-            raise RuntimeError(f"expected forward_features (B,N,D), got {tuple(tokens.shape)}")
+        if not torch.is_tensor(tokens) or tokens.ndim != 3:
+            raise TypeError(
+                "timm DINO forward_features must return a (B,prefix+N,C) Tensor, "
+                f"got {type(tokens).__name__}"
+            )
+        return tokens
+
+    def extract_backbone_feat(self, x: torch.Tensor) -> torch.Tensor:
+        """Full token cache entry: (B, 257, D) with token 0 = global CLS."""
+        tokens = self.forward_tokens(x)
         if int(tokens.shape[1]) != self.num_tokens:
             raise RuntimeError(
                 f"expected {self.num_tokens} tokens (CLS+patches), got N={tokens.shape[1]}"
             )
         return tokens
+
+    def patch_tokens_from_output(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Remove CLS/register prefix tokens and return (B,N,C) patch tokens."""
+        prefix_count = int(getattr(self.backbone, "num_prefix_tokens", 0))
+        if tokens.ndim != 3 or tokens.shape[1] <= prefix_count:
+            raise ValueError(
+                f"invalid DINO token shape {tuple(tokens.shape)} with {prefix_count} prefix tokens"
+            )
+        return tokens[:, prefix_count:]
+
+    def cls_token_from_output(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Return the image's own DINO CLS token as (B,1,C)."""
+        if getattr(self.backbone, "cls_token", None) is None:
+            raise RuntimeError("this DINO backbone does not provide a CLS token")
+        if tokens.ndim != 3 or tokens.shape[1] < 1:
+            raise ValueError(f"invalid DINO token shape {tuple(tokens.shape)}")
+        return tokens[:, :1]
+
+    def extract_local_global_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Return detached patch-local, DINO CLS global, and patch-average features."""
+        tokens = self.forward_tokens(x)
+        local = self.patch_tokens_from_output(tokens).detach()
+        global_feature = self.cls_token_from_output(tokens).detach()
+        avg_global = local.mean(dim=1, keepdim=True).detach()
+        return {"local": local, "global": global_feature, "avg_global": avg_global}
 
     def forward_from_backbone_feat(self, feat: torch.Tensor) -> torch.Tensor:
         return self.head(feat)
@@ -371,6 +405,21 @@ class DinoV2Encoder(nn.Module):
             return self._fuse_view_feats(projected)
         tokens = self._to_token_cache(feat)
         return self._encode_from_tokens(tokens)
+
+    def project_view_histories_from_backbone_feat(
+        self,
+        feat: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project shared DINO features: (B,T,V,C) -> (B*V,T,out_dim)."""
+        if feat.ndim != 4:
+            raise ValueError(f"expected backbone feat (B,T,V,C), got {feat.shape}")
+        b, t, v, c = feat.shape
+        if v != self.n_views:
+            raise ValueError(f"feature views {v} != configured n_views {self.n_views}")
+        # Time and view must be exchanged before view becomes part of the batch.
+        view_history = feat.permute(0, 2, 1, 3).contiguous()  # (B,V,T,C)
+        view_batch = view_history.reshape(b * v, t, c)  # (B*V,T,C)
+        return self.encoder.forward_from_backbone_feat(view_batch)  # (B*V,T,out_dim)
 
     def encode_from_backbone_feat(self, feat: torch.Tensor) -> torch.Tensor:
         return self.encode_all_from_backbone_feat(feat)[:, -1]
