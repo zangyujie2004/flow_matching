@@ -71,14 +71,14 @@ def _plot_eef_traj(ax: plt.Axes, data: np.ndarray, title: str) -> None:
 
 def visualize_sample(ds: ZarrDataset, idx: int, out_dir: str) -> str:
     idx = int(idx)
-    anchor_t, ep_end, ep_idx = ds.windows[idx]
+    anchor_t, ep_end, ep_idx, base_mode = ds._window_fields(idx)
     s0, s1 = ds.state_range(idx)
     i0, i1 = ds.image_range(idx)
     a0, a1 = ds.action_range(idx)
 
     state = ds.get_state(s0, s1)
     action = ds.get_action(a0, a1)
-    camera = ds.get_camera(i0, i1)
+    camera = ds.get_camera(i0, i1, base_mode=base_mode, ep_idx=ep_idx)
     tactile = ds.get_tactile(s0, s1) if ds.use_tactile else None
 
     anchor_in_obs = ds.window_size - 1
@@ -86,7 +86,7 @@ def visualize_sample(ds: ZarrDataset, idx: int, out_dir: str) -> str:
 
     fig = plt.figure(figsize=(16, 10))
     fig.suptitle(
-        f"sample idx={idx}  ep={ep_idx}  anchor_t={anchor_t}  "
+        f"sample idx={idx}  ep={ep_idx}  anchor_t={anchor_t}  base_mode={base_mode}  "
         f"action_type={ds.action_type}  repr={ds.action_representation}",
         fontsize=11,
     )

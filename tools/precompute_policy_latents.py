@@ -24,8 +24,11 @@ from tools.latent_cache import (  # noqa: E402
     FRAME_CACHE_VERSION,
     apply_resolved_latent_cache_root_dir,
     frame_cache_matches,
+    normalize_token_mode,
     resolve_frame_backbone_zarr_path,
+    token_mode_num_tokens,
     write_latent_cache_identity_attrs,
+    write_token_mode_attrs,
 )
 from utils.train_utils import cfg_get, load_config  # noqa: E402
 
@@ -75,6 +78,7 @@ def precompute_image_latents(cfg: dict, *, force: bool = False) -> str:
     force = bool(force) or bool(pre_cfg.get("overwrite", False))
 
     batch_size = max(1, int(pre_cfg.get("batch_size", 256)))
+    token_mode = normalize_token_mode(pre_cfg.get("token_mode"), default="all")
     device = torch.device(str(pre_cfg.get("device", cfg_get(cfg, "runtime.device", "cuda"))))
     fm_cfg = dict(cfg["models"]["fm"])
     if not bool(fm_cfg.get("freeze_image_encoder", True)):
@@ -101,6 +105,7 @@ def precompute_image_latents(cfg: dict, *, force: bool = False) -> str:
         image_size=int(dataset.image_size),
         camera_views=dataset.camera_views,
         total_frames=total_frames,
+        token_mode=token_mode,
         color_order="rgb",
     ):
         print(f"[precompute] frame cache identity match, skipping: {output_path}")
@@ -126,7 +131,7 @@ def precompute_image_latents(cfg: dict, *, force: bool = False) -> str:
     out_root.attrs["image_size"] = int(dataset.image_size)
     out_root.attrs["color_order"] = "rgb"
     out_root.attrs["frame_image_selection"] = "all_frames"
-    out_root.attrs["image_num_tokens"] = int(DINOV2_NUM_TOKENS)
+    write_token_mode_attrs(out_root, token_mode)
     write_latent_cache_identity_attrs(out_root, fm_cfg)
     out_root.attrs["camera_views"] = ",".join(dataset.camera_views)
 
@@ -139,7 +144,7 @@ def precompute_image_latents(cfg: dict, *, force: bool = False) -> str:
     frame_arr = None
     print(
         f"[precompute] encoding all frames: T={total_frames}, views={list(dataset.camera_views)}, "
-        f"model={model_name}, tokens={DINOV2_NUM_TOKENS}, "
+        f"model={model_name}, token_mode={token_mode}, "
         f"batch_size={batch_size}, device={device}, out={output_path}"
     )
 
@@ -155,7 +160,12 @@ def precompute_image_latents(cfg: dict, *, force: bool = False) -> str:
             bsz, num_views = image_batch.shape[:2]
             flat = image_batch.reshape(bsz * num_views, *image_batch.shape[2:])
             tokens = image_encoder.extract_backbone_feat(flat)  # (B*V, 257, D)
-            image_feat = tokens.reshape(bsz, num_views, tokens.shape[1], tokens.shape[2])
+            if token_mode == "cls":
+                image_feat = tokens[:, 0].reshape(bsz, num_views, tokens.shape[-1])
+            else:
+                image_feat = tokens.reshape(
+                    bsz, num_views, tokens.shape[1], tokens.shape[2]
+                )
 
         img = image_feat.detach().cpu().numpy().astype(np.float32, copy=False)
         if frame_arr is None:
@@ -167,7 +177,7 @@ def precompute_image_latents(cfg: dict, *, force: bool = False) -> str:
             )
             out_root.attrs["image_backbone_dim"] = int(img.shape[-1])
             out_root.attrs["n_image_views"] = int(img.shape[1])
-            out_root.attrs["image_num_tokens"] = int(img.shape[2])
+            out_root.attrs["image_num_tokens"] = token_mode_num_tokens(token_mode)
         frame_arr[start_idx : start_idx + len(frame_indices)] = img
 
     if frame_arr is None:
@@ -175,9 +185,8 @@ def precompute_image_latents(cfg: dict, *, force: bool = False) -> str:
 
     print(f"[precompute] saved frame backbone cache: {output_path}")
     print(
-        f"[precompute] frame_image_backbone_feat shape=({total_frames}, "
-        f"{out_root.attrs['n_image_views']}, {out_root.attrs['image_num_tokens']}, "
-        f"{out_root.attrs['image_backbone_dim']})"
+        f"[precompute] frame_image_backbone_feat shape={tuple(frame_arr.shape)}, "
+        f"token_mode={token_mode}"
     )
     return output_path
 

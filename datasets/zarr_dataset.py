@@ -16,6 +16,8 @@ if _POLICY_ROOT not in sys.path:
     sys.path.insert(0, _POLICY_ROOT)
 
 from tools.latent_cache import (
+    infer_token_mode_from_attrs_and_shape,
+    resolve_frame_backbone_base_remove_hand_zarr_path,
     resolve_latent_cache_zarr_path,
     validate_latent_cache_identity,
 )
@@ -28,6 +30,12 @@ _ACTION_TYPES = ("joint", "eef")
 _ROBOT_SLICES = {"joint": slice(0, 14), "eef": slice(14, 34)}
 _ROBOT_DIMS = {"joint": 14, "eef": 20}
 CAMERA_BUNDLE_ORDER = ("base_0", "left_wrist_0", "right_wrist_0")
+CAMERA_BASE_REMOVE_HAND_KEY = "camera_base_remove_hand"
+META_EPISODE_ENDS_REMOVE_HAND = "episode_ends_remove_hand"
+BASE_REMOVE_HAND_PRESENT = "present"
+BASE_MODE_ORIGINAL = "original"
+BASE_MODE_REMOVE = "remove"
+WindowTuple = Tuple[int, int, int, str]
 
 
 def resolve_camera_views(
@@ -123,6 +131,7 @@ class ZarrDataset(Dataset):
         action_key: str = "action_30hz",
         camera_views: Sequence[str] | None = None,
         camera_augmentation: bool = False,
+        mix_base_remove_hand: bool = False,
         memory: Mapping[str, Any] | None = None,
         norm_output_range: Tuple[float, float] = (-1.0, 1.0),
         normalizer_max_windows: int | None = None,
@@ -147,6 +156,12 @@ class ZarrDataset(Dataset):
         self.image_as_uint8 = bool(image_as_uint8)
         self.use_camera_latent = bool(use_camera_latent)
         self.camera_augmentation = bool(camera_augmentation)
+        self.mix_base_remove_hand_requested = bool(mix_base_remove_hand)
+        self.mix_base_remove_hand = False
+        self.ep_has_rh: np.ndarray | None = None
+        self.ep_to_compact: np.ndarray | None = None
+        self.episode_ends_remove_hand: np.ndarray | None = None
+        self.cached_frame_image_backbone_feat_remove_hand: np.ndarray | None = None
         self.latent_cache_root_dir = latent_cache_root_dir
         self.latent_cache_image_encoder_name = latent_cache_image_encoder_name
         self.latent_cache_image_model_name = latent_cache_image_model_name
@@ -196,6 +211,7 @@ class ZarrDataset(Dataset):
         self.cached_image_backbone_feat = None
         self.cached_frame_image_backbone_feat = None
         self._frame_latent_view_indices: tuple[int, ...] | None = None
+        self.latent_token_mode: str | None = None
         self.image_backbone_dim: int | None = None
         self.cached_norm_action: np.ndarray | None = None
         self.camera_key = camera_key
@@ -216,7 +232,6 @@ class ZarrDataset(Dataset):
         self.episode_ends = np.asarray(self.meta_group["episode_ends"][:], dtype=np.int64)
         self.episode_starts = np.concatenate([np.array([0], dtype=np.int64), self.episode_ends[:-1]])
 
-        self._preload_to_ram()
         n_zarr_views = self._zarr_camera_view_count()
         self.camera_views = resolve_camera_views(camera_views, n_zarr_views=n_zarr_views)
         self._camera_channel_indices = camera_channel_indices(self.camera_views)
@@ -235,6 +250,8 @@ class ZarrDataset(Dataset):
                 f"start_mode={self.memory_start_mode}"
             )
 
+        self._setup_mix_base_remove_hand()
+        self._preload_to_ram()
         self.windows = self._build_windows()
         if self.max_windows is not None:
             cap = max(1, int(self.max_windows))
@@ -249,11 +266,14 @@ class ZarrDataset(Dataset):
             )
         self.window_lookup = {
             (int(anchor_t), int(ep_idx)): idx
-            for idx, (anchor_t, _ep_end, ep_idx) in enumerate(self.windows)
+            for idx, (anchor_t, _ep_end, ep_idx, base_mode) in enumerate(self.windows)
+            if base_mode == BASE_MODE_ORIGINAL
         }
 
         if self.use_camera_latent:
             self._maybe_open_latent_cache()
+            if self.mix_base_remove_hand:
+                self._maybe_open_remove_hand_latent_cache()
         elif self.latent_cache_root_dir:
             cache_path = self._resolve_latent_cache_path(require_exists=False)
             if cache_path is not None and os.path.isdir(cache_path):
@@ -332,9 +352,127 @@ class ZarrDataset(Dataset):
         keys = [self.state_key, self.action_key]
         if not self.use_camera_latent:
             keys.insert(0, self.camera_key)
+            if self.mix_base_remove_hand:
+                keys.append(CAMERA_BASE_REMOVE_HAND_KEY)
         if self.use_tactile:
             keys.append(self.tactile_key)
         return keys
+
+    def _meta_json_path(self) -> str:
+        if self.root_dir.endswith(".zarr"):
+            return os.path.join(os.path.dirname(self.root_dir), "meta.json")
+        return os.path.join(self.root_dir, "meta.json")
+
+    def _load_run_meta(self) -> dict[str, Any]:
+        import json
+
+        path = self._meta_json_path()
+        if not os.path.isfile(path):
+            return {}
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else {}
+
+    def _setup_mix_base_remove_hand(self) -> None:
+        """Duplicate eligible windows with the compact remove-hand base view."""
+        if not self.mix_base_remove_hand_requested:
+            return
+        if "base_0" not in self.camera_views:
+            raise ValueError(
+                "mix_base_remove_hand=true requires base_0 in data.camera_views"
+            )
+
+        run_meta = self._load_run_meta()
+        flags = (
+            (run_meta.get("dataset") or {}).get("base_remove_hand") or {}
+        ).get("per_episode")
+        has_array = CAMERA_BASE_REMOVE_HAND_KEY in self.data_group
+        has_ends = META_EPISODE_ENDS_REMOVE_HAND in self.meta_group
+        if not flags or not any(str(flag) == BASE_REMOVE_HAND_PRESENT for flag in flags):
+            print(
+                "[ZarrDataset] no remove-hand episodes found; "
+                "mix_base_remove_hand degrades to original-only"
+            )
+            return
+        if len(flags) != self.num_episodes:
+            raise ValueError(
+                "dataset.base_remove_hand.per_episode length "
+                f"{len(flags)} != num_episodes {self.num_episodes}"
+            )
+        if not has_array or not has_ends:
+            raise ValueError(
+                "remove-hand metadata exists but replay_buffer.zarr is missing "
+                f"data/{CAMERA_BASE_REMOVE_HAND_KEY} or meta/{META_EPISODE_ENDS_REMOVE_HAND}"
+            )
+
+        ep_has_rh = np.asarray(
+            [str(flag) == BASE_REMOVE_HAND_PRESENT for flag in flags],
+            dtype=np.bool_,
+        )
+        ep_to_compact = np.full(self.num_episodes, -1, dtype=np.int64)
+        compact_idx = 0
+        for ep_idx, present in enumerate(ep_has_rh):
+            if present:
+                ep_to_compact[ep_idx] = compact_idx
+                compact_idx += 1
+
+        ends_rh = np.asarray(
+            self.meta_group[META_EPISODE_ENDS_REMOVE_HAND][:], dtype=np.int64
+        )
+        if len(ends_rh) != compact_idx:
+            raise ValueError(
+                f"episode_ends_remove_hand length {len(ends_rh)} != present_count {compact_idx}"
+            )
+        remove_frames = int(self.data_group[CAMERA_BASE_REMOVE_HAND_KEY].shape[0])
+        if int(ends_rh[-1]) != remove_frames:
+            raise ValueError(
+                f"episode_ends_remove_hand[-1]={int(ends_rh[-1])} "
+                f"!= remove-hand frames={remove_frames}"
+            )
+        for ep_idx, present in enumerate(ep_has_rh):
+            if not present:
+                continue
+            compact_ep = int(ep_to_compact[ep_idx])
+            rh_start = 0 if compact_ep == 0 else int(ends_rh[compact_ep - 1])
+            rh_end = int(ends_rh[compact_ep])
+            main_length = int(
+                self.episode_ends[ep_idx] - self.episode_starts[ep_idx]
+            )
+            if rh_end - rh_start != main_length:
+                raise ValueError(
+                    f"episode {ep_idx}: remove-hand length {rh_end - rh_start} "
+                    f"!= main length {main_length}"
+                )
+
+        self.ep_has_rh = ep_has_rh
+        self.ep_to_compact = ep_to_compact
+        self.episode_ends_remove_hand = ends_rh
+        self.mix_base_remove_hand = True
+        print(
+            "[ZarrDataset] mix_base_remove_hand enabled: "
+            f"present={int(ep_has_rh.sum())}, "
+            f"none={self.num_episodes - int(ep_has_rh.sum())}"
+        )
+
+    def _compact_indices(self, main_indices: np.ndarray, ep_idx: int) -> np.ndarray:
+        if self.ep_to_compact is None or self.episode_ends_remove_hand is None:
+            raise RuntimeError("remove-hand compact index map is not initialized")
+        compact_ep = int(self.ep_to_compact[int(ep_idx)])
+        if compact_ep < 0:
+            raise ValueError(f"episode {ep_idx} has no remove-hand data")
+        main_start = int(self.episode_starts[int(ep_idx)])
+        rh_start = (
+            0
+            if compact_ep == 0
+            else int(self.episode_ends_remove_hand[compact_ep - 1])
+        )
+        return rh_start + (np.asarray(main_indices, dtype=np.int64) - main_start)
+
+    def _window_fields(self, idx: int) -> WindowTuple:
+        window = self.windows[int(idx)]
+        if len(window) == 3:
+            return int(window[0]), int(window[1]), int(window[2]), BASE_MODE_ORIGINAL
+        return int(window[0]), int(window[1]), int(window[2]), str(window[3])
 
     def _zarr_camera_view_count(self) -> int:
         if self.camera_key not in self.data_group:
@@ -428,14 +566,20 @@ class ZarrDataset(Dataset):
         self.image_backbone_dim = int(cache_attrs.get("image_backbone_dim", frame_src.shape[-1]))
         # Materialize full frame cache into RAM so DataLoader workers avoid zarr I/O.
         frame = np.asarray(frame_src[:], dtype=np.float32)
-        if frame.ndim == 3:
+        token_mode = infer_token_mode_from_attrs_and_shape(
+            cache_attrs, tuple(int(x) for x in frame.shape)
+        )
+        self.latent_token_mode = token_mode
+        if token_mode == "cls":
+            if frame.ndim == 4 and int(frame.shape[2]) == 1:
+                frame = frame[:, :, 0, :]
+            if frame.ndim != 3:
+                raise ValueError(
+                    f"CLS cache expected (T,V,D), got {tuple(frame.shape)} at {cache_path}"
+                )
+        elif frame.ndim != 4:
             raise ValueError(
-                f"Latent cache at {cache_path} is CLS-only shape {tuple(frame.shape)}. "
-                "Rebuild with ./scripts/precompute.sh (expects T,V,257,D)."
-            )
-        if frame.ndim != 4:
-            raise ValueError(
-                f"Unexpected frame_image_backbone_feat ndim={frame.ndim}, shape={tuple(frame.shape)}"
+                f"all-token cache expected (T,V,N,D), got {tuple(frame.shape)} at {cache_path}"
             )
         view_idx = [int(i) for i in latent_view_indices]
         if view_idx != list(range(int(frame.shape[1]))):
@@ -446,11 +590,65 @@ class ZarrDataset(Dataset):
         frame_gb = frame.nbytes / (1024**3)
         print(
             f"[ZarrDataset] frame latent cache loaded: {cache_path}, "
-            f"shape={tuple(frame.shape)}, using_views={self.n_image_views}, "
+            f"shape={tuple(frame.shape)}, token_mode={token_mode}, "
+            f"using_views={self.n_image_views}, "
             f"backbone_dim={self.image_backbone_dim}, size={frame_gb:.3f} GB"
         )
         self.latent_cache_group = None
         self.latent_cache_zarr = None
+
+    def _maybe_open_remove_hand_latent_cache(self) -> None:
+        root = self.latent_cache_root_dir or self.root_dir
+        cache_path = resolve_frame_backbone_base_remove_hand_zarr_path(str(root))
+        if not os.path.isdir(cache_path):
+            raise FileNotFoundError(
+                f"Remove-hand latent cache not found: {cache_path}"
+            )
+        cache_root = zarr.open_group(cache_path, mode="r")
+        if "data" not in cache_root or "frame_image_backbone_feat" not in cache_root["data"]:
+            raise KeyError(f"Invalid remove-hand latent cache: {cache_path}")
+
+        attrs = dict(getattr(cache_root, "attrs", {}) or {})
+        self._validate_latent_cache_identity(cache_path, attrs)
+        if str(attrs.get("camera_views", "")).strip() != "base_0":
+            raise ValueError("remove-hand latent cache must contain only base_0")
+
+        source = cache_root["data"]["frame_image_backbone_feat"]
+        if self.episode_ends_remove_hand is None:
+            raise RuntimeError("remove-hand episode mapping is not initialized")
+        if int(source.shape[0]) != int(self.episode_ends_remove_hand[-1]):
+            raise ValueError("remove-hand latent frame count does not match metadata")
+        if int(source.shape[1]) != 1:
+            raise ValueError(
+                f"remove-hand latent cache expected one view, got {source.shape[1]}"
+            )
+
+        frame = np.asarray(source[:], dtype=np.float32)
+        token_mode = infer_token_mode_from_attrs_and_shape(
+            attrs, tuple(int(x) for x in frame.shape)
+        )
+        if token_mode != self.latent_token_mode:
+            raise ValueError(
+                f"remove-hand token_mode={token_mode} != main token_mode={self.latent_token_mode}"
+            )
+        if token_mode == "cls":
+            if frame.ndim == 4 and int(frame.shape[2]) == 1:
+                frame = frame[:, :, 0, :]
+            if frame.ndim == 3 and int(frame.shape[1]) == 1:
+                frame = frame[:, 0, :]
+            if frame.ndim != 2:
+                raise ValueError(
+                    f"remove-hand CLS cache expected (T,D), got {tuple(frame.shape)}"
+                )
+        elif frame.ndim != 4:
+            raise ValueError(
+                f"remove-hand all-token cache expected (T,1,N,D), got {tuple(frame.shape)}"
+            )
+        self.cached_frame_image_backbone_feat_remove_hand = np.ascontiguousarray(frame)
+        print(
+            f"[ZarrDataset] remove-hand latent cache loaded: {cache_path}, "
+            f"shape={tuple(frame.shape)}, token_mode={token_mode}"
+        )
 
     def _gather_frame_latent(self, indices) -> np.ndarray:
         if self.cached_frame_image_backbone_feat is None:
@@ -460,9 +658,50 @@ class ZarrDataset(Dataset):
         idx = np.asarray(indices, dtype=np.int64)
         return self.cached_frame_image_backbone_feat[idx]
 
+    def _gather_remove_hand_frame_latent(self, compact_indices) -> np.ndarray:
+        if self.cached_frame_image_backbone_feat_remove_hand is None:
+            raise RuntimeError("remove-hand frame latent cache is not loaded")
+        indices = np.asarray(compact_indices, dtype=np.int64)
+        return self.cached_frame_image_backbone_feat_remove_hand[indices]
+
+    def _replace_base_latent(
+        self,
+        feature: np.ndarray,
+        main_indices: np.ndarray,
+        ep_idx: int,
+    ) -> np.ndarray:
+        base_view = int(self.camera_views.index("base_0"))
+        compact = self._compact_indices(main_indices, ep_idx)
+        remove = self._gather_remove_hand_frame_latent(compact)
+        output = np.array(feature, copy=True)
+        if self.latent_token_mode == "cls":
+            if remove.ndim != 2 or remove.shape != (
+                feature.shape[0],
+                feature.shape[-1],
+            ):
+                raise ValueError(
+                    f"remove-hand CLS shape {remove.shape} incompatible with {feature.shape}"
+                )
+            output[:, base_view, :] = remove
+            return output
+        if remove.ndim == 4 and int(remove.shape[1]) == 1:
+            remove = remove[:, 0]
+        if remove.ndim != 3 or remove.shape != (
+            feature.shape[0],
+            feature.shape[2],
+            feature.shape[3],
+        ):
+            raise ValueError(
+                f"remove-hand token shape {remove.shape} incompatible with {feature.shape}"
+            )
+        output[:, base_view, :, :] = remove
+        return output
+
     def get_camera_latent(self, idx: int) -> np.ndarray:
+        _anchor_t, _ep_end, ep_idx, base_mode = self._window_fields(idx)
         i0, i1 = self.image_range(idx)
-        feat = self._gather_frame_latent(np.arange(i0, i1, dtype=np.int64))
+        indices = np.arange(i0, i1, dtype=np.int64)
+        feat = self._gather_frame_latent(indices)
         if feat.ndim == 2:
             feat = feat[None, ...]
         if feat.shape[0] != self.n_image_steps:
@@ -473,9 +712,16 @@ class ZarrDataset(Dataset):
             raise ValueError(
                 f"camera latent view mismatch: {feat.shape[1]} != {self.n_image_views}"
             )
-        return feat
+        if base_mode == BASE_MODE_REMOVE:
+            feat = self._replace_base_latent(feat, indices, ep_idx)
+        return np.ascontiguousarray(feat)
 
-    def get_memory_camera_latent(self, anchor_t: int, ep_idx: int) -> np.ndarray:
+    def get_memory_camera_latent(
+        self,
+        anchor_t: int,
+        ep_idx: int,
+        base_mode: str = BASE_MODE_ORIGINAL,
+    ) -> np.ndarray:
         indices = self.memory_visual_indices(anchor_t, ep_idx)
         feat = self._gather_frame_latent(indices)
         if feat.shape[0] != len(self.memory_visual_offsets):
@@ -486,6 +732,8 @@ class ZarrDataset(Dataset):
             raise ValueError(
                 f"memory camera latent view mismatch: {feat.shape[1]} != {self.n_image_views}"
             )
+        if base_mode == BASE_MODE_REMOVE:
+            feat = self._replace_base_latent(feat, indices, ep_idx)
         # Full-token cache is (T, V, 257, D); Temporal Memory consumes global CLS only.
         # Take token 0 -> (T, V, D). CLS-only caches (T, V, D) pass through unchanged.
         if feat.ndim == 4:
@@ -528,8 +776,8 @@ class ZarrDataset(Dataset):
             )
         print(f"[ZarrDataset] total RAM preload: {total_gb:.3f} GB")
 
-    def _build_windows(self) -> List[Tuple[int, int, int]]:
-        windows: List[Tuple[int, int, int]] = []
+    def _build_windows(self) -> List[WindowTuple]:
+        windows: List[WindowTuple] = []
         cond_len = max(self.window_size, self.n_image_steps)
 
         for ep_idx, (ep_start, ep_end) in enumerate(zip(self.episode_starts, self.episode_ends)):
@@ -539,8 +787,15 @@ class ZarrDataset(Dataset):
             last_t = ep_end - self.action_horizon
             if last_t < first_t:
                 continue
+            has_remove = bool(
+                self.mix_base_remove_hand
+                and self.ep_has_rh is not None
+                and self.ep_has_rh[ep_idx]
+            )
             for t in range(first_t, last_t + 1, self.stride):
-                windows.append((t, ep_end, ep_idx))
+                windows.append((t, ep_end, ep_idx, BASE_MODE_ORIGINAL))
+                if has_remove:
+                    windows.append((t, ep_end, ep_idx, BASE_MODE_REMOVE))
 
         return windows
 
@@ -589,11 +844,11 @@ class ZarrDataset(Dataset):
         return obs_start, obs_end
 
     def state_range(self, idx: int) -> Tuple[int, int]:
-        anchor_t, _, ep_idx = self.windows[idx]
+        anchor_t, _, ep_idx, _ = self._window_fields(idx)
         return self._obs_window_indices(anchor_t, ep_idx)
 
     def image_range(self, idx: int) -> Tuple[int, int]:
-        anchor_t, _, ep_idx = self.windows[idx]
+        anchor_t, _, ep_idx, _ = self._window_fields(idx)
         image_start = int(anchor_t - self.n_image_steps + 1)
         image_end = int(anchor_t + 1)
         ep_start, _ = self.episode_bounds(ep_idx)
@@ -604,7 +859,7 @@ class ZarrDataset(Dataset):
         return image_start, image_end
 
     def action_range(self, idx: int) -> Tuple[int, int]:
-        anchor_t, episode_end, _ = self.windows[idx]
+        anchor_t, episode_end, _, _ = self._window_fields(idx)
         action_start = int(anchor_t)
         action_end = int(anchor_t + self.action_horizon)
         if action_end > int(episode_end):
@@ -632,8 +887,31 @@ class ZarrDataset(Dataset):
     def get_action(self, t0: int, t1: int) -> np.ndarray:
         return self._slice_robot(self._read_array(self.action_key, slice(t0, t1), dtype=np.float32))
 
-    def get_camera(self, t0: int, t1: int) -> np.ndarray:
+    def get_camera(
+        self,
+        t0: int,
+        t1: int,
+        *,
+        base_mode: str = BASE_MODE_ORIGINAL,
+        ep_idx: int | None = None,
+    ) -> np.ndarray:
         camera = self._read_array(self.camera_key, slice(t0, t1))
+        if base_mode == BASE_MODE_REMOVE:
+            if not self.mix_base_remove_hand or ep_idx is None:
+                raise RuntimeError(
+                    "base_mode=remove requires mix_base_remove_hand and ep_idx"
+                )
+            main_indices = np.arange(t0, t1, dtype=np.int64)
+            compact = self._compact_indices(main_indices, ep_idx)
+            remove = np.asarray(self.ram_data[CAMERA_BASE_REMOVE_HAND_KEY][compact])
+            if remove.shape != (*camera.shape[:-1], 3):
+                raise ValueError(
+                    f"remove-hand image shape {remove.shape} incompatible with {camera.shape}"
+                )
+            camera = np.array(camera, copy=True)
+            camera[..., 0:3] = remove
+        elif base_mode != BASE_MODE_ORIGINAL:
+            raise ValueError(f"unknown base_mode={base_mode!r}")
         return self._select_camera_channels(camera)
 
     def _select_camera_channels(self, camera: np.ndarray) -> np.ndarray:
@@ -723,7 +1001,7 @@ class ZarrDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         idx = int(idx)
-        anchor_t, _episode_end, ep_idx = self.windows[idx]
+        anchor_t, _episode_end, ep_idx, base_mode = self._window_fields(idx)
 
         s0, s1 = self.state_range(idx)
         i0, i1 = self.image_range(idx)
@@ -755,7 +1033,9 @@ class ZarrDataset(Dataset):
             latent = self.get_camera_latent(idx)
             obs["image_backbone_feat"] = torch.from_numpy(latent.astype(np.float32))
         else:
-            camera = self.get_camera(i0, i1)
+            camera = self.get_camera(
+                i0, i1, base_mode=base_mode, ep_idx=ep_idx
+            )
             if camera.shape[0] != self.n_image_steps:
                 raise ValueError(
                     f"image length mismatch: {camera.shape[0]} != {self.n_image_steps}"
@@ -779,7 +1059,9 @@ class ZarrDataset(Dataset):
             memory_state = self.normalizer.normalize_state_np(memory_state_raw)
             obs["memory_state"] = torch.from_numpy(memory_state.astype(np.float32))
             obs["memory_image_backbone_feat"] = torch.from_numpy(
-                self.get_memory_camera_latent(anchor_t, ep_idx).astype(np.float32)
+                self.get_memory_camera_latent(
+                    anchor_t, ep_idx, base_mode=base_mode
+                ).astype(np.float32)
             )
             obs["memory_visual_offsets"] = torch.from_numpy(
                 self.memory_visual_offsets.astype(np.int64, copy=False)
@@ -802,6 +1084,7 @@ class ZarrDataset(Dataset):
                 "idx": idx,
                 "anchor_t": int(anchor_t),
                 "ep_idx": int(ep_idx),
+                "base_mode": str(base_mode),
             },
         }
 

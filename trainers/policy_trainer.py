@@ -35,9 +35,7 @@ def get_autocast_context(device: torch.device, use_amp: bool):
 def build_dataset_and_loader(
     cfg: dict, dist_info: DistInfo | None = None
 ) -> tuple[ZarrDataset, DataLoader, DistributedSampler | None]:
-    from datasets.zarr_dataset import resolve_camera_data_config
-
-    data_cfg = resolve_camera_data_config(cfg["data"])
+    data_cfg = dict(cfg["data"])
     fm_cfg = dict(cfg.get("models", {}).get("fm", {}))
     data_cfg = dict(data_cfg)
     if bool(data_cfg.get("use_camera_latent", False)):
@@ -51,6 +49,15 @@ def build_dataset_and_loader(
     train_cfg = cfg["train"]
     dataset = ZarrDataset.from_config(data_cfg)
     dataset.set_training(True)
+    if bool(data_cfg.get("use_camera_latent", False)):
+        token_mode = getattr(dataset, "latent_token_mode", None)
+        view_pool = str(fm_cfg.get("view_pool", "global_concat")).strip().lower()
+        if token_mode == "cls" and view_pool in {"local_pool", "local_attn"}:
+            raise ValueError(
+                f"latent cache token_mode=cls is incompatible with "
+                f"models.fm.view_pool={view_pool!r}; use global_concat or rebuild "
+                "the cache with precompute.token_mode=all"
+            )
 
     sampler: DistributedSampler | None = None
     if dist_info is not None and dist_info.enabled:
@@ -217,7 +224,7 @@ def main(cfg: dict) -> None:
     dist_info = init_distributed()
     main_proc = is_main_process(dist_info)
 
-    # Vary augmentation across ranks while keeping model/normalizer init aligned.
+    # Give each DDP rank independent sampling randomness.
     set_seed(int(cfg.get("seed", 42)) + dist_info.rank)
 
     if dist_info.enabled:

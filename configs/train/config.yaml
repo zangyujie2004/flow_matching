@@ -7,7 +7,7 @@ output:
   run_name: huanggua_office_mem_unet
 
 data:
-  root_dir: /mnt/workspace/zyj/data/processed/panzi/panzi_0720_1524_suceess
+  root_dir: /mnt/workspace/zyj/data/huanggua_office/huanggua_office_0723_1724
   # window
   window_size: 8
   stride: 1
@@ -19,12 +19,12 @@ data:
   # tatile
   use_tactile: false
   # camera
+  mix_base_remove_hand: true
   camera_views: ['base_0', 'left_wrist_0', 'right_wrist_0']
   image_size: 224
   image_as_uint8: true
   use_camera_latent: true
   latent_cache_root_dir: ${data.root_dir}/latent_cache/{auto}
-  camera_augmentation: false  
   # keys
   camera_key: camera
   tactile_key: tactile
@@ -97,7 +97,9 @@ models:
     state_mem_dim: 64
 
 train:
-  batch_size: 1024
+  # Per-GPU batch size. Start conservatively because 128-step Memory keeps
+  # substantially more activations than the no-Memory main-branch setup.
+  batch_size: 64
   num_workers: 32
   drop_last: true
   pin_memory: true
@@ -124,7 +126,8 @@ precompute:
   batch_size: 1024
   device: cuda
   overwrite: false
-  output_path: null  
+  output_path: null
+  token_mode: cls
 
 deploy:
   action_process: abs_qpos # abs_qpos
