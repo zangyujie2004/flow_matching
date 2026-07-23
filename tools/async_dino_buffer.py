@@ -64,15 +64,36 @@ class AsyncDinoBuffer:
         self.worker.join()
         self.worker = None
 
-    def submit_frame(self, frame_id, image_1, image_2, image_3=None, capture_time=None):
+    def submit_frame(
+        self,
+        frame_id,
+        image_1,
+        image_2,
+        image_3=None,
+        *,
+        robot_state=None,
+        capture_time=None,
+    ):
         if frame_id % self.sample_interval_frames != 0:
             return False
         images = [image_1, image_2]
         if image_3 is not None:
             images.append(image_3)
+        state = None
+        if robot_state is not None:
+            state = torch.as_tensor(robot_state, dtype=torch.float32).detach().clone()
+            if state.ndim == 1:
+                state = state.unsqueeze(0)  # (D) -> (B=1,D)
+            if state.ndim != 2:
+                raise ValueError(
+                    f"robot_state must have shape (D) or (B,D), got {tuple(state.shape)}"
+                )
+            if not torch.isfinite(state).all():
+                raise ValueError("robot_state contains NaN or inf")
         if capture_time is None:
             capture_time = time.perf_counter()
-        frame = (frame_id, images, capture_time)
+        # Images and state remain one mailbox packet, so overwrite/drop is atomic.
+        frame = (frame_id, images, state, capture_time)
         with self.lock:
             if self.stop_event.is_set():
                 return False
@@ -98,24 +119,41 @@ class AsyncDinoBuffer:
 
     def get_global_feature_window(self):
         """Return repeat-first padded DINO CLS history as (B,T,V,C), or None."""
+        memory_window = self.get_memory_window()
+        return None if memory_window is None else memory_window["feature"]
+
+    def get_memory_window(self):
+        """Return aligned repeat-first visual/state history from one Buffer snapshot."""
         with self.lock:
             if not self.buffer:
                 return None
-            features = [entry["global_feature"] for entry in self.buffer]
+            entries = list(self.buffer)
 
+        features = [entry["global_feature"] for entry in entries]
         first_shape = features[0].shape
         if any(feature.shape != first_shape for feature in features):
             shapes = [tuple(feature.shape) for feature in features]
             raise ValueError(f"DINO buffer contains inconsistent feature shapes: {shapes}")
         missing = self.history_length - len(features)
         if missing > 0:
-            features = [features[0]] * missing + features
-        features = features[-self.history_length :]
+            entries = [entries[0]] * missing + entries
+        entries = entries[-self.history_length :]
+        features = [entry["global_feature"] for entry in entries]
         # Each item is (B,V,C); stacking time at dim=1 gives (B,T,V,C).
-        window = torch.stack(features, dim=1).detach()
-        if window.requires_grad or window.grad_fn is not None:
+        feature_window = torch.stack(features, dim=1).detach()
+        if feature_window.requires_grad or feature_window.grad_fn is not None:
             raise RuntimeError("DINO feature window must not keep an autograd graph")
-        return window
+        states = [entry["robot_state"] for entry in entries]
+        state_window = None
+        if all(state is not None for state in states):
+            state_window = torch.stack(states, dim=1).detach()  # (B,T,D)
+        elif any(state is not None for state in states):
+            raise RuntimeError("DINO Buffer contains partially missing aligned robot states")
+        return {
+            "feature": feature_window,
+            "state": state_window,
+            "frame_ids": [entry["frame_id"] for entry in entries],
+        }
 
     def get_local_feature_window(self):
         """Return repeat-first padded patch history as (B,T,V,N,C), or None."""
@@ -186,9 +224,14 @@ class AsyncDinoBuffer:
                 break
             if frame is None:
                 continue
-            frame_id, images, capture_time = frame
+            frame_id, images, robot_state, capture_time = frame
             sample_start = time.perf_counter()
             global_feature, local_feature, timing = self._run_dino(images)
+            if robot_state is not None and robot_state.shape[0] != global_feature.shape[0]:
+                raise ValueError(
+                    "robot_state and DINO batch sizes differ: "
+                    f"{robot_state.shape[0]} != {global_feature.shape[0]}"
+                )
             ready_time = time.perf_counter()
             entry = {
                 "frame_id": frame_id,
@@ -196,6 +239,7 @@ class AsyncDinoBuffer:
                 "feature": global_feature,
                 "global_feature": global_feature,
                 "local_feature": local_feature,
+                "robot_state": robot_state,
                 "capture_time": capture_time,
                 "ready_time": ready_time,
                 "stage_wall_ms": timing["stage_wall_ms"],

@@ -1,4 +1,4 @@
-"""CPU checks for 64-token repeat-first Async DINO history windows."""
+"""CPU checks for aligned 128-token visual/state Async Memory windows."""
 
 import time
 
@@ -35,7 +35,12 @@ def submit_sample(
     num_views: int,
 ) -> None:
     images = [timestep(sample_id, num_views)[:, view] for view in range(num_views)]
-    assert buffer.submit_frame(sample_id * 8, *images)
+    state = torch.full((1, 14), float(sample_id), dtype=torch.float32)
+    assert buffer.submit_frame(
+        sample_id * 8,
+        *images,
+        robot_state=state,
+    )
     wait_for_count(buffer, sample_id)
 
 
@@ -51,35 +56,59 @@ def check_num_views(num_views: int) -> None:
 
     submit_sample(buffer, 1, num_views)
     first = timestep(1, num_views)
-    window = buffer.get_feature_window()
+    memory = buffer.get_memory_window()
+    window = memory["feature"]
+    state_window = memory["state"]
     assert window.shape == (1, H, num_views, 384)
+    assert state_window.shape == (1, H, 14)
     assert torch.equal(window, first.unsqueeze(1).expand(-1, H, -1, -1))
+    assert torch.equal(state_window, torch.ones_like(state_window))
+    assert memory["frame_ids"] == [8] * H
     assert len(buffer.get_buffer()) == 1
 
     submit_sample(buffer, 2, num_views)
     submit_sample(buffer, 3, num_views)
-    window = buffer.get_feature_window()
+    memory = buffer.get_memory_window()
+    window = memory["feature"]
+    state_window = memory["state"]
     assert torch.equal(window[:, : H - 3], first.unsqueeze(1).expand(-1, H - 3, -1, -1))
     assert torch.equal(window[:, -3], timestep(1, num_views))
     assert torch.equal(window[:, -2], timestep(2, num_views))
     assert torch.equal(window[:, -1], timestep(3, num_views))
+    assert torch.equal(state_window[:, : H - 3], torch.ones(1, H - 3, 14))
+    assert torch.equal(state_window[:, -3:, 0], torch.tensor([[1.0, 2.0, 3.0]]))
+    assert memory["frame_ids"] == [8] * (H - 3) + [8, 16, 24]
 
     for sample_id in range(4, H + 1):
         submit_sample(buffer, sample_id, num_views)
-    window = buffer.get_feature_window()
+    memory = buffer.get_memory_window()
+    window = memory["feature"]
+    state_window = memory["state"]
     expected = torch.stack(
         [timestep(sample_id, num_views) for sample_id in range(1, H + 1)],
         dim=1,
     )
     assert torch.equal(window, expected)
+    assert torch.equal(
+        state_window[:, :, 0],
+        torch.arange(1, H + 1, dtype=torch.float32).unsqueeze(0),
+    )
+    assert memory["frame_ids"] == [sample_id * 8 for sample_id in range(1, H + 1)]
 
     submit_sample(buffer, H + 1, num_views)
-    window = buffer.get_feature_window()
+    memory = buffer.get_memory_window()
+    window = memory["feature"]
+    state_window = memory["state"]
     expected = torch.stack(
         [timestep(sample_id, num_views) for sample_id in range(2, H + 2)],
         dim=1,
     )
     assert torch.equal(window, expected)
+    assert torch.equal(
+        state_window[:, :, 0],
+        torch.arange(2, H + 2, dtype=torch.float32).unsqueeze(0),
+    )
+    assert memory["frame_ids"] == [sample_id * 8 for sample_id in range(2, H + 2)]
     assert len(buffer.get_buffer()) == H
     assert window.ndim == 4
     assert buffer.get_local_feature_window() is None
@@ -96,7 +125,7 @@ def main() -> None:
     assert offsets.shape == (128,)
     for num_views in (2, 3):
         check_num_views(num_views)
-    print("PASS: repeat-first [B,128,V,384] history for V=2 and V=3")
+    print("PASS: aligned repeat-first visual [B,128,V,384] + state [B,128,D]")
 
 
 if __name__ == "__main__":

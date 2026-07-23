@@ -22,7 +22,7 @@ B, V, D = 2, 3, 384
 COND = 256
 ACT_DIM, STATE_DIM = 14, 14
 WINDOW, HORIZON = 8, 64
-TVIS, TSTATE = 128, 64
+TVIS = TSTATE = 128
 
 
 def _base_kwargs(velocity_model: str) -> dict:
@@ -78,7 +78,7 @@ def check_enabled(velocity_model: str) -> None:
         memory_injection="concat_global_cond",
         memory_dim=COND,
         memory_history_frames=TSTATE,
-        memory_recent_frame=4,
+        memory_recent_frame=0,
         memory_visual_history_length=TVIS,
         memory_visual_sample_stride=8,
         memory_visual_recent_frame=0,

@@ -82,25 +82,30 @@ def main() -> None:
     runtime, load_seconds, memory_snapshots = load_benchmark_context(args)
     if not runtime.policy.memory_enabled:
         raise RuntimeError("benchmark policy does not enable Memory")
+    if runtime.memory_state_offsets is not runtime.memory_visual_offsets:
+        raise AssertionError("runtime visual/state offsets must be the same Tensor")
     device = runtime.device
     buffer = runtime.start_async_dino(
         sample_interval_frames=args.dino_sample_interval_frames,
         deadline_ms=args.camera_period_ms * args.dino_sample_interval_frames,
     )
     frames = make_camera_frames(runtime, 16, args.seed)
+    sampled_state = np.zeros(runtime.policy.state_dim, dtype=np.float32)
 
     # One real sample is enough: missing older tokens repeat the first DINO CLS.
     accepted = runtime.submit_async_dino_frame(
         0,
         frames[0],
+        sampled_state,
         capture_time=time.perf_counter(),
     )
     if not accepted:
         raise AssertionError("initial sampled frame was rejected")
     wait_for_processed(buffer, 1)
-    initial_window = buffer.get_feature_window()
-    if initial_window is None:
+    initial_memory = buffer.get_memory_window()
+    if initial_memory is None:
         raise AssertionError("Async DINO Buffer must be ready after its first sample")
+    initial_window = initial_memory["feature"]
     expected_window = (
         args.batch_size,
         runtime.memory_visual_history_length,
@@ -111,18 +116,23 @@ def main() -> None:
         raise AssertionError(
             f"initial padded window {tuple(initial_window.shape)} != {expected_window}"
         )
+    expected_state_window = (
+        args.batch_size,
+        runtime.memory_visual_history_length,
+        runtime.policy.state_dim,
+    )
+    if initial_memory["state"].shape != expected_state_window:
+        raise AssertionError(
+            f"initial padded state {tuple(initial_memory['state'].shape)} "
+            f"!= {expected_state_window}"
+        )
+    if initial_memory["frame_ids"] != [0] * runtime.memory_visual_history_length:
+        raise AssertionError("initial visual/state frame ids are not repeat-first aligned")
 
     obs, state_raw = random_smoke_obs(runtime, seed=args.seed)
-    rng = np.random.default_rng(args.seed + 1)
-    memory_state_raw = rng.normal(
-        0.0,
-        0.05,
-        (runtime.policy.memory_history_frames, runtime.policy.state_dim),
-    ).astype(np.float32)
     action = runtime.predict_rot6d_abs(
         obs,
         state_raw=state_raw,
-        memory_state_raw=memory_state_raw,
         num_inference_steps=runtime.num_inference_steps,
         solver=runtime.solver,
     )
@@ -132,7 +142,6 @@ def main() -> None:
         runtime.predict_rot6d_abs(
             obs,
             state_raw=state_raw,
-            memory_state_raw=memory_state_raw,
             num_inference_steps=runtime.num_inference_steps,
             solver=runtime.solver,
         )
@@ -156,6 +165,11 @@ def main() -> None:
             runtime.submit_async_dino_frame(
                 frame_id,
                 frames[frame_id % len(frames)],
+                np.full(
+                    runtime.policy.state_dim,
+                    float(frame_id),
+                    dtype=np.float32,
+                ),
                 capture_time=start,
             )
             elapsed = (time.perf_counter() - start) * 1000.0
@@ -187,7 +201,6 @@ def main() -> None:
         lambda: runtime.predict_rot6d_abs(
             obs,
             state_raw=state_raw,
-            memory_state_raw=memory_state_raw,
             num_inference_steps=runtime.num_inference_steps,
             solver=runtime.solver,
         ),
@@ -287,7 +300,11 @@ def main() -> None:
     shapes = {
         "current_image": list(np.asarray(obs["image"]).shape),
         "current_state": list(np.asarray(obs["state"]).shape),
-        "memory_state_raw": list(memory_state_raw.shape),
+        "memory_state": [
+            args.batch_size,
+            runtime.policy.memory_history_frames,
+            runtime.policy.state_dim,
+        ],
         "feature_window": list(buffer.get_feature_window().shape),
         "action": list(action.shape),
     }
@@ -311,7 +328,7 @@ def main() -> None:
     result_dir = create_result_dir(args, "full_pipeline")
     config = runtime.policy_cfg
     finalize_memory_snapshots(memory_snapshots, device)
-    del runtime, buffer, frames, action, obs, memory_state_raw
+    del runtime, buffer, frames, action, obs
     del camera_loop, camera_thread, timed_build_memory, original_build_memory
     gc.collect()
     torch.cuda.empty_cache()

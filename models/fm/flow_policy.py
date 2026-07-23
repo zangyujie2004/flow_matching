@@ -54,8 +54,8 @@ class FlowMatchingPolicy(nn.Module):
         memory_method: str = "fusion",
         memory_injection: str = "cross_attn",
         memory_dim: int = 256,
-        memory_history_frames: int = 64,
-        memory_recent_frame: int = 2,
+        memory_history_frames: int = 128,
+        memory_recent_frame: int = 0,
         memory_visual_history_length: int = 128,
         memory_visual_sample_stride: int = 8,
         memory_visual_recent_frame: int = 0,
@@ -94,6 +94,16 @@ class FlowMatchingPolicy(nn.Module):
             raise ValueError("memory_visual_sample_stride must be positive")
         if self.memory_visual_recent_frame < 0:
             raise ValueError("memory_visual_recent_frame must be non-negative")
+        if self.memory_enabled and self.memory_history_frames != self.memory_visual_history_length:
+            raise ValueError(
+                "state and visual Memory must share history_length: "
+                f"{self.memory_history_frames} != {self.memory_visual_history_length}"
+            )
+        if self.memory_enabled and self.memory_recent_frame != self.memory_visual_recent_frame:
+            raise ValueError(
+                "state and visual Memory must share the same anchor/recent_frame: "
+                f"{self.memory_recent_frame} != {self.memory_visual_recent_frame}"
+            )
         self.memory_injection = str(memory_injection).lower()
         if self.memory_injection not in {"cross_attn", "concat_global_cond"}:
             raise ValueError(
@@ -243,10 +253,10 @@ class FlowMatchingPolicy(nn.Module):
             )
             kwargs["memory_dim"] = int(mem_cfg.get("dim", kwargs.get("memory_dim", 256)))
             kwargs["memory_history_frames"] = int(
-                data_mem.get("history_frames", kwargs.get("memory_history_frames", 64))
+                data_mem.get("history_frames", kwargs.get("memory_history_frames", 128))
             )
             kwargs["memory_recent_frame"] = int(
-                data_mem.get("recent_frame", kwargs.get("memory_recent_frame", 2))
+                data_mem.get("recent_frame", kwargs.get("memory_recent_frame", 0))
             )
             kwargs["memory_visual_history_length"] = int(
                 data_mem.get(

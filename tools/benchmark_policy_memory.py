@@ -48,7 +48,7 @@ def main():
 
     device = torch.device("cuda")
     b, t, v, c = 1, 128, args.num_views, 384
-    state_dim, state_history, cond_steps = 14, 64, 16
+    state_dim, state_history, cond_steps = 14, 128, 16
     policy = FlowMatchingPolicy(
         action_dim=state_dim,
         state_dim=state_dim,
@@ -66,7 +66,7 @@ def main():
         memory_injection="concat_global_cond",
         memory_dim=256,
         memory_history_frames=state_history,
-        memory_recent_frame=4,
+        memory_recent_frame=0,
         memory_visual_history_length=t,
         memory_visual_sample_stride=8,
         memory_visual_recent_frame=0,

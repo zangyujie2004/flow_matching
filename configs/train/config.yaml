@@ -37,11 +37,11 @@ data:
   # memory
   memory:
     enabled: true
-    history_frames: 64          # state Memory: 64 high-frequency frames
-    recent_frame: 4             # state Memory endpoint
-    visual_history_length: 128  # 128 DINO CLS sampling instants
-    sample_stride: 8            # one DINO sample per 8 camera frames
-    visual_recent_frame: 0      # visual offsets end at the current sampled frame
+    history_frames: 128         # state and visual share 128 sampled instants
+    recent_frame: 0             # both branches end at the current sampled frame
+    visual_history_length: 128
+    sample_stride: 8            # both state and DINO sample every 8 camera frames
+    visual_recent_frame: 0
 
 models:
   fm:

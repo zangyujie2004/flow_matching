@@ -136,6 +136,8 @@ def main() -> None:
 
     shapes = {
         "input_feature_window": list(feature_window.shape),
+        "input_state_window": list(memory_state.shape),
+        "shared_offsets": list(offsets.shape),
         "view_as_batch_input": list(details["view_batch_input"].shape),
         "projected_visual_sequence": list(projected.shape),
         "per_view_temporal_output": list(temporal_output.shape),
@@ -166,6 +168,7 @@ def main() -> None:
                 name: tensor_description(tensor)
                 for name, tensor in {
                     "feature_window": feature_window,
+                    "state_window": memory_state,
                     "projected_visual_sequence": projected,
                     "temporal_output": temporal_output,
                     "view_summary": view_summary,

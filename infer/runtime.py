@@ -136,10 +136,13 @@ class FMInferenceRuntime:
             device=self.device,
             dtype=torch.long,
         )
+        self.memory_state_offsets = self.memory_visual_offsets
         if self.policy.memory_enabled:
             policy_history = int(self.policy.memory_visual_history_length)
+            policy_state_history = int(self.policy.memory_history_frames)
             policy_stride = int(self.policy.memory_visual_sample_stride)
             policy_recent = int(self.policy.memory_visual_recent_frame)
+            policy_state_recent = int(self.policy.memory_recent_frame)
             configured = (
                 self.memory_visual_history_length,
                 self.dino_sample_interval_frames,
@@ -150,6 +153,12 @@ class FMInferenceRuntime:
                 raise ValueError(
                     "runtime visual memory config does not match Policy: "
                     f"runtime={configured}, policy={policy_values}"
+                )
+            if policy_state_history != policy_history or policy_state_recent != policy_recent:
+                raise ValueError(
+                    "state and visual Memory must share history_length and anchor: "
+                    f"state=({policy_state_history},{policy_state_recent}), "
+                    f"visual=({policy_history},{policy_recent})"
                 )
         self.load_timing_ms["runtime_total"] = (time.perf_counter() - init_start) * 1000.0
 
@@ -211,7 +220,6 @@ class FMInferenceRuntime:
         obs: Mapping[str, Any],
         *,
         state_raw: np.ndarray,
-        memory_state_raw: np.ndarray | None = None,
         num_inference_steps: int | None = None,
         solver: str | None = None,
     ) -> np.ndarray:
@@ -230,7 +238,7 @@ class FMInferenceRuntime:
             window_size=self.window_size,
         )
         if self.policy.memory_enabled:
-            memory_obs = self._get_async_memory_obs(memory_state_raw)
+            memory_obs = self._get_async_memory_obs()
             if memory_obs is None:
                 raise RuntimeError(
                     "memory not ready: DINO buffer needs its first processed sample"
@@ -253,20 +261,29 @@ class FMInferenceRuntime:
     @torch.inference_mode()
     def _get_async_memory_obs(
         self,
-        memory_state_raw: np.ndarray | None,
     ) -> dict[str, torch.Tensor] | None:
         if self.async_dino_buffer is None:
             return None
-        feature_window = self.async_dino_buffer.get_feature_window()
-        if feature_window is None:
+        memory_window = self.async_dino_buffer.get_memory_window()
+        if memory_window is None:
             return None
-        if memory_state_raw is None:
-            raise ValueError("memory_state_raw is required when policy memory is enabled")
-
-        state = as_float32_array(memory_state_raw, name="memory_state_raw")
-        expected = (self.policy.memory_history_frames, self.policy.state_dim)
+        feature_window = memory_window["feature"]
+        state_tensor = memory_window["state"]
+        if state_tensor is None:
+            raise RuntimeError(
+                "aligned robot state is missing; pass robot_state to submit_async_dino_frame"
+            )
+        state = as_float32_array(
+            state_tensor.detach().cpu().numpy(),
+            name="aligned_memory_state",
+        )
+        expected = (
+            feature_window.shape[0],
+            self.memory_visual_history_length,
+            self.policy.state_dim,
+        )
         if state.shape != expected:
-            raise ValueError(f"memory_state_raw shape {state.shape} != {expected}")
+            raise ValueError(f"aligned memory state shape {state.shape} != {expected}")
         state_norm = self.normalizer.normalize_state_np(state).astype(np.float32, copy=False)
 
         _b, t, v, c = feature_window.shape
@@ -284,23 +301,21 @@ class FMInferenceRuntime:
             )
         return {
             "memory_image_backbone_feat": feature_window,
-            "memory_state": torch.from_numpy(state_norm).unsqueeze(0).to(self.device),
+            "memory_state": torch.from_numpy(state_norm).to(self.device),
             "memory_visual_offsets": self.memory_visual_offsets,
         }
 
     @torch.inference_mode()
     def build_async_policy_memory(
         self,
-        memory_state_raw: np.ndarray,
         measure_cuda_memory: bool = False,
     ) -> dict[str, Any] | None:
         """Return real Policy Memory intermediates after at least one DINO sample."""
-        memory_obs = self._get_async_memory_obs(memory_state_raw)
+        memory_obs = self._get_async_memory_obs()
         if memory_obs is None:
             return None
-        feature_window = self.async_dino_buffer.get_feature_window()
         return build_policy_memory_input(
-            feature_window,
+            memory_obs["memory_image_backbone_feat"],
             self.policy,
             memory_obs["memory_state"],
             self.memory_visual_offsets,
@@ -395,21 +410,35 @@ class FMInferenceRuntime:
             "memory_visual_input_shape = "
             f"[B,{self.memory_visual_history_length},{self.n_image_views},384]"
         )
+        print(
+            "memory_state_input_shape = "
+            f"[B,{self.memory_visual_history_length},{self.policy.state_dim}]"
+        )
+        print("memory_offsets = shared_visual_state")
         return self.async_dino_buffer
 
     def submit_async_dino_frame(
         self,
         frame_id: int,
         frame: Any,
+        robot_state: np.ndarray,
         capture_time: float | None = None,
     ) -> bool:
-        """Submit one synchronized infer frame at the camera frame rate."""
+        """Submit synchronized cameras and robot state as one sampled packet."""
 
         if self.async_dino_buffer is None or self.async_dino_preprocess is None:
             raise RuntimeError("call start_async_dino() first")
+        state = as_float32_array(robot_state, name="robot_state")
+        if state.shape != (self.policy.state_dim,):
+            raise ValueError(
+                f"robot_state shape {state.shape} != ({self.policy.state_dim},)"
+            )
         images = build_dino_images(frame, self.async_dino_preprocess)
         return self.async_dino_buffer.submit_frame(
-            frame_id, *images, capture_time=capture_time
+            frame_id,
+            *images,
+            robot_state=state,
+            capture_time=capture_time,
         )
 
     def stop_async_dino(self) -> None:
@@ -420,7 +449,6 @@ class FMInferenceRuntime:
         self,
         frames: Sequence[Any],
         *,
-        memory_state_raw: np.ndarray | None = None,
         preprocess: PreprocessConfig | None = None,
         robot: Mapping[str, Any] | None = None,
         num_inference_steps: int | None = None,
@@ -448,7 +476,6 @@ class FMInferenceRuntime:
         pred_rot6d = self.predict_rot6d_abs(
             obs,
             state_raw=state_raw,
-            memory_state_raw=memory_state_raw,
             num_inference_steps=num_inference_steps,
             solver=solver,
         )

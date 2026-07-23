@@ -19,13 +19,14 @@ Memory，以及 Memory 如何注入 UNet 或 DiT。本文只描述当前的 `fus
 ## 2. 完整数据流
 
 ```text
-V 路相机图像：每路 [B,3,224,224]
+V 路相机图像：每路 [B,3,224,224] + 同时刻 robot state [B,Ds]
         ↓ 每 8 个相机帧接收一次（约 0.264 s）
 AsyncDinoBuffer
         ↓ 每个视角独立执行共享 DINOv2 backbone
 单视角 DINO CLS token [B,1,384]
         ↓ squeeze + stack V 个视角
 单个采样时刻 [B,V,384]
+同一 Buffer entry 同时保存 robot state [B,Ds]
         ↓ deque(maxlen=128)
 历史窗口 [B,128,V,384]（约 33.79 s）
         ↓ infer/runtime.py
@@ -43,13 +44,13 @@ UNet global condition 或 DiT condition
 
 `local patches [B,N,384]` 只在 `store_local_features=True` 时额外保存。当前
 Policy Memory 使用每张图像自己的 DINO CLS token，不是 patch-average feature。
-名义视觉历史范围为 `128 × 8 × 0.033 = 33.79 s`（首尾真实跨度
-`127 × 8 × 0.033 = 33.53 s`）；状态 Memory 仍是独立的
-64个高频状态帧，没有扩大为 1016 帧。
+名义历史范围为 `128 × 8 × 0.033 = 33.79 s`（首尾真实跨度
+`127 × 8 × 0.033 = 33.53 s`）。视觉与状态共享同一组128个采样时刻，
+但分别进入 Visual Temporal Memory 和 StateConvMemoryEncoder。
 
 ## 3. AsyncDinoBuffer 数据结构
 
-`submit_async_dino_frame()` 会将同步的 2 或 3 路图像交给
+`submit_async_dino_frame()` 会将同步的2或3路图像和同一时刻 robot state 交给
 `tools/async_dino_buffer.py`。只处理满足下面条件的帧：
 
 ```python
@@ -64,6 +65,7 @@ frame_id % 8 == 0
     "feature": Tensor[B, V, 384],        # 兼容字段，即 global_feature
     "global_feature": Tensor[B, V, 384],
     "local_feature": Tensor[B, V, N, 384] | None,
+    "robot_state": Tensor[B, Ds],
     "capture_time": float,
     "ready_time": float,
     "stage_wall_ms": float,
@@ -74,14 +76,21 @@ frame_id % 8 == 0
 第一次真实 DINO 特征产生后：
 
 ```python
-feature_window = buffer.get_feature_window()
-# [B,128,V,384]
+memory_window = buffer.get_memory_window()
+memory_window["feature"]  # [B,128,V,384]
+memory_window["state"]    # [B,128,Ds]
 ```
 
 Buffer 为空时返回 `None`。Buffer 有1到127个真实采样时，缺失的较早位置使用
-first-frame CLS 在窗口左侧补齐；deque 本身仍只保存真实采样。例如三个真实采样
-`[f1,f2,f3]` 返回 `[f1×125,f1,f2,f3]`。这些 padding token 参与 Temporal
-Transformer，不使用零向量，也不重新运行 DINO。
+first entry 在窗口左侧补齐；deque 本身仍只保存真实采样。例如三个真实采样返回：
+
+```text
+Visual: [f1×125,f1,f2,f3]
+State:  [s1×125,s1,s2,s3]
+```
+
+每个 `fi` 和 `si` 来自同一个 mailbox packet 和 frame_id。latest-only 覆盖也会
+同时覆盖图像与 state，不存在两个 Buffer 独立计数。
 
 ## 4. infer 交给 Policy 的数据
 
@@ -90,11 +99,11 @@ Transformer，不使用零向量，也不重新运行 DINO。
 | key | shape | 说明 |
 |---|---|---|
 | `memory_image_backbone_feat` | `[B,128,V,384]` | DINO CLS 历史 |
-| `memory_state` | `[B,64,Ds]` | 归一化的状态历史（独立 64 帧） |
+| `memory_state` | `[B,128,Ds]` | 与视觉严格对齐的状态历史 |
 | `memory_visual_offsets` | `[128]` | `[-1016,-1008,...,-8,0]` |
 
-offsets 不扩展成 `128*V`。V 个视角作为 batch 独立处理，共享同一组
-128 个时间 offsets。
+视觉和状态共用这一组 offsets。offsets 不扩展成 `128*V`；V 个视角作为
+batch 独立处理。
 
 ## 5. 每视角独立时间建模
 
@@ -134,7 +143,7 @@ V=3: [B,768] → [B,256]
 ## 6. 状态 Memory 和最终 Memory
 
 ```text
-memory_state                     [B,64,Ds]
+memory_state                     [B,128,Ds]
 StateConvMemoryEncoder           [B,64]
 
 visual_global                    [B,256]
@@ -243,13 +252,18 @@ runtime.start_async_dino()
 # 相机循环：capture_time 应尽量来自相机驱动/ROS 消息。
 capture_time = time.perf_counter()
 frame = read_synchronized_cameras()
-runtime.submit_async_dino_frame(frame_id, frame, capture_time=capture_time)
+robot_state = read_state_for_the_same_frame()
+runtime.submit_async_dino_frame(
+    frame_id,
+    frame,
+    robot_state,
+    capture_time=capture_time,
+)
 
 # 第一次 DINO 采样完成后即可调用；缺失历史会 repeat-first。
 action_chunk = runtime.predict_rot6d_abs(
     current_obs,
     state_raw=current_state_window,
-    memory_state_raw=state_history_64,
 )
 
 runtime.stop_async_dino()
@@ -276,4 +290,6 @@ CUDA shape smoke test：
 ```bash
 python -m tools.test_async_dino_memory --num-views 2
 python -m tools.test_async_dino_memory --num-views 3
+python -m tools.test_async_dino_history_window
+python -m tools.test_aligned_memory_training
 ```

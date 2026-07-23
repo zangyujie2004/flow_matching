@@ -25,8 +25,8 @@
 | `T_visual`       | 视觉 Memory 采样数     | **128**                                          | `data.memory.visual_history_length`                                     |
 | `visual_stride`  | 视觉采样间隔（相机帧） | **8**                                            | `data.memory.sample_stride`                                             |
 | `visual_offsets` | 视觉时间偏移           | **[-1016, -1008, …, -8, 0]**（128 个）          | `zarr_dataset._build_memory_visual_offsets`                             |
-| `T_state`        | 状态 Memory 帧数       | **64**                                           | `data.memory.history_frames`                                            |
-| `state_recent`   | 状态 Memory 末端偏移   | 4                                                      | `data.memory.recent_frame`                                              |
+| `T_state`        | 状态 Memory 采样数     | **128**                                          | `data.memory.history_frames`                                            |
+| `state_recent`   | 状态 Memory 末端偏移   | 0                                                      | `data.memory.recent_frame`                                              |
 | `cond_steps`     | 当前观测状态窗口       | **8**                                            | `data.window_size`（=`dataset.window_size`）                          |
 | `n_image_steps`  | 当前观测图像帧数       | 1                                                      | `data.n_image_steps`                                                    |
 | `action_dim`     | 动作维度               | **14**（`action_type: joint`）                 | `zarr_dataset._ROBOT_DIMS["joint"]`                                     |
@@ -38,8 +38,8 @@
 | `view_pool`      | 视觉融合方式           | global_concat                                          | `models.fm.view_pool`                                                   |
 | Memory             | 方法 / 注入            | fusion / concat_global_cond                            | `models.memory.method` / `.injection`                                 |
 
-> 长度不要混淆：`T_visual=128`（稀疏视觉，stride 8，跨度约 33.5s）、`T_state=64`
-> （高频状态）、`cond_steps=8`（当前观测状态窗）、`action_horizon=64`（预测长度）是四个独立量。
+> `T_visual=T_state=128`，二者共用 stride 8、anchor 和 offsets；`cond_steps=8`
+> 是独立的当前观测状态窗口，`action_horizon=64` 是独立的预测长度。
 >
 > 注意：`FlowMatchingPolicy.__init__` 的 `action_horizon` 默认是 32；真实训练由
 > `trainers/policy_trainer.build_policy` 调 `sync_fm_action_horizon_from_data` 从
@@ -100,10 +100,10 @@ view_fusion_proj [B,256]                     # LN(768)+Linear(768→256)+SiLU+Dr
 visual_global    [B,256]
 ```
 
-状态 Memory（`StateConvMemoryEncoder`，独立于视觉，保持 64 帧）：
+状态 Memory（`StateConvMemoryEncoder`，与视觉共享采样时刻但不共享编码器）：
 
 ```text
-memory_state     [B,64,14]
+memory_state     [B,128,14]
 2×[Conv1d(k=5)+GroupNorm+SiLU+Dropout]（ch=128）+ masked mean pool
 Linear(128→64)
 state_global     [B,64]
@@ -128,10 +128,11 @@ memory_tokens    [B,1,256]                   # memory_global.unsqueeze(1)，供 
   `[128, 3, 384]`（`datasets/zarr_dataset.py`）。
 - **部署 Buffer**（`tools/async_dino_buffer.py`，`store_local_features=False`）只保存 CLS：
   每个 deque 元素 `entry["global_feature"]` 形状 `[B,V,D]=[1,3,384]`；
-  `get_feature_window()` = `stack(dim=1)` → `[B,128,3,384]`（repeat-first 左补齐）。
+  同一个 entry 还保存同帧 `robot_state [B,14]`。`get_memory_window()` 从同一
+  entry 快照构造视觉 `[B,128,3,384]` 和状态 `[B,128,14]`。
 
-两侧最终喂给 Policy 的都是 `[B,128,3,384]` CLS，且都走同一 `project_view_histories`
-→ `head(384→256)`，训练/推理一致。
+训练 Dataset 的 visual/state 直接复用相同 indices；部署的 visual/state 在一次
+submit 中进入同一个 latest-only packet。两侧均保持 oldest→newest 和 repeat-first。
 
 ---
 
@@ -232,8 +233,8 @@ predicted velocity                [B,64,14]
 | 原始图像            | 相机张量                 | `uint8 [B,1,V,3,224,224]`（`ZarrDataset._process_image`）                         |
 | 完整 DINO token     | 训练缓存 zarr            | `float32 [T_episode, V, 257, 384]`（`frame_backbone.zarr`）                       |
 | CLS 张量            | token 0                  | `float32 [B,V,384]`（单帧）/ `[B,T,V,384]`（历史）                                |
-| Async Buffer 单元素 | `deque` entry（dict）  | `entry["global_feature"] = [B,V,D] = [1,3,384]`；`local_feature=None`（默认不存） |
-| Buffer 窗口         | `get_feature_window()` | `float32 [B,128,V,384] = [1,128,3,384]`                                             |
+| Async Buffer 单元素 | `deque` entry（dict）  | `global_feature [B,V,384]` + 同帧 `robot_state [B,14]`                             |
+| Buffer 窗口         | `get_memory_window()`  | visual `[B,128,V,384]` + state `[B,128,14]`                                        |
 | Dataset batch       | `dict`                 | `{"obs": {...}, "action":[B,64,14], "meta":{idx,anchor_t,ep_idx}}`                  |
 | Policy observation  | `obs` dict             | 见下                                                                                  |
 | memory_global       | Tensor                   | `[B,256]`                                                                           |
@@ -250,11 +251,11 @@ predicted velocity                [B,64,14]
   "image_backbone_feat"        [B,1,3,257,384]   # 训练：full token；推理当前帧同理
   （或原图 "image" [B,1,3,3,224,224]，当 use_camera_latent=false）
 Memory（memory_enabled 时追加）:
-  "memory_state"               [B,64,14]
+  "memory_state"               [B,128,14]
   "memory_image_backbone_feat" [B,128,3,384]     # CLS
   "memory_visual_offsets"      [128]             # [-1016,…,0]
   "memory_visual_valid"        [B,128]           # 全 True（padding 也参与）
-  "memory_state_valid"         [B,64]
+  "memory_state_valid"         [B,128]            # 全 True（repeat-first 参与）
 ```
 
 - 训练缓存保存**完整 token** `[T,V,257,D]`；
@@ -272,7 +273,8 @@ Memory（memory_enabled 时追加）:
 | CLS token index      | `feat[:, :, 0, :]`                                        | `cls_token_from_output = tokens[:, :1]`              | 均取 token 0                                    |
 | 视角顺序             | `base_0, left_wrist_0, right_wrist_0`                     | 同                                                     | `CAMERA_BUNDLE_ORDER`                         |
 | 128×8 offsets       | `_build_memory_visual_offsets` → `[-1016,…,0]`        | `runtime.memory_visual_offsets` → 同                | 128 个，stride 8                                |
-| repeat-first padding | 索引 clamp 到 episode 首帧；`memory_visual_valid` 全 True | `get_feature_window` 首帧左补齐                      | 语义一致                                        |
+| repeat-first padding | visual/state 同一索引 clamp 到 episode 首帧；valid 全 True | `get_memory_window` 对齐左补齐                    | 语义一致                                        |
+| visual/state 对齐    | 两者复用 `memory_visual_indices`                          | 同一个 Buffer entry 同时保存 CLS/state              | 每个位置 frame_id 相同                          |
 | feature dtype        | float32                                                     | float32                                                | —                                              |
 | Memory input shape   | `[B,128,3,384]`                                           | `[B,128,3,384]`                                      | runtime 校验`(t,v,c)`                         |
 | condition injection  | `concat_global_cond` → 512                               | 同（`predict_action` 内部同一 `_build_condition`） | 512                                             |
@@ -286,9 +288,9 @@ Memory（memory_enabled 时追加）:
 | DINO token 提取      | `models/fm/encoders/dino_v2.py`                                                                                | `DinoV2SmallEncoder.forward_tokens` / `extract_backbone_feat` / `cls_token_from_output`                             |
 | 当前观测视觉融合     | `models/fm/encoders/dino_v2.py`                                                                                | `DinoV2Encoder.encode_all_from_backbone_feat` / `_fuse_view_feats`                                                    |
 | 当前观测条件         | `models/fm/condition_encoder.py`                                                                               | `ConditionEncoder.forward` / `StateMLP`                                                                               |
-| Dataset 历史采样     | `datasets/zarr_dataset.py`                                                                                     | `_build_memory_visual_offsets` / `memory_visual_indices` / `get_memory_camera_latent`（CLS 提取） / `__getitem__` |
+| Dataset 历史采样     | `datasets/zarr_dataset.py`                                                                                     | `_build_memory_visual_offsets` / `memory_visual_indices` / `memory_state_indices`（直接复用视觉索引）              |
 | 训练缓存             | `tools/precompute_policy_latents.py`                                                                           | full-token`frame_backbone.zarr`                                                                                         |
-| Async Buffer         | `tools/async_dino_buffer.py`                                                                                   | `AsyncDinoBuffer.submit_frame` / `_run_dino` / `get_global_feature_window`                                          |
+| Async Buffer         | `tools/async_dino_buffer.py`                                                                                   | `AsyncDinoBuffer.submit_frame` / `_run_dino` / `get_memory_window`                                                   |
 | 视觉 Temporal Memory | `models/fm/memory/fusion.py`                                                                                   | `MemoryEncoder` / `VisualTemporalMemoryEncoder` / `StateConvMemoryEncoder` / `encode_visual_views`                |
 | Memory 工厂          | `models/fm/memory/factory.py`                                                                                  | `build_memory_encoder`                                                                                                  |
 | condition fusion     | `models/fm/flow_policy.py`                                                                                     | `_build_obs_condition` / `_build_memory` / `_build_condition`                                                       |

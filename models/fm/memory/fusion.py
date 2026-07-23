@@ -143,8 +143,8 @@ class MemoryEncoder(nn.Module):
         state_dim: int,
         visual_dim: int,
         memory_dim: int,
-        history_frames: int = 64,
-        recent_frame: int = 2,
+        history_frames: int = 128,
+        recent_frame: int = 0,
         max_visual_time_offset: int | None = None,
         visual_layers: int = 2,
         visual_heads: int = 4,
@@ -253,6 +253,11 @@ class MemoryEncoder(nn.Module):
     ) -> MemoryOutput:
         bsz = state.shape[0]
         ts = state.shape[1]
+        if visual_tokens.shape[1] != ts:
+            raise ValueError(
+                "state and visual Memory sequence lengths must match: "
+                f"{ts} != {visual_tokens.shape[1]}"
+            )
         device = state.device
         st_valid = _as_batch_valid(state_valid, batch=bsz, seq=ts, device=device)
         visual_mem, _, _, _ = self.encode_visual_views(

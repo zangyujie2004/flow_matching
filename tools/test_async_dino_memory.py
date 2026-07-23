@@ -29,7 +29,7 @@ def main() -> None:
     device = torch.device("cuda")
     b, t, v, c = 1, 128, args.num_views, 384
     projected_dim = memory_dim = 256
-    state_dim, state_history = 14, 64
+    state_dim, state_history = 14, 128
     policy = FlowMatchingPolicy(
         action_dim=state_dim,
         state_dim=state_dim,
@@ -47,7 +47,7 @@ def main() -> None:
         memory_injection="concat_global_cond",
         memory_dim=memory_dim,
         memory_history_frames=state_history,
-        memory_recent_frame=4,
+        memory_recent_frame=0,
         memory_visual_history_length=t,
         memory_visual_sample_stride=8,
         memory_visual_recent_frame=0,
@@ -71,18 +71,27 @@ def main() -> None:
             torch.randint(0, 256, (b, 3, 224, 224), dtype=torch.uint8)
             for _ in range(v)
         ]
-        assert buffer.submit_frame(sample_id * 8, *images)
+        robot_state = torch.full((b, state_dim), float(sample_id))
+        assert buffer.submit_frame(
+            sample_id * 8,
+            *images,
+            robot_state=robot_state,
+        )
         wait_until_processed(buffer, sample_id + 1)
 
-    feature_window = buffer.get_feature_window()
+    aligned_window = buffer.get_memory_window()
+    assert aligned_window is not None
+    feature_window = aligned_window["feature"]
+    memory_state = aligned_window["state"].to(device)
     assert feature_window is not None
     assert feature_window.shape == (b, t, v, c)
+    assert memory_state.shape == (b, t, state_dim)
+    assert aligned_window["frame_ids"] == [sample_id * 8 for sample_id in range(t)]
     assert feature_window.ndim == 4
     assert buffer.get_local_feature_window() is None
     assert feature_window.device.type == "cuda"
     assert not feature_window.requires_grad and feature_window.grad_fn is None
 
-    memory_state = torch.randn(b, state_history, state_dim, device=device)
     offsets = torch.arange(-1016, 1, 8, device=device)
     assert offsets.shape == (t,)
     temporal_input_shapes = []
@@ -128,7 +137,7 @@ def main() -> None:
     # There is one shared projection head and one shared temporal Transformer.
     shared_head = policy.condition_encoder.image_encoder.encoder.head
     shared_temporal = policy.memory_encoder.visual_encoder
-    assert shared_temporal.time_embed.num_embeddings == 505
+    assert shared_temporal.time_embed.num_embeddings == 1017
     assert sum(module is shared_head for module in policy.modules()) == 1
     assert sum(module is shared_temporal for module in policy.modules()) == 1
     assert not hasattr(shared_temporal, "cls_token")

@@ -72,8 +72,8 @@ def architecture_only_config(num_views: int) -> dict[str, Any]:
             "camera_views": camera_views,
             "memory": {
                 "enabled": True,
-                "history_frames": 64,
-                "recent_frame": 4,
+                "history_frames": 128,
+                "recent_frame": 0,
                 "visual_history_length": 128,
                 "sample_stride": 8,
                 "visual_recent_frame": 0,
@@ -140,6 +140,7 @@ class ArchitectureOnlyRuntimeAdapter:
         self.memory_visual_offsets = torch.arange(
             -1016, 1, 8, device=device, dtype=torch.long
         )
+        self.memory_state_offsets = self.memory_visual_offsets
         identity = FieldNormalizer.identity(policy.state_dim)
         self.normalizer = DatasetNormalizer(
             state=identity,
@@ -198,6 +199,11 @@ class ArchitectureOnlyRuntimeAdapter:
             "memory_visual_input_shape = "
             f"[B,{self.memory_visual_history_length},{self.n_image_views},384]"
         )
+        print(
+            "memory_state_input_shape = "
+            f"[B,{self.memory_visual_history_length},{self.policy.state_dim}]"
+        )
+        print("memory_offsets = shared_visual_state")
         return self.async_dino_buffer
 
     def stop_async_dino(self) -> None:
@@ -205,13 +211,25 @@ class ArchitectureOnlyRuntimeAdapter:
             self.async_dino_buffer.stop()
 
     def submit_async_dino_frame(
-        self, frame_id: int, frame: Any, capture_time: float | None = None
+        self,
+        frame_id: int,
+        frame: Any,
+        robot_state: np.ndarray,
+        capture_time: float | None = None,
     ) -> bool:
         if self.async_dino_buffer is None or self.async_dino_preprocess is None:
             raise RuntimeError("call start_async_dino() first")
+        state = as_float32_array(robot_state, name="robot_state")
+        if state.shape != (self.policy.state_dim,):
+            raise ValueError(
+                f"robot_state shape {state.shape} != ({self.policy.state_dim},)"
+            )
         images = build_dino_images(frame, self.async_dino_preprocess)
         return self.async_dino_buffer.submit_frame(
-            frame_id, *images, capture_time=capture_time
+            frame_id,
+            *images,
+            robot_state=state,
+            capture_time=capture_time,
         )
 
     @torch.inference_mode()
@@ -220,7 +238,6 @@ class ArchitectureOnlyRuntimeAdapter:
         obs: Mapping[str, Any],
         *,
         state_raw: np.ndarray,
-        memory_state_raw: np.ndarray | None = None,
         num_inference_steps: int | None = None,
         solver: str | None = None,
     ) -> np.ndarray:
@@ -235,25 +252,31 @@ class ArchitectureOnlyRuntimeAdapter:
             normalizer=self.normalizer,
             window_size=self.window_size,
         )
-        feature_window = (
+        memory_window = (
             None
             if self.async_dino_buffer is None
-            else self.async_dino_buffer.get_feature_window()
+            else self.async_dino_buffer.get_memory_window()
         )
-        if feature_window is None:
+        if memory_window is None:
             raise RuntimeError("memory not ready: DINO buffer needs its first processed sample")
-        if memory_state_raw is None:
-            raise ValueError("memory_state_raw is required")
-        memory_state = as_float32_array(memory_state_raw, name="memory_state_raw")
-        expected_memory = (self.policy.memory_history_frames, self.policy.state_dim)
+        feature_window = memory_window["feature"]
+        state_tensor = memory_window["state"]
+        if state_tensor is None:
+            raise RuntimeError("aligned robot state is missing from Async DINO Buffer")
+        memory_state = state_tensor.to(self.device)
+        expected_memory = (
+            feature_window.shape[0],
+            self.policy.memory_history_frames,
+            self.policy.state_dim,
+        )
         if memory_state.shape != expected_memory:
             raise ValueError(
-                f"memory_state_raw shape {memory_state.shape} != {expected_memory}"
+                f"aligned memory state shape {memory_state.shape} != {expected_memory}"
             )
         obs_torch.update(
             {
                 "memory_image_backbone_feat": feature_window,
-                "memory_state": torch.from_numpy(memory_state).unsqueeze(0).to(self.device),
+                "memory_state": memory_state,
                 "memory_visual_offsets": self.memory_visual_offsets,
             }
         )
@@ -351,8 +374,8 @@ def build_architecture_only_context(
         memory_method="fusion",
         memory_injection="concat_global_cond",
         memory_dim=256,
-        memory_history_frames=64,
-        memory_recent_frame=4,
+        memory_history_frames=128,
+        memory_recent_frame=0,
         memory_visual_layers=2,
         memory_visual_heads=4,
         memory_visual_history_length=128,
