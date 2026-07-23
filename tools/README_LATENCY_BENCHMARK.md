@@ -169,7 +169,8 @@ python -m tools.bench_full_pipeline_latency \
 ```
 
 该测试使用真实 `FMInferenceRuntime`、`submit_async_dino_frame()` 和
-`predict_rot6d_abs()`。先用真实 DINO 填满16个历史时刻，再 warmup。正式阶段的
+`predict_rot6d_abs()`。第一个真实 DINO CLS 到达后用 repeat-first 构造固定64长度
+历史，再 warmup。正式阶段的
 相机 feeder 按约30 Hz 持续提交，不会等待 DINO 完成，因此会测到真实
 GPU 竞争、latest-only dropped samples 和 deadline misses。
 

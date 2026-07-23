@@ -74,7 +74,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     add_common_arguments(parser)
     parser.add_argument("--camera-period-ms", type=float, default=33.0)
-    parser.add_argument("--dino-sample-interval-frames", type=int, default=4)
+    parser.add_argument("--dino-sample-interval-frames", type=int, default=8)
     args = parser.parse_args()
     if args.batch_size != 1:
         raise ValueError("full pipeline deployment entry currently requires batch-size=1")
@@ -89,19 +89,28 @@ def main() -> None:
     )
     frames = make_camera_frames(runtime, 16, args.seed)
 
-    # Initial history fill is setup, not part of formal latency statistics.
-    for sample_index in range(16):
-        frame_id = sample_index * args.dino_sample_interval_frames
-        accepted = runtime.submit_async_dino_frame(
-            frame_id,
-            frames[sample_index % len(frames)],
-            capture_time=time.perf_counter(),
+    # One real sample is enough: missing older tokens repeat the first DINO CLS.
+    accepted = runtime.submit_async_dino_frame(
+        0,
+        frames[0],
+        capture_time=time.perf_counter(),
+    )
+    if not accepted:
+        raise AssertionError("initial sampled frame was rejected")
+    wait_for_processed(buffer, 1)
+    initial_window = buffer.get_feature_window()
+    if initial_window is None:
+        raise AssertionError("Async DINO Buffer must be ready after its first sample")
+    expected_window = (
+        args.batch_size,
+        runtime.memory_visual_history_length,
+        runtime.n_image_views,
+        384,
+    )
+    if initial_window.shape != expected_window:
+        raise AssertionError(
+            f"initial padded window {tuple(initial_window.shape)} != {expected_window}"
         )
-        if not accepted:
-            raise AssertionError(f"initial sampled frame {frame_id} was rejected")
-        wait_for_processed(buffer, sample_index + 1)
-    if buffer.get_feature_window() is None:
-        raise AssertionError("Async DINO Buffer must contain 16 real processed samples")
 
     obs, state_raw = random_smoke_obs(runtime, seed=args.seed)
     rng = np.random.default_rng(args.seed + 1)
@@ -137,7 +146,7 @@ def main() -> None:
     stop_camera = threading.Event()
     camera_submit_times = []
     camera_lock = threading.Lock()
-    first_formal_frame = 16 * args.dino_sample_interval_frames
+    first_formal_frame = args.dino_sample_interval_frames
 
     def camera_loop():
         frame_id = first_formal_frame

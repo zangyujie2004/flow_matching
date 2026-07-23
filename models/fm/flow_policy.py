@@ -52,6 +52,9 @@ class FlowMatchingPolicy(nn.Module):
         memory_dim: int = 256,
         memory_history_frames: int = 64,
         memory_recent_frame: int = 2,
+        memory_visual_history_length: int = 64,
+        memory_visual_sample_stride: int = 8,
+        memory_visual_recent_frame: int = 0,
         memory_visual_layers: int = 2,
         memory_visual_heads: int = 4,
         memory_state_channels: int = 128,
@@ -78,6 +81,15 @@ class FlowMatchingPolicy(nn.Module):
         self.memory_method = str(memory_method)
         self.memory_history_frames = int(memory_history_frames)
         self.memory_recent_frame = int(memory_recent_frame)
+        self.memory_visual_history_length = int(memory_visual_history_length)
+        self.memory_visual_sample_stride = int(memory_visual_sample_stride)
+        self.memory_visual_recent_frame = int(memory_visual_recent_frame)
+        if self.memory_visual_history_length < 1:
+            raise ValueError("memory_visual_history_length must be positive")
+        if self.memory_visual_sample_stride < 1:
+            raise ValueError("memory_visual_sample_stride must be positive")
+        if self.memory_visual_recent_frame < 0:
+            raise ValueError("memory_visual_recent_frame must be non-negative")
         self.memory_injection = str(memory_injection).lower()
         if self.memory_injection not in {"cross_attn", "concat_global_cond"}:
             raise ValueError(
@@ -123,6 +135,11 @@ class FlowMatchingPolicy(nn.Module):
                 memory_dim=int(memory_dim),
                 history_frames=self.memory_history_frames,
                 recent_frame=self.memory_recent_frame,
+                max_visual_time_offset=(
+                    self.memory_visual_recent_frame
+                    + self.memory_visual_sample_stride
+                    * (self.memory_visual_history_length - 1)
+                ),
                 visual_layers=memory_visual_layers,
                 visual_heads=memory_visual_heads,
                 state_channels=memory_state_channels,
@@ -225,6 +242,24 @@ class FlowMatchingPolicy(nn.Module):
             )
             kwargs["memory_recent_frame"] = int(
                 data_mem.get("recent_frame", kwargs.get("memory_recent_frame", 2))
+            )
+            kwargs["memory_visual_history_length"] = int(
+                data_mem.get(
+                    "visual_history_length",
+                    kwargs.get("memory_visual_history_length", 64),
+                )
+            )
+            kwargs["memory_visual_sample_stride"] = int(
+                data_mem.get(
+                    "sample_stride",
+                    kwargs.get("memory_visual_sample_stride", 8),
+                )
+            )
+            kwargs["memory_visual_recent_frame"] = int(
+                data_mem.get(
+                    "visual_recent_frame",
+                    kwargs.get("memory_visual_recent_frame", 0),
+                )
             )
             kwargs["memory_visual_layers"] = int(
                 mem_cfg.get("visual_layers", kwargs.get("memory_visual_layers", 2))

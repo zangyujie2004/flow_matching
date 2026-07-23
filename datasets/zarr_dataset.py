@@ -156,8 +156,14 @@ class ZarrDataset(Dataset):
         memory_cfg = dict(memory or {})
         self.memory_enabled = bool(memory_cfg.get("enabled", False))
         self.memory_history_frames = max(1, int(memory_cfg.get("history_frames", 64)))
-        self.memory_sample_stride = max(1, int(memory_cfg.get("sample_stride", 4)))
+        self.memory_visual_history_length = max(
+            1, int(memory_cfg.get("visual_history_length", 64))
+        )
+        self.memory_sample_stride = max(1, int(memory_cfg.get("sample_stride", 8)))
         self.memory_recent_frame = max(1, int(memory_cfg.get("recent_frame", 2)))
+        self.memory_visual_recent_frame = max(
+            0, int(memory_cfg.get("visual_recent_frame", 0))
+        )
         # Locked: pad_first only (ignore any start_mode in config).
         self.memory_start_mode = "pad_first"
         self.memory_visual_offsets = self._build_memory_visual_offsets()
@@ -205,9 +211,11 @@ class ZarrDataset(Dataset):
         if self.memory_enabled:
             print(
                 "[ZarrDataset] memory enabled: "
-                f"history_frames={self.memory_history_frames}, "
-                f"sample_stride={self.memory_sample_stride}, "
-                f"recent_frame={self.memory_recent_frame}, "
+                f"state_history_frames={self.memory_history_frames}, "
+                f"visual_history_length={self.memory_visual_history_length}, "
+                f"visual_sample_stride={self.memory_sample_stride}, "
+                f"state_recent_frame={self.memory_recent_frame}, "
+                f"visual_recent_frame={self.memory_visual_recent_frame}, "
                 f"visual_offsets={self.memory_visual_offsets.tolist()}, "
                 f"start_mode={self.memory_start_mode}"
             )
@@ -509,9 +517,11 @@ class ZarrDataset(Dataset):
         return windows
 
     def _build_memory_visual_offsets(self) -> np.ndarray:
-        n_tokens = max(1, int(np.ceil(self.memory_history_frames / self.memory_sample_stride)))
-        start = -self.memory_recent_frame - self.memory_sample_stride * (n_tokens - 1)
-        stop = -self.memory_recent_frame + 1
+        start = (
+            -self.memory_visual_recent_frame
+            - self.memory_sample_stride * (self.memory_visual_history_length - 1)
+        )
+        stop = -self.memory_visual_recent_frame + 1
         return np.arange(start, stop, self.memory_sample_stride, dtype=np.int64)
 
     def _clamp_memory_indices(self, indices: np.ndarray, ep_idx: int) -> np.ndarray:
@@ -528,8 +538,9 @@ class ZarrDataset(Dataset):
         return self._clamp_memory_indices(raw, ep_idx)
 
     def memory_visual_valid(self, anchor_t: int, ep_idx: int) -> np.ndarray:
-        raw = int(anchor_t) + self.memory_visual_offsets
-        return self._memory_index_valid(raw, ep_idx)
+        # Out-of-episode visual indices are clamped to the first episode frame.
+        # Those repeated first-frame tokens intentionally participate in attention.
+        return np.ones(self.memory_visual_history_length, dtype=np.bool_)
 
     def memory_state_indices(self, anchor_t: int, ep_idx: int) -> np.ndarray:
         end = int(anchor_t) - self.memory_recent_frame + 1
@@ -797,4 +808,3 @@ def build_dataloader(
         )
         kwargs["prefetch_factor"] = prefetch_factor
     return DataLoader(dataset, **kwargs)
-

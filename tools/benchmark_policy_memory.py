@@ -47,7 +47,7 @@ def main():
         raise RuntimeError("CUDA is required")
 
     device = torch.device("cuda")
-    b, t, v, c = 1, 16, args.num_views, 384
+    b, t, v, c = 1, 64, args.num_views, 384
     state_dim, state_history, cond_steps = 14, 64, 16
     policy = FlowMatchingPolicy(
         action_dim=state_dim,
@@ -67,6 +67,9 @@ def main():
         memory_dim=256,
         memory_history_frames=state_history,
         memory_recent_frame=4,
+        memory_visual_history_length=t,
+        memory_visual_sample_stride=8,
+        memory_visual_recent_frame=0,
         memory_visual_layers=2,
         memory_visual_heads=4,
         memory_state_mem_dim=64,
@@ -78,7 +81,7 @@ def main():
     memory_obs = {
         "memory_image_backbone_feat": torch.randn(b, t, v, c, device=device),
         "memory_state": torch.randn(b, state_history, state_dim, device=device),
-        "memory_visual_offsets": torch.arange(-64, 0, 4, device=device),
+        "memory_visual_offsets": torch.arange(-504, 1, 8, device=device),
     }
     common_obs = {
         "state": torch.randn(b, cond_steps, state_dim, device=device),

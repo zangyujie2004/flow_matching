@@ -145,6 +145,7 @@ class MemoryEncoder(nn.Module):
         memory_dim: int,
         history_frames: int = 64,
         recent_frame: int = 2,
+        max_visual_time_offset: int | None = None,
         visual_layers: int = 2,
         visual_heads: int = 4,
         state_channels: int = 128,
@@ -158,7 +159,11 @@ class MemoryEncoder(nn.Module):
         visual_branch_dim = int(memory_dim)
         state_branch_dim = int(state_mem_dim)
         self.n_views = int(n_views)
-        max_time_offset = int(history_frames) + int(recent_frame)
+        max_time_offset = (
+            int(history_frames) + int(recent_frame)
+            if max_visual_time_offset is None
+            else int(max_visual_time_offset)
+        )
         self.visual_encoder = VisualTemporalMemoryEncoder(
             visual_dim=int(visual_dim),
             out_dim=visual_branch_dim,

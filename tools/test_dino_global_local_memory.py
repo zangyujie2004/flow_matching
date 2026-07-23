@@ -25,8 +25,9 @@ def fill_buffer(
     buffer: AsyncDinoBuffer,
     image_size: int,
     num_views: int,
-    sample_count: int = 16,
+    sample_count: int | None = None,
 ) -> None:
+    sample_count = buffer.history_length if sample_count is None else int(sample_count)
     start_count = buffer.get_stats()["processed_count"]
     buffer.start()
     for sample_id in range(sample_count):
@@ -35,7 +36,7 @@ def fill_buffer(
             for _ in range(num_views)
         ]
         assert buffer.submit_frame(
-            (start_count + sample_id) * 4,
+            (start_count + sample_id) * buffer.sample_interval_frames,
             *images,
             capture_time=time.perf_counter(),
         )
@@ -172,11 +173,15 @@ def main() -> None:
     fill_buffer(global_buffer, image_size, num_views)
     global_buffer.stop()
     torch.cuda.synchronize()
-    global_snapshot = cuda_memory_snapshot("global_buffer_16", device)
+    global_snapshot = cuda_memory_snapshot("global_buffer_64", device)
     global_window = global_buffer.get_global_feature_window()
     assert global_window is not None
-    assert global_window.shape[:3] == (1, 16, num_views)
-    describe_tensor("global_16_frame", global_window)
+    assert global_window.shape[:3] == (
+        1,
+        global_buffer.history_length,
+        num_views,
+    )
+    describe_tensor("global_64_frame", global_window)
     global_mib = tensor_mib(global_window)
     global_window = None
     global_buffer.clear()
@@ -192,12 +197,12 @@ def main() -> None:
     fill_buffer(both_buffer, image_size, num_views)
     both_buffer.stop()
     torch.cuda.synchronize()
-    both_snapshot = cuda_memory_snapshot("global_plus_local_buffer_16", device)
+    both_snapshot = cuda_memory_snapshot("global_plus_local_buffer_64", device)
     latest = both_buffer.get_latest()
     local_window = both_buffer.get_local_feature_window()
     global_window = both_buffer.get_global_feature_window()
 
-    b, t, v = 1, 16, num_views
+    b, t, v = 1, global_buffer.history_length, num_views
     n, c = expected_patches, int(backbone.num_features)
     assert latest["local_feature"].shape == (b, v, n, c)
     assert latest["global_feature"].shape == (b, v, c)
@@ -211,10 +216,10 @@ def main() -> None:
     describe_tensor("global_single_view_single_frame", latest["global_feature"][:, 0])
     describe_tensor("local_multi_view_timestep", latest["local_feature"])
     describe_tensor("global_multi_view_timestep", latest["global_feature"])
-    describe_tensor("local_16_frame", local_window)
-    describe_tensor("global_16_frame", global_window)
+    describe_tensor("local_64_frame", local_window)
+    describe_tensor("global_64_frame", global_window)
     local_mib = tensor_mib(local_window)
-    print(f"local_plus_global_16_frame_memory_mib={local_mib + global_mib:.6f}")
+    print(f"local_plus_global_64_frame_memory_mib={local_mib + global_mib:.6f}")
 
     print("CUDA allocator snapshots:")
     for item in (
@@ -234,6 +239,8 @@ def main() -> None:
     print(f"global_buffer_allocated_delta_mib={global_delta:.6f}")
     print(f"local_plus_global_allocated_delta_mib={both_delta:.6f}")
     print(f"local_buffer_extra_allocated_mib={both_delta - global_delta:.6f}")
+    assert abs(global_mib - 0.28125) < 1e-6
+    assert abs(global_delta - global_mib) < 1e-6
     print_timing(both_buffer.get_stats())
 
     latest = local_window = global_window = None

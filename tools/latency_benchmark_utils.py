@@ -74,7 +74,9 @@ def architecture_only_config(num_views: int) -> dict[str, Any]:
                 "enabled": True,
                 "history_frames": 64,
                 "recent_frame": 4,
-                "sample_stride": 4,
+                "visual_history_length": 64,
+                "sample_stride": 8,
+                "visual_recent_frame": 0,
             },
         },
         "models": {
@@ -132,8 +134,11 @@ class ArchitectureOnlyRuntimeAdapter:
         self.action_horizon = 64
         self.use_tactile = False
         self.velocity_model = "unet"
+        self.memory_visual_history_length = 64
+        self.dino_sample_interval_frames = 8
+        self.memory_visual_recent_frame = 0
         self.memory_visual_offsets = torch.arange(
-            -64, 0, 4, device=device, dtype=torch.long
+            -504, 1, 8, device=device, dtype=torch.long
         )
         identity = FieldNormalizer.identity(policy.state_dim)
         self.normalizer = DatasetNormalizer(
@@ -156,8 +161,8 @@ class ArchitectureOnlyRuntimeAdapter:
         self,
         *,
         preprocess: PreprocessConfig | None = None,
-        sample_interval_frames: int = 4,
-        deadline_ms: float = 132.0,
+        sample_interval_frames: int | None = None,
+        deadline_ms: float | None = None,
     ) -> AsyncDinoBuffer:
         if self.async_dino_buffer is not None:
             self.async_dino_buffer.stop()
@@ -166,13 +171,33 @@ class ArchitectureOnlyRuntimeAdapter:
             action_type="joint", camera_views=views, image_size=224, use_tactile=False
         )
         dino = self.policy.condition_encoder.image_encoder.encoder
+        interval = (
+            self.dino_sample_interval_frames
+            if sample_interval_frames is None
+            else int(sample_interval_frames)
+        )
+        if interval != self.dino_sample_interval_frames:
+            raise ValueError(
+                "sample_interval_frames must match architecture visual sample_stride: "
+                f"{interval} != {self.dino_sample_interval_frames}"
+            )
+        deadline = 33.0 * interval if deadline_ms is None else float(deadline_ms)
         self.async_dino_buffer = AsyncDinoBuffer(
             dino,
             device=str(self.device),
-            sample_interval_frames=sample_interval_frames,
-            deadline_ms=deadline_ms,
+            sample_interval_frames=interval,
+            history_length=self.memory_visual_history_length,
+            deadline_ms=deadline,
         )
         self.async_dino_buffer.start()
+        print(f"memory_visual_history_length = {self.memory_visual_history_length}")
+        print(f"dino_sample_interval_frames = {interval}")
+        print("visual_token_source = dino_cls")
+        print("startup_padding = repeat_first_frame")
+        print(
+            "memory_visual_input_shape = "
+            f"[B,{self.memory_visual_history_length},{self.n_image_views},384]"
+        )
         return self.async_dino_buffer
 
     def stop_async_dino(self) -> None:
@@ -216,7 +241,7 @@ class ArchitectureOnlyRuntimeAdapter:
             else self.async_dino_buffer.get_feature_window()
         )
         if feature_window is None:
-            raise RuntimeError("memory not ready: DINO buffer needs 16 processed samples")
+            raise RuntimeError("memory not ready: DINO buffer needs its first processed sample")
         if memory_state_raw is None:
             raise ValueError("memory_state_raw is required")
         memory_state = as_float32_array(memory_state_raw, name="memory_state_raw")
@@ -330,6 +355,9 @@ def build_architecture_only_context(
         memory_recent_frame=4,
         memory_visual_layers=2,
         memory_visual_heads=4,
+        memory_visual_history_length=64,
+        memory_visual_sample_stride=8,
+        memory_visual_recent_frame=0,
         memory_state_mem_dim=64,
         memory_dropout=0.0,
         num_inference_steps=32,

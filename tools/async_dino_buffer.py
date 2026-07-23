@@ -12,17 +12,21 @@ class AsyncDinoBuffer:
         self,
         dino_model: nn.Module,
         device: str = "cuda",
-        sample_interval_frames: int = 4,
-        deadline_ms: float = 132.0,
+        sample_interval_frames: int = 8,
+        history_length: int = 64,
+        deadline_ms: float = 264.0,
         store_local_features: bool = False,
     ):
         self.dino_model = dino_model.to(device)
         self.dino_model.eval()
         self.device = torch.device(device)
         self.sample_interval_frames = sample_interval_frames
+        self.history_length = int(history_length)
+        if self.history_length < 1:
+            raise ValueError("history_length must be positive")
         self.deadline_ms = deadline_ms
         self.store_local_features = store_local_features
-        self.buffer = deque(maxlen=16)
+        self.buffer = deque(maxlen=self.history_length)
         self.pending_frame = None
         self.lock = threading.Lock()
         self.new_frame_event = threading.Event()
@@ -93,9 +97,9 @@ class AsyncDinoBuffer:
         return self.get_global_feature_window()
 
     def get_global_feature_window(self):
-        """Return detached per-image DINO CLS features as (B,T=16,V,C), or None."""
+        """Return repeat-first padded DINO CLS history as (B,T,V,C), or None."""
         with self.lock:
-            if len(self.buffer) < self.buffer.maxlen:
+            if not self.buffer:
                 return None
             features = [entry["global_feature"] for entry in self.buffer]
 
@@ -103,6 +107,10 @@ class AsyncDinoBuffer:
         if any(feature.shape != first_shape for feature in features):
             shapes = [tuple(feature.shape) for feature in features]
             raise ValueError(f"DINO buffer contains inconsistent feature shapes: {shapes}")
+        missing = self.history_length - len(features)
+        if missing > 0:
+            features = [features[0]] * missing + features
+        features = features[-self.history_length :]
         # Each item is (B,V,C); stacking time at dim=1 gives (B,T,V,C).
         window = torch.stack(features, dim=1).detach()
         if window.requires_grad or window.grad_fn is not None:
@@ -110,13 +118,17 @@ class AsyncDinoBuffer:
         return window
 
     def get_local_feature_window(self):
-        """Return detached patch features as (B,T=16,V,N,C), or None."""
+        """Return repeat-first padded patch history as (B,T,V,N,C), or None."""
         with self.lock:
-            if len(self.buffer) < self.buffer.maxlen:
+            if not self.buffer:
                 return None
             features = [entry["local_feature"] for entry in self.buffer]
         if any(feature is None for feature in features):
             return None
+        missing = self.history_length - len(features)
+        if missing > 0:
+            features = [features[0]] * missing + features
+        features = features[-self.history_length :]
         window = torch.stack(features, dim=1).detach()  # (B,T,V,N,C)
         if window.requires_grad or window.grad_fn is not None:
             raise RuntimeError("DINO local feature window must not keep an autograd graph")

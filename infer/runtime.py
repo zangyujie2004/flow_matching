@@ -115,14 +115,42 @@ class FMInferenceRuntime:
         self.async_dino_preprocess: PreprocessConfig | None = None
 
         memory_cfg = dict(data_cfg.get("memory") or {})
-        stride = max(1, int(memory_cfg.get("sample_stride", 4)))
-        recent = int(self.policy.memory_recent_frame)
-        history = int(self.policy.memory_history_frames)
-        token_count = max(1, int(np.ceil(history / stride)))
-        start = -recent - stride * (token_count - 1)
-        self.memory_visual_offsets = torch.arange(
-            start, -recent + 1, stride, device=self.device, dtype=torch.long
+        self.memory_visual_history_length = max(
+            1, int(memory_cfg.get("visual_history_length", 64))
         )
+        self.dino_sample_interval_frames = max(
+            1, int(memory_cfg.get("sample_stride", 8))
+        )
+        self.memory_visual_recent_frame = max(
+            0, int(memory_cfg.get("visual_recent_frame", 0))
+        )
+        start = (
+            -self.memory_visual_recent_frame
+            - self.dino_sample_interval_frames
+            * (self.memory_visual_history_length - 1)
+        )
+        self.memory_visual_offsets = torch.arange(
+            start,
+            -self.memory_visual_recent_frame + 1,
+            self.dino_sample_interval_frames,
+            device=self.device,
+            dtype=torch.long,
+        )
+        if self.policy.memory_enabled:
+            policy_history = int(self.policy.memory_visual_history_length)
+            policy_stride = int(self.policy.memory_visual_sample_stride)
+            policy_recent = int(self.policy.memory_visual_recent_frame)
+            configured = (
+                self.memory_visual_history_length,
+                self.dino_sample_interval_frames,
+                self.memory_visual_recent_frame,
+            )
+            policy_values = (policy_history, policy_stride, policy_recent)
+            if configured != policy_values:
+                raise ValueError(
+                    "runtime visual memory config does not match Policy: "
+                    f"runtime={configured}, policy={policy_values}"
+                )
         self.load_timing_ms["runtime_total"] = (time.perf_counter() - init_start) * 1000.0
 
         if warmup:
@@ -204,7 +232,9 @@ class FMInferenceRuntime:
         if self.policy.memory_enabled:
             memory_obs = self._get_async_memory_obs(memory_state_raw)
             if memory_obs is None:
-                raise RuntimeError("memory not ready: DINO buffer needs 16 processed samples")
+                raise RuntimeError(
+                    "memory not ready: DINO buffer needs its first processed sample"
+                )
             obs_torch.update(memory_obs)
         steps = self.num_inference_steps if num_inference_steps is None else int(num_inference_steps)
         solver_name = self.solver if solver is None else str(solver)
@@ -242,10 +272,15 @@ class FMInferenceRuntime:
         _b, t, v, c = feature_window.shape
         image_encoder = self.policy.condition_encoder.image_encoder
         expected_c = int(image_encoder.encoder.head[0].normalized_shape[0])
-        if (t, v, c) != (16, image_encoder.n_views, expected_c):
+        if (t, v, c) != (
+            self.memory_visual_history_length,
+            image_encoder.n_views,
+            expected_c,
+        ):
             raise ValueError(
                 "async DINO window shape must be "
-                f"(B,16,{image_encoder.n_views},{expected_c}), got {tuple(feature_window.shape)}"
+                f"(B,{self.memory_visual_history_length},"
+                f"{image_encoder.n_views},{expected_c}), got {tuple(feature_window.shape)}"
             )
         return {
             "memory_image_backbone_feat": feature_window,
@@ -259,7 +294,7 @@ class FMInferenceRuntime:
         memory_state_raw: np.ndarray,
         measure_cuda_memory: bool = False,
     ) -> dict[str, Any] | None:
-        """Return the real Policy Memory intermediates, or None until 16 samples exist."""
+        """Return real Policy Memory intermediates after at least one DINO sample."""
         memory_obs = self._get_async_memory_obs(memory_state_raw)
         if memory_obs is None:
             return None
@@ -310,8 +345,8 @@ class FMInferenceRuntime:
         self,
         *,
         preprocess: PreprocessConfig | None = None,
-        sample_interval_frames: int = 4,
-        deadline_ms: float = 132.0,
+        sample_interval_frames: int | None = None,
+        deadline_ms: float | None = None,
     ) -> AsyncDinoBuffer:
         """Start a simple two- or three-camera DINO buffer."""
 
@@ -323,19 +358,43 @@ class FMInferenceRuntime:
                 "async camera count must match policy n_image_views: "
                 f"{len(self.async_dino_preprocess.camera_views)} != {self.n_image_views}"
             )
-        if self.policy.memory_enabled and self.memory_visual_offsets.numel() != 16:
+        if (
+            self.policy.memory_enabled
+            and self.memory_visual_offsets.numel()
+            != self.memory_visual_history_length
+        ):
             raise ValueError(
-                "Async DINO buffer is fixed at 16 samples, but policy config expects "
+                "visual offset count does not match configured history length: "
                 f"{self.memory_visual_offsets.numel()} visual memory tokens"
             )
+        interval = (
+            self.dino_sample_interval_frames
+            if sample_interval_frames is None
+            else int(sample_interval_frames)
+        )
+        if self.policy.memory_enabled and interval != self.dino_sample_interval_frames:
+            raise ValueError(
+                "sample_interval_frames must match configured visual sample_stride: "
+                f"{interval} != {self.dino_sample_interval_frames}"
+            )
+        deadline = 33.0 * interval if deadline_ms is None else float(deadline_ms)
         dino_model = self.policy.condition_encoder.image_encoder.encoder
         self.async_dino_buffer = AsyncDinoBuffer(
             dino_model=dino_model,
             device=str(self.device),
-            sample_interval_frames=sample_interval_frames,
-            deadline_ms=deadline_ms,
+            sample_interval_frames=interval,
+            history_length=self.memory_visual_history_length,
+            deadline_ms=deadline,
         )
         self.async_dino_buffer.start()
+        print(f"memory_visual_history_length = {self.memory_visual_history_length}")
+        print(f"dino_sample_interval_frames = {interval}")
+        print("visual_token_source = dino_cls")
+        print("startup_padding = repeat_first_frame")
+        print(
+            "memory_visual_input_shape = "
+            f"[B,{self.memory_visual_history_length},{self.n_image_views},384]"
+        )
         return self.async_dino_buffer
 
     def submit_async_dino_frame(

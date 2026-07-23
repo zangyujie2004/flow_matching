@@ -34,8 +34,10 @@ data:
   memory:
     enabled: true
     history_frames: 64
-    sample_stride: 4
     recent_frame: 4
+    visual_history_length: 64
+    sample_stride: 8
+    visual_recent_frame: 0
 
 models:
   fm:

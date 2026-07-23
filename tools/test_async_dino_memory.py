@@ -27,7 +27,7 @@ def main() -> None:
         raise RuntimeError("This smoke test requires CUDA")
 
     device = torch.device("cuda")
-    b, t, v, c = 1, 16, args.num_views, 384
+    b, t, v, c = 1, 64, args.num_views, 384
     projected_dim = memory_dim = 256
     state_dim, state_history = 14, 64
     policy = FlowMatchingPolicy(
@@ -48,6 +48,9 @@ def main() -> None:
         memory_dim=memory_dim,
         memory_history_frames=state_history,
         memory_recent_frame=4,
+        memory_visual_history_length=t,
+        memory_visual_sample_stride=8,
+        memory_visual_recent_frame=0,
         memory_visual_layers=2,
         memory_visual_heads=4,
         memory_state_mem_dim=64,
@@ -55,24 +58,32 @@ def main() -> None:
     ).to(device).eval()
 
     dino = policy.condition_encoder.image_encoder.encoder
-    buffer = AsyncDinoBuffer(dino, device="cuda", store_local_features=False)
+    buffer = AsyncDinoBuffer(
+        dino,
+        device="cuda",
+        sample_interval_frames=8,
+        history_length=t,
+        store_local_features=False,
+    )
     buffer.start()
     for sample_id in range(t):
         images = [
             torch.randint(0, 256, (b, 3, 224, 224), dtype=torch.uint8)
             for _ in range(v)
         ]
-        assert buffer.submit_frame(sample_id * 4, *images)
+        assert buffer.submit_frame(sample_id * 8, *images)
         wait_until_processed(buffer, sample_id + 1)
 
     feature_window = buffer.get_feature_window()
     assert feature_window is not None
     assert feature_window.shape == (b, t, v, c)
+    assert feature_window.ndim == 4
+    assert buffer.get_local_feature_window() is None
     assert feature_window.device.type == "cuda"
     assert not feature_window.requires_grad and feature_window.grad_fn is None
 
     memory_state = torch.randn(b, state_history, state_dim, device=device)
-    offsets = torch.arange(-64, -3, 4, device=device)
+    offsets = torch.arange(-504, 1, 8, device=device)
     assert offsets.shape == (t,)
     temporal_input_shapes = []
     temporal_encoder = policy.memory_encoder.visual_encoder.encoder
@@ -118,6 +129,7 @@ def main() -> None:
     # There is one shared projection head and one shared temporal Transformer.
     shared_head = policy.condition_encoder.image_encoder.encoder.head
     shared_temporal = policy.memory_encoder.visual_encoder
+    assert shared_temporal.time_embed.num_embeddings == 505
     assert sum(module is shared_head for module in policy.modules()) == 1
     assert sum(module is shared_temporal for module in policy.modules()) == 1
     assert not hasattr(shared_temporal, "cls_token")
