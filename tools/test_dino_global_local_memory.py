@@ -1,5 +1,6 @@
 """Measure DINO patch-local and per-image CLS global feature storage on CUDA."""
 
+import gc
 import sys
 import time
 from pathlib import Path
@@ -20,19 +21,41 @@ def wait_until_processed(buffer: AsyncDinoBuffer, target: int) -> None:
         time.sleep(0.01)
 
 
-def fill_buffer(buffer: AsyncDinoBuffer, image_size: int, num_views: int) -> None:
+def fill_buffer(
+    buffer: AsyncDinoBuffer,
+    image_size: int,
+    num_views: int,
+    sample_count: int = 16,
+) -> None:
+    start_count = buffer.get_stats()["processed_count"]
     buffer.start()
-    for sample_id in range(16):
+    for sample_id in range(sample_count):
         images = [
             torch.randint(0, 256, (1, 3, image_size, image_size), dtype=torch.uint8)
             for _ in range(num_views)
         ]
         assert buffer.submit_frame(
-            sample_id * 4,
+            (start_count + sample_id) * 4,
             *images,
             capture_time=time.perf_counter(),
         )
-        wait_until_processed(buffer, sample_id + 1)
+        wait_until_processed(buffer, start_count + sample_id + 1)
+
+
+def worker_warmed_empty_snapshot(
+    buffer: AsyncDinoBuffer,
+    image_size: int,
+    num_views: int,
+    label: str,
+) -> dict:
+    """Warm the actual worker, then measure with no Buffer-owned feature tensors."""
+    fill_buffer(buffer, image_size, num_views, sample_count=2)
+    buffer.stop()
+    buffer.clear()
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    return cuda_memory_snapshot(label, buffer.device)
 
 
 def describe_tensor(name: str, tensor: torch.Tensor) -> None:
@@ -54,7 +77,7 @@ def print_timing(stats: dict) -> None:
         "buffer_append_ms",
         "sample_total_ms",
     )
-    print("Timing, formal samples only (mean / p95 / max ms):")
+    print("Timing, including 2 worker warmup samples (mean / p95 / max ms):")
     for name in names:
         values = stats[name]
         print(
@@ -140,9 +163,16 @@ def main() -> None:
     empty_snapshot = cuda_memory_snapshot("model_loaded_buffer_empty", device)
 
     global_buffer = AsyncDinoBuffer(model, device="cuda", store_local_features=False)
+    global_empty_snapshot = worker_warmed_empty_snapshot(
+        global_buffer,
+        image_size,
+        num_views,
+        "worker_warmed_global_buffer_empty",
+    )
     fill_buffer(global_buffer, image_size, num_views)
-    global_snapshot = cuda_memory_snapshot("global_buffer_16", device)
     global_buffer.stop()
+    torch.cuda.synchronize()
+    global_snapshot = cuda_memory_snapshot("global_buffer_16", device)
     global_window = global_buffer.get_global_feature_window()
     assert global_window is not None
     assert global_window.shape[:3] == (1, 16, num_views)
@@ -153,9 +183,16 @@ def main() -> None:
     torch.cuda.empty_cache()
 
     both_buffer = AsyncDinoBuffer(model, device="cuda", store_local_features=True)
+    both_empty_snapshot = worker_warmed_empty_snapshot(
+        both_buffer,
+        image_size,
+        num_views,
+        "worker_warmed_local_global_buffer_empty",
+    )
     fill_buffer(both_buffer, image_size, num_views)
-    both_snapshot = cuda_memory_snapshot("global_plus_local_buffer_16", device)
     both_buffer.stop()
+    torch.cuda.synchronize()
+    both_snapshot = cuda_memory_snapshot("global_plus_local_buffer_16", device)
     latest = both_buffer.get_latest()
     local_window = both_buffer.get_local_feature_window()
     global_window = both_buffer.get_global_feature_window()
@@ -180,14 +217,23 @@ def main() -> None:
     print(f"local_plus_global_16_frame_memory_mib={local_mib + global_mib:.6f}")
 
     print("CUDA allocator snapshots:")
-    for item in (empty_snapshot, global_snapshot, both_snapshot):
+    for item in (
+        empty_snapshot,
+        global_empty_snapshot,
+        global_snapshot,
+        both_empty_snapshot,
+        both_snapshot,
+    ):
         print(item)
-    empty_alloc = float(empty_snapshot["allocated_mib"])
+    global_empty_alloc = float(global_empty_snapshot["allocated_mib"])
+    both_empty_alloc = float(both_empty_snapshot["allocated_mib"])
     global_alloc = float(global_snapshot["allocated_mib"])
     both_alloc = float(both_snapshot["allocated_mib"])
-    print(f"global_buffer_allocated_delta_mib={global_alloc - empty_alloc:.6f}")
-    print(f"local_plus_global_allocated_delta_mib={both_alloc - empty_alloc:.6f}")
-    print(f"local_extra_allocated_delta_mib={both_alloc - global_alloc:.6f}")
+    global_delta = global_alloc - global_empty_alloc
+    both_delta = both_alloc - both_empty_alloc
+    print(f"global_buffer_allocated_delta_mib={global_delta:.6f}")
+    print(f"local_plus_global_allocated_delta_mib={both_delta:.6f}")
+    print(f"local_buffer_extra_allocated_mib={both_delta - global_delta:.6f}")
     print_timing(both_buffer.get_stats())
 
     latest = local_window = global_window = None
