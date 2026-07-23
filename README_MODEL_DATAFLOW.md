@@ -1,10 +1,12 @@
 # 模型数据流总览：UNet / DiT × 有无 Memory
 
 本文档基于当前仓库真实代码（`configs/train/config.yaml` + `models/` + `datasets/`
+
 + `infer/` + `tools/`）整理，覆盖四种组合的训练与推理数据流、Tensor 维度和数据结构。
-所有 shape 均按代码验证，未验证的内容在第 9 节单独列出。
+  所有 shape 均按代码验证，未验证的内容在第 9 节单独列出。
 
 > 与旧模板的三点差异（按当前代码为准）：
+>
 > 1. 当前观测三视角是 **先逐视角投影 384→256、再 concat 成 3×256=768**，不是 3×384=1152。
 > 2. `concat_global_cond` 已**移除 512→256 的 `memory_cond_fusion` 压缩层**，直接使用拼接后的 512 维。
 > 3. DiT 的 Memory（目标 `concat_global_cond`）经 **AdaLN 全局条件**注入，不是额外 token / cross-attention。
@@ -13,28 +15,28 @@
 
 ## 1. 总体配置（真实值）
 
-| 符号 | 含义 | 值 | 来源 |
-|---|---|---|---|
-| `B` | batch size | 训练 1024 / 部署 1 | `config.yaml train.batch_size` / 真机 |
-| `V` | 视角数 | **3**（`base_0, left_wrist_0, right_wrist_0`） | `data.camera_views` / `models.fm.n_image_views` |
-| `D` | DINOv2-Small CLS 维度 | **384** | `dino_v2.py` backbone `num_features` |
-| `cond_dim` | 条件维度 | 256 | `models.fm.cond_dim` |
-| `image_feat_dim` | 单视觉分支输出 | 256 | `models.fm.image_feat_dim` |
-| `T_visual` | 视觉 Memory 采样数 | **128** | `data.memory.visual_history_length` |
-| `visual_stride` | 视觉采样间隔（相机帧） | **8** | `data.memory.sample_stride` |
-| `visual_offsets` | 视觉时间偏移 | **[-1016, -1008, …, -8, 0]**（128 个） | `zarr_dataset._build_memory_visual_offsets` |
-| `T_state` | 状态 Memory 帧数 | **64** | `data.memory.history_frames` |
-| `state_recent` | 状态 Memory 末端偏移 | 4 | `data.memory.recent_frame` |
-| `cond_steps` | 当前观测状态窗口 | **8** | `data.window_size`（=`dataset.window_size`） |
-| `n_image_steps` | 当前观测图像帧数 | 1 | `data.n_image_steps` |
-| `action_dim` | 动作维度 | **14**（`action_type: joint`） | `zarr_dataset._ROBOT_DIMS["joint"]` |
-| `action_horizon` | 预测动作长度 | **64** | `data.action_horizon`，训练经 `sync_fm_action_horizon_from_data` 注入 |
-| `n_action_steps` | 执行动作步数 | **64**（未单列 → 取 `action_horizon`） | 同上 |
-| `solver_steps` | 采样步数 | **32** | `models.fm.num_inference_steps` |
-| `solver` | ODE 求解器 | euler | `models.fm.solver` |
-| `velocity_model` | 速度场骨干 | unet（可选 dit） | `models.fm.velocity_model` |
-| `view_pool` | 视觉融合方式 | global_concat | `models.fm.view_pool` |
-| Memory | 方法 / 注入 | fusion / concat_global_cond | `models.memory.method` / `.injection` |
+| 符号               | 含义                   | 值                                                     | 来源                                                                      |
+| ------------------ | ---------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------- |
+| `B`              | batch size             | 训练 1024 / 部署 1                                     | `config.yaml train.batch_size` / 真机                                   |
+| `V`              | 视角数                 | **3**（`base_0, left_wrist_0, right_wrist_0`） | `data.camera_views` / `models.fm.n_image_views`                       |
+| `D`              | DINOv2-Small CLS 维度  | **384**                                          | `dino_v2.py` backbone `num_features`                                  |
+| `cond_dim`       | 条件维度               | 256                                                    | `models.fm.cond_dim`                                                    |
+| `image_feat_dim` | 单视觉分支输出         | 256                                                    | `models.fm.image_feat_dim`                                              |
+| `T_visual`       | 视觉 Memory 采样数     | **128**                                          | `data.memory.visual_history_length`                                     |
+| `visual_stride`  | 视觉采样间隔（相机帧） | **8**                                            | `data.memory.sample_stride`                                             |
+| `visual_offsets` | 视觉时间偏移           | **[-1016, -1008, …, -8, 0]**（128 个）          | `zarr_dataset._build_memory_visual_offsets`                             |
+| `T_state`        | 状态 Memory 帧数       | **64**                                           | `data.memory.history_frames`                                            |
+| `state_recent`   | 状态 Memory 末端偏移   | 4                                                      | `data.memory.recent_frame`                                              |
+| `cond_steps`     | 当前观测状态窗口       | **8**                                            | `data.window_size`（=`dataset.window_size`）                          |
+| `n_image_steps`  | 当前观测图像帧数       | 1                                                      | `data.n_image_steps`                                                    |
+| `action_dim`     | 动作维度               | **14**（`action_type: joint`）                 | `zarr_dataset._ROBOT_DIMS["joint"]`                                     |
+| `action_horizon` | 预测动作长度           | **64**                                           | `data.action_horizon`，训练经 `sync_fm_action_horizon_from_data` 注入 |
+| `n_action_steps` | 执行动作步数           | **64**（未单列 → 取 `action_horizon`）        | 同上                                                                      |
+| `solver_steps`   | 采样步数               | **32**                                           | `models.fm.num_inference_steps`                                         |
+| `solver`         | ODE 求解器             | euler                                                  | `models.fm.solver`                                                      |
+| `velocity_model` | 速度场骨干             | unet（可选 dit）                                       | `models.fm.velocity_model`                                              |
+| `view_pool`      | 视觉融合方式           | global_concat                                          | `models.fm.view_pool`                                                   |
+| Memory             | 方法 / 注入            | fusion / concat_global_cond                            | `models.memory.method` / `.injection`                                 |
 
 > 长度不要混淆：`T_visual=128`（稀疏视觉，stride 8，跨度约 33.5s）、`T_state=64`
 > （高频状态）、`cond_steps=8`（当前观测状态窗）、`action_horizon=64`（预测长度）是四个独立量。
@@ -210,12 +212,12 @@ predicted velocity                [B,64,14]
 
 ## 4. 四种模式对比表（真实 Tensor shape）
 
-| Backbone | Memory | Current obs | Memory input | Condition injection | Model 条件输入 | Output |
-|---|---|---|---|---|---|---|
-| UNet | 无 | `obs_cond [B,256]` | — | FiLM，`global_cond_dim=256` | `global_cond [B,256]`（FiLM 实宽 256+256=512） | `velocity [B,64,14]` |
-| UNet | 有 | `obs_cond [B,256]` | `[B,128,3,384]`→`memory_global [B,256]` | FiLM，`global_cond_dim=512` | `global_cond [B,512]` | `velocity [B,64,14]` |
-| DiT | 无 | `obs_cond [B,256]` | — | AdaLN，`cond_proj(256→hidden)` | `global_cond [B,256]`，`condition_tokens=None` | `velocity [B,64,14]` |
-| DiT | 有 | `obs_cond [B,256]` | `[B,128,3,384]`→`memory_global [B,256]` | AdaLN，`cond_proj(512→hidden)` | `global_cond [B,512]`，`condition_tokens=None` | `velocity [B,64,14]` |
+| Backbone | Memory | Current obs          | Memory input                                 | Condition injection               | Model 条件输入                                     | Output                 |
+| -------- | ------ | -------------------- | -------------------------------------------- | --------------------------------- | -------------------------------------------------- | ---------------------- |
+| UNet     | 无     | `obs_cond [B,256]` | —                                           | FiLM，`global_cond_dim=256`     | `global_cond [B,256]`（FiLM 实宽 256+256=512）   | `velocity [B,64,14]` |
+| UNet     | 有     | `obs_cond [B,256]` | `[B,128,3,384]`→`memory_global [B,256]` | FiLM，`global_cond_dim=512`     | `global_cond [B,512]`                            | `velocity [B,64,14]` |
+| DiT      | 无     | `obs_cond [B,256]` | —                                           | AdaLN，`cond_proj(256→hidden)` | `global_cond [B,256]`，`condition_tokens=None` | `velocity [B,64,14]` |
+| DiT      | 有     | `obs_cond [B,256]` | `[B,128,3,384]`→`memory_global [B,256]` | AdaLN，`cond_proj(512→hidden)` | `global_cond [B,512]`，`condition_tokens=None` | `velocity [B,64,14]` |
 
 > UNet FiLM 的实际条件宽度 = `diffusion_step_embed_dim(256) + global_cond_dim`：
 > 无 Memory = 256+256 = 512，有 Memory = 256+512 = 768（`ConditionalResidualBlock1D.cond_encoder[1].in_features`）。
@@ -225,20 +227,20 @@ predicted velocity                [B,64,14]
 
 ## 5. 数据结构与容器
 
-| 阶段 | 变量 / 容器 | 类型与 shape |
-|---|---|---|
-| 原始图像 | 相机张量 | `uint8 [B,1,V,3,224,224]`（`ZarrDataset._process_image`） |
-| 完整 DINO token | 训练缓存 zarr | `float32 [T_episode, V, 257, 384]`（`frame_backbone.zarr`） |
-| CLS 张量 | token 0 | `float32 [B,V,384]`（单帧）/ `[B,T,V,384]`（历史） |
-| Async Buffer 单元素 | `deque` entry（dict） | `entry["global_feature"] = [B,V,D] = [1,3,384]`；`local_feature=None`（默认不存） |
-| Buffer 窗口 | `get_feature_window()` | `float32 [B,128,V,384] = [1,128,3,384]` |
-| Dataset batch | `dict` | `{"obs": {...}, "action":[B,64,14], "meta":{idx,anchor_t,ep_idx}}` |
-| Policy observation | `obs` dict | 见下 |
-| memory_global | Tensor | `[B,256]` |
-| memory_tokens | Tensor | `[B,1,256]` |
-| noisy action | Tensor | `[B,64,14]` |
-| timestep | Tensor | `[B]`（flow 时间 t∈[0,1]） |
-| Policy output | dict | `{"action_normalized":[B,64,14], "action_pred_normalized":[B,64,14]}` |
+| 阶段                | 变量 / 容器              | 类型与 shape                                                                          |
+| ------------------- | ------------------------ | ------------------------------------------------------------------------------------- |
+| 原始图像            | 相机张量                 | `uint8 [B,1,V,3,224,224]`（`ZarrDataset._process_image`）                         |
+| 完整 DINO token     | 训练缓存 zarr            | `float32 [T_episode, V, 257, 384]`（`frame_backbone.zarr`）                       |
+| CLS 张量            | token 0                  | `float32 [B,V,384]`（单帧）/ `[B,T,V,384]`（历史）                                |
+| Async Buffer 单元素 | `deque` entry（dict）  | `entry["global_feature"] = [B,V,D] = [1,3,384]`；`local_feature=None`（默认不存） |
+| Buffer 窗口         | `get_feature_window()` | `float32 [B,128,V,384] = [1,128,3,384]`                                             |
+| Dataset batch       | `dict`                 | `{"obs": {...}, "action":[B,64,14], "meta":{idx,anchor_t,ep_idx}}`                  |
+| Policy observation  | `obs` dict             | 见下                                                                                  |
+| memory_global       | Tensor                   | `[B,256]`                                                                           |
+| memory_tokens       | Tensor                   | `[B,1,256]`                                                                         |
+| noisy action        | Tensor                   | `[B,64,14]`                                                                         |
+| timestep            | Tensor                   | `[B]`（flow 时间 t∈[0,1]）                                                         |
+| Policy output       | dict                     | `{"action_normalized":[B,64,14], "action_pred_normalized":[B,64,14]}`               |
 
 `obs` dict 关键字段（`ZarrDataset.__getitem__` / `infer/runtime.py`）：
 
@@ -263,40 +265,40 @@ Memory（memory_enabled 时追加）:
 
 ## 6. 训练与推理一致性对照
 
-| 项 | 训练 | 推理 | 一致点 |
-|---|---|---|---|
-| 图像预处理 | resize 224 + ImageNet 归一化 | 同 | `DinoV2SmallEncoder._imagenet_normalize` |
-| DINO 权重 | `vit_small_patch14_dinov2`，冻结 | 同 | `pretrained_weights/dinov2_small.safetensors` |
-| CLS token index | `feat[:, :, 0, :]` | `cls_token_from_output = tokens[:, :1]` | 均取 token 0 |
-| 视角顺序 | `base_0, left_wrist_0, right_wrist_0` | 同 | `CAMERA_BUNDLE_ORDER` |
-| 128×8 offsets | `_build_memory_visual_offsets` → `[-1016,…,0]` | `runtime.memory_visual_offsets` → 同 | 128 个，stride 8 |
-| repeat-first padding | 索引 clamp 到 episode 首帧；`memory_visual_valid` 全 True | `get_feature_window` 首帧左补齐 | 语义一致 |
-| feature dtype | float32 | float32 | — |
-| Memory input shape | `[B,128,3,384]` | `[B,128,3,384]` | runtime 校验 `(t,v,c)` |
-| condition injection | `concat_global_cond` → 512 | 同（`predict_action` 内部同一 `_build_condition`） | 512 |
+| 项                   | 训练                                                        | 推理                                                   | 一致点                                          |
+| -------------------- | ----------------------------------------------------------- | ------------------------------------------------------ | ----------------------------------------------- |
+| 图像预处理           | resize 224 + ImageNet 归一化                                | 同                                                     | `DinoV2SmallEncoder._imagenet_normalize`      |
+| DINO 权重            | `vit_small_patch14_dinov2`，冻结                          | 同                                                     | `pretrained_weights/dinov2_small.safetensors` |
+| CLS token index      | `feat[:, :, 0, :]`                                        | `cls_token_from_output = tokens[:, :1]`              | 均取 token 0                                    |
+| 视角顺序             | `base_0, left_wrist_0, right_wrist_0`                     | 同                                                     | `CAMERA_BUNDLE_ORDER`                         |
+| 128×8 offsets       | `_build_memory_visual_offsets` → `[-1016,…,0]`        | `runtime.memory_visual_offsets` → 同                | 128 个，stride 8                                |
+| repeat-first padding | 索引 clamp 到 episode 首帧；`memory_visual_valid` 全 True | `get_feature_window` 首帧左补齐                      | 语义一致                                        |
+| feature dtype        | float32                                                     | float32                                                | —                                              |
+| Memory input shape   | `[B,128,3,384]`                                           | `[B,128,3,384]`                                      | runtime 校验`(t,v,c)`                         |
+| condition injection  | `concat_global_cond` → 512                               | 同（`predict_action` 内部同一 `_build_condition`） | 512                                             |
 
 ---
 
 ## 7. 代码位置索引
 
-| 数据流环节 | 文件 | 类 / 函数 |
-|---|---|---|
-| DINO token 提取 | `models/fm/encoders/dino_v2.py` | `DinoV2SmallEncoder.forward_tokens` / `extract_backbone_feat` / `cls_token_from_output` |
-| 当前观测视觉融合 | `models/fm/encoders/dino_v2.py` | `DinoV2Encoder.encode_all_from_backbone_feat` / `_fuse_view_feats` |
-| 当前观测条件 | `models/fm/condition_encoder.py` | `ConditionEncoder.forward` / `StateMLP` |
-| Dataset 历史采样 | `datasets/zarr_dataset.py` | `_build_memory_visual_offsets` / `memory_visual_indices` / `get_memory_camera_latent`（CLS 提取） / `__getitem__` |
-| 训练缓存 | `tools/precompute_policy_latents.py` | full-token `frame_backbone.zarr` |
-| Async Buffer | `tools/async_dino_buffer.py` | `AsyncDinoBuffer.submit_frame` / `_run_dino` / `get_global_feature_window` |
-| 视觉 Temporal Memory | `models/fm/memory/fusion.py` | `MemoryEncoder` / `VisualTemporalMemoryEncoder` / `StateConvMemoryEncoder` / `encode_visual_views` |
-| Memory 工厂 | `models/fm/memory/factory.py` | `build_memory_encoder` |
-| condition fusion | `models/fm/flow_policy.py` | `_build_obs_condition` / `_build_memory` / `_build_condition` |
-| UNet Policy | `models/diffusion/conditional_unet1d.py` | `ConditionalUnet1D` / `ConditionalResidualBlock1D`(FiLM) |
-| DiT Policy | `models/fm/action_dit.py` | `ActionDiT` / `DiTBlock`(AdaLN, cross_attn) |
-| 采样 / 预测 | `models/fm/flow_policy.py` | `predict_action` / `conditional_sample` / `_model_forward` |
-| 训练循环 | `trainers/policy_trainer.py` | `build_policy`（`sync_fm_action_horizon_from_data`）/ `main` |
-| 推理运行时 | `infer/runtime.py` | `FMInferenceRuntime._get_async_memory_obs` / `predict_rot6d_abs` |
-| benchmark | `tools/bench_*_latency.py` / `tools/run_latency_calibration.sh` / `tools/test_dino_global_local_memory.py` | 见各文件 |
-| shape 测试 | `tools/test_memory_cond_dim.py` | disabled 256 / enabled 512 |
+| 数据流环节           | 文件                                                                                                             | 类 / 函数                                                                                                                 |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| DINO token 提取      | `models/fm/encoders/dino_v2.py`                                                                                | `DinoV2SmallEncoder.forward_tokens` / `extract_backbone_feat` / `cls_token_from_output`                             |
+| 当前观测视觉融合     | `models/fm/encoders/dino_v2.py`                                                                                | `DinoV2Encoder.encode_all_from_backbone_feat` / `_fuse_view_feats`                                                    |
+| 当前观测条件         | `models/fm/condition_encoder.py`                                                                               | `ConditionEncoder.forward` / `StateMLP`                                                                               |
+| Dataset 历史采样     | `datasets/zarr_dataset.py`                                                                                     | `_build_memory_visual_offsets` / `memory_visual_indices` / `get_memory_camera_latent`（CLS 提取） / `__getitem__` |
+| 训练缓存             | `tools/precompute_policy_latents.py`                                                                           | full-token`frame_backbone.zarr`                                                                                         |
+| Async Buffer         | `tools/async_dino_buffer.py`                                                                                   | `AsyncDinoBuffer.submit_frame` / `_run_dino` / `get_global_feature_window`                                          |
+| 视觉 Temporal Memory | `models/fm/memory/fusion.py`                                                                                   | `MemoryEncoder` / `VisualTemporalMemoryEncoder` / `StateConvMemoryEncoder` / `encode_visual_views`                |
+| Memory 工厂          | `models/fm/memory/factory.py`                                                                                  | `build_memory_encoder`                                                                                                  |
+| condition fusion     | `models/fm/flow_policy.py`                                                                                     | `_build_obs_condition` / `_build_memory` / `_build_condition`                                                       |
+| UNet Policy          | `models/diffusion/conditional_unet1d.py`                                                                       | `ConditionalUnet1D` / `ConditionalResidualBlock1D`(FiLM)                                                              |
+| DiT Policy           | `models/fm/action_dit.py`                                                                                      | `ActionDiT` / `DiTBlock`(AdaLN, cross_attn)                                                                           |
+| 采样 / 预测          | `models/fm/flow_policy.py`                                                                                     | `predict_action` / `conditional_sample` / `_model_forward`                                                          |
+| 训练循环             | `trainers/policy_trainer.py`                                                                                   | `build_policy`（`sync_fm_action_horizon_from_data`）/ `main`                                                        |
+| 推理运行时           | `infer/runtime.py`                                                                                             | `FMInferenceRuntime._get_async_memory_obs` / `predict_rot6d_abs`                                                      |
+| benchmark            | `tools/bench_*_latency.py` / `tools/run_latency_calibration.sh` / `tools/test_dino_global_local_memory.py` | 见各文件                                                                                                                  |
+| shape 测试           | `tools/test_memory_cond_dim.py`                                                                                | disabled 256 / enabled 512                                                                                                |
 
 ---
 
@@ -327,20 +329,3 @@ cd /home/tracy/uncertain_rl/flow_matching   # 或远端 /mnt/workspace/zyj/rl/ly
 - checkpoint：`{output.root_dir}/{run_name}/checkpoints/latest.pt`（每 epoch）+ `epoch_XXXX.pt`。
 - 切换骨干：`models.fm.velocity_model: unet|dit`；切换 Memory 注入：`models.memory.injection: concat_global_cond|cross_attn`。
 - 开启/关闭 Memory：`data.memory.enabled: true|false`。
-
----
-
-## 9. 仍无法从代码单独确认的内容
-
-1. **是否有已训练 checkpoint / 真机验证过 128×8**：本文档所有 shape 由代码路径 + CPU
-   随机权重前向验证；未验证真实收敛效果或真机闭环。
-2. **部署实际执行步数**：`predict_action` 返回 64 步（`n_action_steps=64`），但每次真机执行
-   多少步（chunk 复用/重规划频率）由上层调用方决定，本仓库未固定该策略。
-3. **`num_inference_steps` 部署取值**：训练配置为 32；`predict_action` 允许运行时传参覆盖，
-   实际部署值取决于调用参数。
-4. **`action_horizon` 的两处默认**：`FlowMatchingPolicy.__init__` 默认 32，训练经
-   `sync_fm_action_horizon_from_data` 用 `data.action_horizon=64` 覆盖。若某处直接
-   `from_config`（不经 `build_policy`）而 `models.fm` 未写 `action_horizon`，会退回 32——
-   需按实际调用路径确认。
-5. **DiT `hidden_dim` 等标量**：`dit_hidden_dim=512, dit_depth=14, dit_num_heads=8` 见
-   config，但当前 `velocity_model: unet`，DiT 分支的真机使用情况未验证。
