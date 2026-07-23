@@ -21,7 +21,7 @@ Options:
 Examples:
   ./scripts/train.sh
   ./scripts/train.sh --gpus 0
-  ./scripts/train.sh --gpus 0,1,2,3,4,5,6,7   # 8-GPU DDP via torchrun
+  PYTHON=/path/to/env/bin/python ./scripts/train.sh --gpus 0,1,2,3,4,5,6,7
   ./scripts/train.sh --config configs/train/smoke_mem.yaml
 
 Edit training hyperparameters in the config yaml (data, train, models, output, checkpoint).
@@ -61,13 +61,13 @@ done
 export CUDA_VISIBLE_DEVICES="$GPUS"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
-# Count requested GPUs; >1 launches DDP via torchrun, otherwise single process.
+# Always launch through PYTHON_BIN so DDP workers use the same environment.
 IFS=',' read -ra GPU_ARR <<< "$GPUS"
 NGPU="${#GPU_ARR[@]}"
 
 if [[ "$NGPU" -gt 1 ]]; then
   MASTER_PORT="${MASTER_PORT:-29500}"
-  exec torchrun \
+  exec "$PYTHON_BIN" -m torch.distributed.run \
     --standalone \
     --nnodes=1 \
     --nproc_per_node="$NGPU" \
