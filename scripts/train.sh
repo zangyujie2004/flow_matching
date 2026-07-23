@@ -60,6 +60,9 @@ done
 
 export CUDA_VISIBLE_DEVICES="$GPUS"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+if [[ -z "${HF_HOME:-}" && -e "$ROOT/.hf_cache" ]]; then
+  export HF_HOME="$ROOT/.hf_cache"
+fi
 
 # Always launch through PYTHON_BIN so DDP workers use the same environment.
 IFS=',' read -ra GPU_ARR <<< "$GPUS"

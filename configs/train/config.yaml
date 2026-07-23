@@ -105,6 +105,8 @@ train:
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 4
+  # global_concat leaves the alternative local-pooling branches unused.
+  ddp_find_unused_parameters: true
   epochs: 256
   grad_clip: 1.0
   use_amp: false
