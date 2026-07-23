@@ -135,8 +135,11 @@ python -m tools.bench_memory_latency \
 ```bash
 python -m tools.bench_policy_latency \
     --run-dir /path/to/run_dir \
-    --device cuda:0
+    --device cuda:0 \
+    --num-inference-steps 16
 ```
+
+省略 `--num-inference-steps` 时使用 config/checkpoint 中的 solver steps。
 
 分别报告：
 

@@ -22,13 +22,21 @@ from tools.latency_benchmark_utils import (
 def main() -> None:
     parser = argparse.ArgumentParser()
     add_common_arguments(parser)
+    parser.add_argument("--num-inference-steps", type=int)
     args = parser.parse_args()
+    if args.num_inference_steps is not None and args.num_inference_steps < 1:
+        raise ValueError("--num-inference-steps must be positive")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     runtime, load_seconds, memory_snapshots = load_benchmark_context(args)
     policy = runtime.policy
     device = runtime.device
+    inference_steps = (
+        runtime.num_inference_steps
+        if args.num_inference_steps is None
+        else int(args.num_inference_steps)
+    )
     if not policy.memory_enabled:
         raise RuntimeError("benchmark policy does not enable Memory")
 
@@ -100,7 +108,7 @@ def main() -> None:
     )
     prediction = policy.predict_action(
         obs,
-        num_inference_steps=policy.num_inference_steps,
+        num_inference_steps=inference_steps,
         solver=policy.solver,
     )
     if velocity.shape != sample.shape:
@@ -156,7 +164,7 @@ def main() -> None:
         "solver_total_ms",
         lambda: policy.conditional_sample(
             obs,
-            num_inference_steps=policy.num_inference_steps,
+            num_inference_steps=inference_steps,
             solver=policy.solver,
         ),
         iterations=full_iterations,
@@ -166,7 +174,7 @@ def main() -> None:
         "predict_action_total_ms",
         lambda: policy.predict_action(
             obs,
-            num_inference_steps=policy.num_inference_steps,
+            num_inference_steps=inference_steps,
             solver=policy.solver,
         ),
         iterations=full_iterations,
@@ -201,7 +209,7 @@ def main() -> None:
             "velocity_model": policy.velocity_model,
             "memory_method": policy.memory_method,
             "memory_injection": policy.memory_injection,
-            "number_of_solver_steps": policy.num_inference_steps,
+            "number_of_solver_steps": inference_steps,
             "solver": policy.solver,
             "number_of_action_steps": policy.n_action_steps,
             "action_horizon": policy.action_horizon,
@@ -216,7 +224,7 @@ def main() -> None:
     print(f"velocity_model = {policy.velocity_model}")
     print(f"memory_method = {policy.memory_method}")
     print(f"memory_injection = {policy.memory_injection}")
-    print(f"number_of_solver_steps = {policy.num_inference_steps}")
+    print(f"number_of_solver_steps = {inference_steps}")
     for name, shape in shapes.items():
         print(f"{name}: {tuple(shape)}")
 
