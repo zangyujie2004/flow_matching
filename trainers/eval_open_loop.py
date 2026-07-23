@@ -267,27 +267,22 @@ def evaluate_open_loop(
     solver: str | None = None,
 ) -> Dict[str, float]:
     policy.eval()
-    was_training = bool(getattr(dataset, "training", True))
-    dataset.set_training(False)
-    try:
-        return _evaluate_open_loop_impl(
-            policy,
-            dataset,
-            normalizer,
-            device,
-            epoch=epoch,
-            seed=seed,
-            max_batches=max_batches,
-            batch_size=batch_size,
-            plot_samples=plot_samples,
-            plot_dims=plot_dims,
-            out_dir=out_dir,
-            writer=writer,
-            num_inference_steps=num_inference_steps,
-            solver=solver,
-        )
-    finally:
-        dataset.set_training(was_training)
+    return _evaluate_open_loop_impl(
+        policy,
+        dataset,
+        normalizer,
+        device,
+        epoch=epoch,
+        seed=seed,
+        max_batches=max_batches,
+        batch_size=batch_size,
+        plot_samples=plot_samples,
+        plot_dims=plot_dims,
+        out_dir=out_dir,
+        writer=writer,
+        num_inference_steps=num_inference_steps,
+        solver=solver,
+    )
 
 
 @torch.no_grad()

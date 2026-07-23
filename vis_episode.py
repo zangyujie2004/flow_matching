@@ -79,8 +79,8 @@ def episode_action_bounds(dataset: ZarrDataset, ep_idx: int) -> tuple[int, int] 
 def episode_window_indices(dataset: ZarrDataset, ep_idx: int) -> list[int]:
     return [
         idx
-        for idx, (_anchor_t, _ep_end, window_ep_idx) in enumerate(dataset.windows)
-        if int(window_ep_idx) == int(ep_idx)
+        for idx, (_anchor_t, _ep_end, window_ep_idx, base_mode) in enumerate(dataset.windows)
+        if int(window_ep_idx) == int(ep_idx) and str(base_mode) == "original"
     ]
 
 

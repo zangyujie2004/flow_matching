@@ -1,19 +1,68 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 FRAME_CACHE_BASENAME = "frame_backbone.zarr"
+FRAME_CACHE_BASE_REMOVE_HAND_BASENAME = "frame_backbone_base_remove_hand.zarr"
 LEGACY_CACHE_BASENAME = "policy_latent_cache.zarr"
 LATENT_CACHE_BASENAME = FRAME_CACHE_BASENAME  # preferred write/read name
 DEFAULT_DINOV2_MODEL = "vit_small_patch14_dinov2.lvd142m"
 DINOV2_BASE_MODEL = "vit_base_patch14_dinov2.lvd142m"
-# v3: store full forward_features tokens (T, V, 257, D) instead of CLS-only (T, V, D)
+# v3: full tokens (T,V,257,D) or CLS (T,V,D) via token_mode attr
 FRAME_CACHE_VERSION = 3
 DINOV2_NUM_TOKENS = 257
+TOKEN_MODE_CLS = "cls"
+TOKEN_MODE_ALL = "all"
+TokenMode = Literal["cls", "all"]
 CACHE_SUBDIR_SMALL = "dinov2_s14"
 CACHE_SUBDIR_BASE = "dinov2_b14"
 DEFAULT_CACHE_SUBDIR = os.path.join("latent_cache", CACHE_SUBDIR_SMALL)
+CAMERA_BASE_REMOVE_HAND_KEY = "camera_base_remove_hand"
+
+
+def normalize_token_mode(value: Any, *, default: TokenMode = TOKEN_MODE_ALL) -> TokenMode:
+    if value is None or str(value).strip() == "":
+        return default
+    key = str(value).strip().lower()
+    if key in {"cls", "cls_only", "class", "1"}:
+        return TOKEN_MODE_CLS
+    if key in {"all", "full", "tokens", "257", "patch", "patches"}:
+        return TOKEN_MODE_ALL
+    raise ValueError(f"invalid token_mode={value!r}; expected 'cls' or 'all'")
+
+
+def token_mode_num_tokens(token_mode: TokenMode | str) -> int:
+    mode = normalize_token_mode(token_mode)
+    return 1 if mode == TOKEN_MODE_CLS else int(DINOV2_NUM_TOKENS)
+
+
+def infer_token_mode_from_attrs_and_shape(
+    attrs: Mapping[str, Any],
+    feat_shape: tuple[int, ...],
+) -> TokenMode:
+    """Resolve token_mode from attrs, with shape fallback for older caches."""
+    raw = attrs.get("token_mode")
+    if raw is not None and str(raw).strip() != "":
+        return normalize_token_mode(raw)
+    num = attrs.get("image_num_tokens")
+    if num is not None:
+        try:
+            n = int(num)
+        except (TypeError, ValueError):
+            n = -1
+        if n == 1:
+            return TOKEN_MODE_CLS
+        if n == int(DINOV2_NUM_TOKENS):
+            return TOKEN_MODE_ALL
+    # Shape fallback: (T,V,D) → cls; (T,V,257,D) → all
+    if len(feat_shape) == 3:
+        return TOKEN_MODE_CLS
+    if len(feat_shape) == 4 and int(feat_shape[2]) == int(DINOV2_NUM_TOKENS):
+        return TOKEN_MODE_ALL
+    if len(feat_shape) == 4 and int(feat_shape[2]) == 1:
+        return TOKEN_MODE_CLS
+    raise ValueError(f"cannot infer token_mode from attrs/shape={feat_shape}")
 
 
 def normalize_image_encoder_name(name: str | None) -> str:
@@ -90,6 +139,11 @@ def resolve_frame_backbone_zarr_path(cache_root_dir: str) -> str:
     return os.path.join(str(cache_root_dir), FRAME_CACHE_BASENAME)
 
 
+def resolve_frame_backbone_base_remove_hand_zarr_path(cache_root_dir: str) -> str:
+    """Canonical write path for base_0 remove-hand compact frame cache."""
+    return os.path.join(str(cache_root_dir), FRAME_CACHE_BASE_REMOVE_HAND_BASENAME)
+
+
 def resolve_latent_cache_zarr_path(cache_root_dir: str) -> str:
     """Resolve existing cache for reading; prefer frame_backbone, else legacy."""
     root = str(cache_root_dir)
@@ -163,6 +217,23 @@ def write_latent_cache_identity_attrs(root_group: Any, fm_cfg: Mapping[str, Any]
     return identity
 
 
+def write_token_mode_attrs(root_group: Any, token_mode: TokenMode | str) -> TokenMode:
+    mode = normalize_token_mode(token_mode)
+    root_group.attrs["token_mode"] = mode
+    root_group.attrs["image_num_tokens"] = int(token_mode_num_tokens(mode))
+    return mode
+
+
+def _feat_shape_matches_token_mode(feat_shape: tuple[int, ...], token_mode: TokenMode) -> bool:
+    if token_mode == TOKEN_MODE_CLS:
+        # (T, V, D) or legacy (T, V, 1, D)
+        if len(feat_shape) == 3:
+            return True
+        return len(feat_shape) == 4 and int(feat_shape[2]) == 1
+    # all: (T, V, 257, D)
+    return len(feat_shape) == 4 and int(feat_shape[2]) == int(DINOV2_NUM_TOKENS)
+
+
 def frame_cache_matches(
     cache_path: str,
     *,
@@ -171,6 +242,7 @@ def frame_cache_matches(
     image_size: int,
     camera_views: tuple[str, ...] | list[str],
     total_frames: int,
+    token_mode: TokenMode | str = TOKEN_MODE_ALL,
     color_order: str = "rgb",
 ) -> bool:
     """True if existing frame cache can be reused (scheme A skip)."""
@@ -210,7 +282,74 @@ def frame_cache_matches(
     feat = root["data"]["frame_image_backbone_feat"]
     if int(feat.shape[0]) != int(total_frames):
         return False
-    # v3+: (T, V, 257, D)
-    if len(feat.shape) != 4 or int(feat.shape[2]) != int(DINOV2_NUM_TOKENS):
+    want = normalize_token_mode(token_mode)
+    try:
+        have = infer_token_mode_from_attrs_and_shape(attrs, tuple(int(x) for x in feat.shape))
+    except ValueError:
         return False
-    return True
+    if have != want:
+        return False
+    return _feat_shape_matches_token_mode(tuple(int(x) for x in feat.shape), want)
+
+
+def remove_hand_frame_cache_matches(
+    cache_path: str,
+    *,
+    fm_cfg: Mapping[str, Any],
+    source_zarr_path: str,
+    image_size: int,
+    total_frames: int,
+    token_mode: TokenMode | str = TOKEN_MODE_ALL,
+    color_order: str = "rgb",
+) -> bool:
+    """True if compact base_0 remove-hand frame cache can be reused."""
+    if not os.path.isdir(cache_path):
+        return False
+    try:
+        import zarr
+
+        root = zarr.open_group(cache_path, mode="r")
+    except Exception:
+        return False
+    if "data" not in root or "frame_image_backbone_feat" not in root["data"]:
+        return False
+    attrs = dict(getattr(root, "attrs", {}) or {})
+    try:
+        version = int(attrs.get("cache_version", 0))
+    except (TypeError, ValueError):
+        return False
+    if version < int(FRAME_CACHE_VERSION):
+        return False
+    try:
+        validate_latent_cache_identity(attrs, fm_cfg, cache_path=cache_path)
+    except ValueError:
+        return False
+    if str(attrs.get("source_zarr_path", "")) != str(source_zarr_path):
+        return False
+    if attrs.get("image_size") is None or int(attrs["image_size"]) != int(image_size):
+        return False
+    if attrs.get("color_order") is None or str(attrs["color_order"]).lower() != str(color_order).lower():
+        return False
+    if str(attrs.get("camera_views", "")).strip() != "base_0":
+        return False
+    compact = attrs.get("compact")
+    if compact not in (True, 1, "1", "true", "True"):
+        return False
+    if str(attrs.get("ties_to", "")) != CAMERA_BASE_REMOVE_HAND_KEY:
+        return False
+    brh = attrs.get("base_remove_hand")
+    if brh not in (True, 1, "1", "true", "True", "present"):
+        return False
+    feat = root["data"]["frame_image_backbone_feat"]
+    if int(feat.shape[0]) != int(total_frames):
+        return False
+    if int(feat.shape[1]) != 1:
+        return False
+    want = normalize_token_mode(token_mode)
+    try:
+        have = infer_token_mode_from_attrs_and_shape(attrs, tuple(int(x) for x in feat.shape))
+    except ValueError:
+        return False
+    if have != want:
+        return False
+    return _feat_shape_matches_token_mode(tuple(int(x) for x in feat.shape), want)

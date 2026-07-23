@@ -24,7 +24,6 @@ data:
   image_as_uint8: true
   use_camera_latent: true
   latent_cache_root_dir: /mnt/oss_data/zyj/latent_cache/peel_0722_1139/dinov2_s14
-  camera_augmentation: false
   # keys
   camera_key: camera
   tactile_key: tactile

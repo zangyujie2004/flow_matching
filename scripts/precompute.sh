@@ -22,8 +22,13 @@ Options:
 
 Writes (scheme A, frame-only):
   {data.latent_cache_root_dir}/frame_backbone.zarr
+  {data.latent_cache_root_dir}/frame_backbone_base_remove_hand.zarr  # if dual zarr has remove-hand
 
-Skip rule: existing cache with matching identity + full T frames → skip.
+precompute.token_mode: cls | all
+  cls → (T,V,D) / (T_rh,1,D)
+  all → (T,V,257,D) / (T_rh,1,257,D)
+
+Skip rule: existing cache with matching identity + token_mode + full T → skip.
 Use --force (or precompute.overwrite=true) to recompute.
 
 Independent of data.window_size / stride / n_image_steps / action_horizon / memory.

@@ -7,7 +7,7 @@ output:
   run_name: huanggua_office_mem_unet
 
 data:
-  root_dir: /mnt/workspace/zyj/data/processed/panzi/panzi_0720_1524_suceess
+  root_dir: /mnt/workspace/zyj/data/huanggua_office/huanggua_office_0723_1724
   # window
   window_size: 8
   stride: 1
@@ -19,12 +19,12 @@ data:
   # tatile
   use_tactile: false
   # camera
-  camera_views: ['left_wrist_0', 'right_wrist_0'] # ['base_0', 'left_wrist_0', 'right_wrist_0']
+  mix_base_remove_hand: true
+  camera_views: ['base_0', 'left_wrist_0', 'right_wrist_0']
   image_size: 224
   image_as_uint8: true
   use_camera_latent: true
   latent_cache_root_dir: ${data.root_dir}/latent_cache/{auto}
-  camera_augmentation: false  
   # keys
   camera_key: camera
   tactile_key: tactile
@@ -45,24 +45,24 @@ models:
   fm:
     cond_dim: 256
     # vision — DINOv2 (timm)
-    n_image_views: 2
-    image_encoder_name: dinov2_base
-    dino_model_name: vit_base_patch14_dinov2.lvd142m  # vit_small_patch14_dinov2.lvd142m
+    n_image_views: 3
+    image_encoder_name: dinov2_small
+    dino_model_name: vit_small_patch14_dinov2.lvd142m  # vit_small_patch14_dinov2.lvd142m
     freeze_image_encoder: true
     image_pretrained: true
     image_feat_dim: 256
-    view_pool: local_attn  # global_concat | local_pool | local_attn
+    view_pool: global_concat  # global_concat | local_pool | local_attn
     local_pool_size: 2
     local_attn_heads: 4
     local_attn_dropout: 0.1
-    # tactile CNN
+    # tactile cnn
     use_tactile: false
     tactile_feat_dim: 256
     tactile_temporal_pool: conv1d   # mean | conv1d
     state_feat_dim: 256
     state_pool: flatten           
     diffusion_step_embed_dim: 256
-    velocity_model: unet  # unet | dit
+    velocity_model: dit  # unet | dit
     # unet config
     down_dims: [256, 512, 1024]
     kernel_size: 5
@@ -94,7 +94,7 @@ models:
     state_mem_dim: 64
 
 train:
-  batch_size: 1024
+  batch_size: 2048
   num_workers: 32
   drop_last: true
   pin_memory: true
@@ -121,7 +121,8 @@ precompute:
   batch_size: 1024
   device: cuda
   overwrite: false
-  output_path: null  
+  output_path: null
+  token_mode: cls  # cls | all
 
 deploy:
   action_process: abs_qpos # abs_qpos

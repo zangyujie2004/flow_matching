@@ -30,9 +30,7 @@ def get_autocast_context(device: torch.device, use_amp: bool):
 
 
 def build_dataset_and_loader(cfg: dict) -> tuple[ZarrDataset, DataLoader]:
-    from datasets.zarr_dataset import resolve_camera_data_config
-
-    data_cfg = resolve_camera_data_config(cfg["data"])
+    data_cfg = dict(cfg["data"])
     fm_cfg = dict(cfg.get("models", {}).get("fm", {}))
     data_cfg = dict(data_cfg)
     if bool(data_cfg.get("use_camera_latent", False)):
@@ -45,7 +43,14 @@ def build_dataset_and_loader(cfg: dict) -> tuple[ZarrDataset, DataLoader]:
         )
     train_cfg = cfg["train"]
     dataset = ZarrDataset.from_config(data_cfg)
-    dataset.set_training(True)
+    if bool(data_cfg.get("use_camera_latent", False)):
+        token_mode = getattr(dataset, "latent_token_mode", None)
+        view_pool = str(fm_cfg.get("view_pool", "global_concat")).strip().lower()
+        if token_mode == "cls" and view_pool in {"local_pool", "local_attn"}:
+            raise ValueError(
+                f"latent cache token_mode=cls is incompatible with models.fm.view_pool={view_pool!r}. "
+                "Use precompute.token_mode=all, or set view_pool=global_concat."
+            )
     loader = build_dataloader(
         dataset,
         batch_size=int(train_cfg.get("batch_size", 32)),
