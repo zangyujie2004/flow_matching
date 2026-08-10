@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-import yaml
 import zarr
 from torch.utils.data import DataLoader, Dataset
 
@@ -16,7 +15,12 @@ if _POLICY_ROOT not in sys.path:
     sys.path.insert(0, _POLICY_ROOT)
 
 from tools.latent_cache import (
+    CACHE_MODE_CLS_LOCAL_NPY,
+    LOCAL_FEATURE_INDEX_KEY,
+    LOCAL_FEATURE_NUM_TOKENS,
+    LOCAL_FEATURE_STORAGE,
     infer_token_mode_from_attrs_and_shape,
+    local_feature_file_path,
     resolve_frame_backbone_base_remove_hand_zarr_path,
     resolve_latent_cache_zarr_path,
     validate_latent_cache_identity,
@@ -110,6 +114,7 @@ class ZarrDataset(Dataset):
         image_size: int = 224,
         image_as_uint8: bool = True,
         use_camera_latent: bool = False,
+        use_local_camera_latent: bool = False,
         latent_cache_root_dir: str | None = None,
         latent_cache_image_encoder_name: str | None = None,
         latent_cache_image_model_name: str | None = None,
@@ -119,6 +124,8 @@ class ZarrDataset(Dataset):
         state_key: str = "state_30hz",
         action_key: str = "action_30hz",
         camera_views: Sequence[str] | None = None,
+        episode_indices: Sequence[int] | None = None,
+        episode_range: Sequence[int] | None = None,
         mix_base_remove_hand: bool = False,
         memory: Mapping[str, Any] | None = None,
         norm_output_range: Tuple[float, float] = (-1.0, 1.0),
@@ -143,16 +150,42 @@ class ZarrDataset(Dataset):
         self.tactile_dim = TACTILE_FEATURE_DIM
         self.image_as_uint8 = bool(image_as_uint8)
         self.use_camera_latent = bool(use_camera_latent)
+        self.use_local_camera_latent = bool(use_local_camera_latent)
+        if self.use_local_camera_latent and not self.use_camera_latent:
+            raise ValueError(
+                "use_local_camera_latent=true requires use_camera_latent=true"
+            )
         self.mix_base_remove_hand_requested = bool(mix_base_remove_hand)
         self.mix_base_remove_hand = False
         self.ep_has_rh: np.ndarray | None = None
         self.ep_to_compact: np.ndarray | None = None
         self.episode_ends_remove_hand: np.ndarray | None = None
         self.cached_frame_image_backbone_feat_remove_hand: np.ndarray | None = None
+        self.cached_local_feature_index: np.ndarray | None = None
+        self.cached_local_feature_index_remove_hand: np.ndarray | None = None
+        self.local_feature_root: str | None = None
+        self.local_feature_root_remove_hand: str | None = None
+        self.local_feature_frames_per_directory: int | None = None
+        self.local_feature_frames_per_directory_remove_hand: int | None = None
+        self.local_feature_shape: tuple[int, int, int] | None = None
+        self.local_feature_shape_remove_hand: tuple[int, int, int] | None = None
+        self._local_feature_view_indices: tuple[int, ...] | None = None
         self.latent_cache_root_dir = latent_cache_root_dir
         self.latent_cache_image_encoder_name = latent_cache_image_encoder_name
         self.latent_cache_image_model_name = latent_cache_image_model_name
         self.fit_normalizer = bool(fit_normalizer)
+        if episode_indices is not None and episode_range is not None:
+            raise ValueError("Set only one of episode_indices or episode_range")
+        if episode_range is not None:
+            if len(episode_range) != 2:
+                raise ValueError("episode_range must be [start, stop]")
+            episode_start, episode_stop = (int(value) for value in episode_range)
+            if episode_start < 0 or episode_stop <= episode_start:
+                raise ValueError("episode_range must satisfy 0 <= start < stop")
+            episode_indices = range(episode_start, episode_stop)
+        self.requested_episode_indices = (
+            None if episode_indices is None else tuple(int(value) for value in episode_indices)
+        )
 
         memory_cfg = dict(memory or {})
         self.memory_enabled = bool(memory_cfg.get("enabled", False))
@@ -211,6 +244,25 @@ class ZarrDataset(Dataset):
         self._preload_to_ram()
 
         self.windows = self._build_windows()
+        if self.requested_episode_indices is not None:
+            if not self.requested_episode_indices:
+                raise ValueError("episode_indices must be non-empty when provided")
+            if len(set(self.requested_episode_indices)) != len(self.requested_episode_indices):
+                raise ValueError("episode_indices must not contain duplicates")
+            if min(self.requested_episode_indices) < 0 or max(self.requested_episode_indices) >= self.num_episodes:
+                raise ValueError(
+                    f"episode_indices must be in [0, {self.num_episodes}), "
+                    f"got [{min(self.requested_episode_indices)}, "
+                    f"{max(self.requested_episode_indices)}]"
+                )
+            episode_set = set(self.requested_episode_indices)
+            self.windows = [
+                window for window in self.windows if int(window[2]) in episode_set
+            ]
+            print(
+                f"[ZarrDataset] selected episodes={len(episode_set)}, "
+                f"windows={len(self.windows)}"
+            )
         if self.max_windows is not None:
             cap = max(1, int(self.max_windows))
             if len(self.windows) > cap:
@@ -483,6 +535,90 @@ class ZarrDataset(Dataset):
             cache_path=cache_path,
         )
 
+    @staticmethod
+    def _open_local_feature_metadata(
+        *,
+        cache_path: str,
+        cache_root: Any,
+        total_frames: int,
+    ) -> tuple[np.ndarray, str, int, tuple[int, int, int]]:
+        attrs = dict(getattr(cache_root, "attrs", {}) or {})
+        if str(attrs.get("cache_mode", "")).strip() != CACHE_MODE_CLS_LOCAL_NPY:
+            raise ValueError(
+                "use_local_camera_latent=true requires a cache built with "
+                "precompute.token_mode=cls_local_npy; "
+                f"got cache_mode={attrs.get('cache_mode')!r} at {cache_path}"
+            )
+        if str(attrs.get("local_feature_storage", "")).strip() != LOCAL_FEATURE_STORAGE:
+            raise ValueError(f"Unsupported local feature storage at {cache_path}")
+        if attrs.get("local_feature_complete") not in (True, 1, "1", "true", "True"):
+            raise RuntimeError(f"Local feature cache is incomplete at {cache_path}")
+        data = cache_root["data"]
+        if LOCAL_FEATURE_INDEX_KEY not in data:
+            raise KeyError(
+                f"Missing data/{LOCAL_FEATURE_INDEX_KEY} in local feature cache {cache_path}"
+            )
+        index = np.asarray(data[LOCAL_FEATURE_INDEX_KEY][:], dtype=np.int64)
+        if index.shape != (int(total_frames),):
+            raise ValueError(
+                f"local feature index shape {index.shape} != ({int(total_frames)},)"
+            )
+        if bool((index < 0).any()):
+            missing = int(np.flatnonzero(index < 0)[0])
+            raise RuntimeError(f"local feature index is missing frame {missing} at {cache_path}")
+
+        directory_name = str(attrs.get("local_feature_dir", "")).strip()
+        if not directory_name or os.path.isabs(directory_name):
+            raise ValueError(
+                f"local_feature_dir must be a relative sibling name, got {directory_name!r}"
+            )
+        local_root = os.path.join(os.path.dirname(cache_path), directory_name)
+        if not os.path.isdir(local_root):
+            raise FileNotFoundError(f"Local feature directory not found: {local_root}")
+        frames_per_directory = int(attrs.get("local_feature_frames_per_directory", 0))
+        if frames_per_directory < 1:
+            raise ValueError("local_feature_frames_per_directory must be positive")
+        raw_shape = attrs.get("local_feature_shape")
+        if not isinstance(raw_shape, (list, tuple)) or len(raw_shape) != 3:
+            raise ValueError(f"Invalid local_feature_shape={raw_shape!r} at {cache_path}")
+        shape = tuple(int(value) for value in raw_shape)
+        if shape[1] != LOCAL_FEATURE_NUM_TOKENS:
+            raise ValueError(
+                f"Expected {LOCAL_FEATURE_NUM_TOKENS} local tokens, got shape={shape}"
+            )
+        return index, local_root, frames_per_directory, shape
+
+    @staticmethod
+    def _load_local_feature_rows(
+        indices: np.ndarray,
+        *,
+        feature_index: np.ndarray,
+        local_root: str,
+        frames_per_directory: int,
+        expected_shape: tuple[int, int, int],
+        view_indices: tuple[int, ...],
+    ) -> np.ndarray:
+        rows: list[np.ndarray] = []
+        for frame_idx in np.asarray(indices, dtype=np.int64).reshape(-1):
+            feature_id = int(feature_index[int(frame_idx)])
+            path = local_feature_file_path(
+                local_root,
+                feature_id,
+                frames_per_directory=frames_per_directory,
+            )
+            try:
+                feature = np.load(path, allow_pickle=False)
+            except FileNotFoundError as exc:
+                raise FileNotFoundError(
+                    f"Missing local feature for frame={int(frame_idx)}, id={feature_id}: {path}"
+                ) from exc
+            if tuple(int(x) for x in feature.shape) != expected_shape:
+                raise ValueError(
+                    f"Local feature shape {tuple(feature.shape)} != {expected_shape}: {path}"
+                )
+            rows.append(np.asarray(feature[list(view_indices)], dtype=np.float32))
+        return np.ascontiguousarray(np.stack(rows, axis=0))
+
     def _maybe_open_latent_cache(self) -> None:
         cache_path = self._resolve_latent_cache_path(require_exists=True)
         self.latent_cache_zarr = zarr.open_group(cache_path, mode="r")
@@ -540,7 +676,6 @@ class ZarrDataset(Dataset):
             raise ValueError(
                 f"Latent cache at {cache_path} has unsupported shape {tuple(frame.shape)}: {exc}"
             ) from exc
-        self.latent_token_mode = token_mode
         if token_mode == "cls":
             # Prefer canonical (T, V, D); squeeze legacy (T, V, 1, D).
             if frame.ndim == 4 and int(frame.shape[2]) == 1:
@@ -556,6 +691,31 @@ class ZarrDataset(Dataset):
                     f"at {cache_path}"
                 )
         view_idx = [int(i) for i in latent_view_indices]
+        if self.use_local_camera_latent:
+            if token_mode != "cls":
+                raise ValueError(
+                    "use_local_camera_latent expects a CLS zarr plus sibling npy files; "
+                    f"got stored token_mode={token_mode!r}"
+                )
+            (
+                self.cached_local_feature_index,
+                self.local_feature_root,
+                self.local_feature_frames_per_directory,
+                self.local_feature_shape,
+            ) = self._open_local_feature_metadata(
+                cache_path=cache_path,
+                cache_root=self.latent_cache_zarr,
+                total_frames=frame_count,
+            )
+            if self.local_feature_shape[0] != len(cache_view_list):
+                raise ValueError(
+                    "local feature view count does not match cache camera_views: "
+                    f"shape={self.local_feature_shape}, views={list(cache_view_list)}"
+                )
+            self._local_feature_view_indices = tuple(view_idx)
+            self.latent_token_mode = CACHE_MODE_CLS_LOCAL_NPY
+        else:
+            self.latent_token_mode = token_mode
         if view_idx != list(range(int(frame.shape[1]))):
             frame = np.ascontiguousarray(frame[:, view_idx])
         self._frame_latent_view_indices = tuple(range(int(frame.shape[1])))
@@ -564,7 +724,7 @@ class ZarrDataset(Dataset):
         frame_gb = frame.nbytes / (1024**3)
         print(
             f"[ZarrDataset] frame latent cache loaded: {cache_path}, "
-            f"shape={tuple(frame.shape)}, token_mode={token_mode}, "
+            f"shape={tuple(frame.shape)}, token_mode={self.latent_token_mode}, "
             f"using_views={self.n_image_views}, "
             f"backbone_dim={self.image_backbone_dim}, size={frame_gb:.3f} GB"
         )
@@ -622,10 +782,33 @@ class ZarrDataset(Dataset):
                 f"Remove-hand latent cache unsupported shape {tuple(frame.shape)}: {exc}"
             ) from exc
 
-        if self.latent_token_mode is not None and token_mode != self.latent_token_mode:
+        effective_token_mode = token_mode
+        if self.latent_token_mode == CACHE_MODE_CLS_LOCAL_NPY:
+            if token_mode != "cls":
+                raise ValueError(
+                    "remove-hand cls_local_npy cache must keep CLS in its zarr array"
+                )
+            (
+                self.cached_local_feature_index_remove_hand,
+                self.local_feature_root_remove_hand,
+                self.local_feature_frames_per_directory_remove_hand,
+                self.local_feature_shape_remove_hand,
+            ) = self._open_local_feature_metadata(
+                cache_path=cache_path,
+                cache_root=rh_root,
+                total_frames=expect_t,
+            )
+            if self.local_feature_shape_remove_hand[0] != 1:
+                raise ValueError(
+                    "remove-hand local feature files must contain one base_0 view, "
+                    f"got shape={self.local_feature_shape_remove_hand}"
+                )
+            effective_token_mode = CACHE_MODE_CLS_LOCAL_NPY
+
+        if self.latent_token_mode is not None and effective_token_mode != self.latent_token_mode:
             raise ValueError(
                 "remove-hand latent token_mode mismatch with main cache: "
-                f"rh={token_mode!r}, main={self.latent_token_mode!r}. Rebuild both with same "
+                f"rh={effective_token_mode!r}, main={self.latent_token_mode!r}. Rebuild both with same "
                 "precompute.token_mode."
             )
 
@@ -650,24 +833,121 @@ class ZarrDataset(Dataset):
         frame_gb = frame.nbytes / (1024**3)
         print(
             f"[ZarrDataset] remove-hand latent cache loaded: {cache_path}, "
-            f"shape={tuple(frame.shape)}, token_mode={token_mode}, size={frame_gb:.3f} GB"
+            f"shape={tuple(frame.shape)}, token_mode={effective_token_mode}, size={frame_gb:.3f} GB"
         )
 
-    def _gather_frame_latent(self, indices) -> np.ndarray:
+    def _gather_frame_latent(
+        self,
+        indices,
+        *,
+        include_cls: bool = True,
+    ) -> np.ndarray:
         if self.cached_frame_image_backbone_feat is None:
             raise RuntimeError(
                 "frame camera latent cache is not loaded; run ./scripts/precompute.sh"
             )
         idx = np.asarray(indices, dtype=np.int64)
-        return self.cached_frame_image_backbone_feat[idx]
+        cls_or_tokens = self.cached_frame_image_backbone_feat[idx]
+        if self.latent_token_mode != CACHE_MODE_CLS_LOCAL_NPY:
+            return cls_or_tokens
+        if (
+            self.cached_local_feature_index is None
+            or self.local_feature_root is None
+            or self.local_feature_frames_per_directory is None
+            or self.local_feature_shape is None
+            or self._local_feature_view_indices is None
+        ):
+            raise RuntimeError("local feature cache metadata is not initialized")
+        local = self._load_local_feature_rows(
+            idx,
+            feature_index=self.cached_local_feature_index,
+            local_root=self.local_feature_root,
+            frames_per_directory=self.local_feature_frames_per_directory,
+            expected_shape=self.local_feature_shape,
+            view_indices=self._local_feature_view_indices,
+        )
+        if not include_cls:
+            return local
+        cls = np.asarray(cls_or_tokens, dtype=np.float32)
+        return np.concatenate((cls[:, :, None, :], local), axis=2)
 
-    def _gather_remove_hand_frame_latent(self, compact_indices: np.ndarray) -> np.ndarray:
+    def _gather_remove_hand_frame_latent(
+        self,
+        compact_indices: np.ndarray,
+        *,
+        include_cls: bool = True,
+    ) -> np.ndarray:
         if self.cached_frame_image_backbone_feat_remove_hand is None:
             raise RuntimeError(
                 "remove-hand frame latent cache is not loaded; run ./scripts/precompute.sh"
             )
         idx = np.asarray(compact_indices, dtype=np.int64)
-        return self.cached_frame_image_backbone_feat_remove_hand[idx]
+        cls_or_tokens = self.cached_frame_image_backbone_feat_remove_hand[idx]
+        if self.latent_token_mode != CACHE_MODE_CLS_LOCAL_NPY:
+            return cls_or_tokens
+        if (
+            self.cached_local_feature_index_remove_hand is None
+            or self.local_feature_root_remove_hand is None
+            or self.local_feature_frames_per_directory_remove_hand is None
+            or self.local_feature_shape_remove_hand is None
+        ):
+            raise RuntimeError("remove-hand local feature cache metadata is not initialized")
+        local = self._load_local_feature_rows(
+            idx,
+            feature_index=self.cached_local_feature_index_remove_hand,
+            local_root=self.local_feature_root_remove_hand,
+            frames_per_directory=self.local_feature_frames_per_directory_remove_hand,
+            expected_shape=self.local_feature_shape_remove_hand,
+            view_indices=(0,),
+        )
+        if not include_cls:
+            return local
+        cls = np.asarray(cls_or_tokens, dtype=np.float32)
+        if cls.ndim == 2:
+            cls = cls[:, None, :]
+        return np.concatenate((cls[:, :, None, :], local), axis=2)
+
+    def _replace_base_latent(
+        self,
+        feat: np.ndarray,
+        main_indices: np.ndarray,
+        ep_idx: int,
+    ) -> np.ndarray:
+        """Replace base_0 features with the compact remove-hand cache."""
+        if "base_0" not in self.camera_views:
+            raise RuntimeError("remove latent requires base_0 in camera_views")
+        indices = np.asarray(main_indices, dtype=np.int64)
+        if indices.size == 0:
+            return feat
+        compact = np.asarray(
+            [self.main_t_to_compact_t(int(t), int(ep_idx)) for t in indices],
+            dtype=np.int64,
+        )
+        include_cls = not (
+            self.latent_token_mode == CACHE_MODE_CLS_LOCAL_NPY
+            and feat.ndim == 4
+            and int(feat.shape[2]) == LOCAL_FEATURE_NUM_TOKENS
+        )
+        rh = self._gather_remove_hand_frame_latent(
+            compact,
+            include_cls=include_cls,
+        )
+        out = np.array(feat, copy=True)
+        base_view_i = int(self.camera_views.index("base_0"))
+        if self.latent_token_mode == "cls":
+            if rh.ndim == 3 and int(rh.shape[1]) == 1:
+                rh = rh[:, 0]
+            if rh.ndim != 2 or rh.shape[0] != out.shape[0] or rh.shape[-1] != out.shape[-1]:
+                raise ValueError(f"RH CLS shape {rh.shape} incompatible with main {out.shape}")
+            out[:, base_view_i, :] = rh
+            return out
+
+        if rh.ndim == 4 and int(rh.shape[1]) == 1:
+            rh = rh[:, 0]
+        if rh.ndim != 3 or rh.shape[0] != out.shape[0] or rh.shape[1:] != out.shape[2:]:
+            raise ValueError(f"RH token shape {rh.shape} incompatible with main {out.shape}")
+        out[:, base_view_i, :, :] = rh
+        return out
 
     def get_camera_latent(self, idx: int) -> np.ndarray:
         _anchor_t, _ep_end, ep_idx, base_mode = self._window_fields(idx)
@@ -685,38 +965,24 @@ class ZarrDataset(Dataset):
             )
 
         if base_mode == BASE_MODE_REMOVE:
-            if "base_0" not in self.camera_views:
-                raise RuntimeError("remove latent requires base_0 in camera_views")
-            base_view_i = int(self.camera_views.index("base_0"))
-            compact = self._compact_indices_for_range(i0, i1, ep_idx)
-            rh = self._gather_remove_hand_frame_latent(compact)
-            feat = np.array(feat, copy=True)
-            if self.latent_token_mode == "cls":
-                # main (T,V,D); rh (T,D)
-                if rh.ndim != 2:
-                    raise ValueError(f"expected RH CLS (T,D), got {rh.shape}")
-                if rh.shape[0] != feat.shape[0] or rh.shape[-1] != feat.shape[-1]:
-                    raise ValueError(
-                        f"RH CLS shape {rh.shape} incompatible with main {feat.shape}"
-                    )
-                feat[:, base_view_i, :] = rh
-            else:
-                # main (T,V,N,D); rh (T,1,N,D) or (T,N,D)
-                if rh.ndim == 4 and int(rh.shape[1]) == 1:
-                    rh = rh[:, 0]
-                if rh.ndim != 3:
-                    raise ValueError(f"expected RH all-tokens (T,N,D), got {rh.shape}")
-                if rh.shape[0] != feat.shape[0] or rh.shape[1:] != feat.shape[2:]:
-                    raise ValueError(
-                        f"RH all-token shape {rh.shape} incompatible with main {feat.shape}"
-                    )
-                feat[:, base_view_i, :, :] = rh
+            feat = self._replace_base_latent(
+                feat,
+                np.arange(i0, i1, dtype=np.int64),
+                ep_idx,
+            )
 
         return feat
 
-    def get_memory_camera_latent(self, anchor_t: int, ep_idx: int) -> np.ndarray:
+    def get_memory_camera_latent(
+        self,
+        anchor_t: int,
+        ep_idx: int,
+        *,
+        base_mode: str = BASE_MODE_ORIGINAL,
+        include_cls: bool = True,
+    ) -> np.ndarray:
         indices = self.memory_visual_indices(anchor_t, ep_idx)
-        feat = self._gather_frame_latent(indices)
+        feat = self._gather_frame_latent(indices, include_cls=include_cls)
         if feat.shape[0] != len(self.memory_visual_offsets):
             raise ValueError(
                 f"memory camera latent time mismatch: {feat.shape[0]} != {len(self.memory_visual_offsets)}"
@@ -725,6 +991,10 @@ class ZarrDataset(Dataset):
             raise ValueError(
                 f"memory camera latent view mismatch: {feat.shape[1]} != {self.n_image_views}"
             )
+        if str(base_mode) == BASE_MODE_REMOVE:
+            feat = self._replace_base_latent(feat, indices, ep_idx)
+        elif str(base_mode) != BASE_MODE_ORIGINAL:
+            raise ValueError(f"unknown base_mode={base_mode!r}")
         return feat
 
     def _precompute_normalized_actions(self) -> None:
@@ -1100,4 +1370,3 @@ def build_dataloader(
         )
         kwargs["prefetch_factor"] = prefetch_factor
     return DataLoader(dataset, **kwargs)
-

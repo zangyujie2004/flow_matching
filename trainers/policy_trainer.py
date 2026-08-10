@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import os
 from collections import defaultdict
 from contextlib import nullcontext
-from copy import deepcopy
+from copy import copy, deepcopy
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 import torch
 import yaml
@@ -29,10 +28,7 @@ def get_autocast_context(device: torch.device, use_amp: bool):
     return torch.autocast(device_type="cuda", dtype=torch.float16)
 
 
-def build_dataset_and_loader(cfg: dict) -> tuple[ZarrDataset, DataLoader]:
-    data_cfg = dict(cfg["data"])
-    fm_cfg = dict(cfg.get("models", {}).get("fm", {}))
-    data_cfg = dict(data_cfg)
+def _inject_latent_identity(data_cfg: dict, fm_cfg: Mapping[str, Any]) -> None:
     if bool(data_cfg.get("use_camera_latent", False)):
         from models.fm.encoders.dino_v2 import resolve_dino_model_name
 
@@ -41,6 +37,28 @@ def build_dataset_and_loader(cfg: dict) -> tuple[ZarrDataset, DataLoader]:
             fm_cfg.get("image_encoder_name"),
             fm_cfg.get("dino_model_name"),
         )
+
+
+def _expand_episode_groups(value: Any) -> dict[str, tuple[int, ...]]:
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError("eval_data.episode_groups must be a non-empty mapping")
+    groups: dict[str, tuple[int, ...]] = {}
+    for name, bounds in value.items():
+        if isinstance(bounds, (str, bytes)) or not isinstance(bounds, Sequence) or len(bounds) != 2:
+            raise TypeError(f"eval_data.episode_groups.{name} must be [start, stop]")
+        start, stop = (int(item) for item in bounds)
+        if start < 0 or stop <= start:
+            raise ValueError(
+                f"eval_data.episode_groups.{name} must satisfy 0 <= start < stop"
+            )
+        groups[str(name)] = tuple(range(start, stop))
+    return groups
+
+
+def build_dataset_and_loader(cfg: dict) -> tuple[ZarrDataset, DataLoader]:
+    data_cfg = dict(cfg["data"])
+    fm_cfg = dict(cfg.get("models", {}).get("fm", {}))
+    _inject_latent_identity(data_cfg, fm_cfg)
     train_cfg = cfg["train"]
     dataset = ZarrDataset.from_config(data_cfg)
     if bool(data_cfg.get("use_camera_latent", False)):
@@ -62,6 +80,55 @@ def build_dataset_and_loader(cfg: dict) -> tuple[ZarrDataset, DataLoader]:
         prefetch_factor=int(train_cfg.get("prefetch_factor", 2)),
     )
     return dataset, loader
+
+
+def build_eval_datasets(
+    cfg: dict,
+    train_dataset: ZarrDataset,
+) -> dict[str, ZarrDataset]:
+    """Build named external test groups using only the train normalizer."""
+    eval_overlay = dict(cfg.get("eval_data") or {})
+    if not eval_overlay:
+        return {}
+    groups = _expand_episode_groups(eval_overlay.pop("episode_groups", None))
+    base_cfg = dict(cfg["data"])
+    base_cfg.pop("episode_range", None)
+    base_cfg.pop("episode_indices", None)
+    base_cfg.update(eval_overlay)
+    base_cfg["fit_normalizer"] = False
+    fm_cfg = dict(cfg.get("models", {}).get("fm", {}))
+    _inject_latent_identity(base_cfg, fm_cfg)
+
+    datasets: dict[str, ZarrDataset] = {}
+    for name, episode_indices in groups.items():
+        if (
+            str(base_cfg["root_dir"]) == str(train_dataset.root_dir)
+            and str(base_cfg.get("latent_cache_root_dir"))
+            == str(train_dataset.latent_cache_root_dir)
+        ):
+            # Same Zarr/cache: share RAM arrays and cache handles, but keep an
+            # independent window table and normalized-action cache per group.
+            dataset = copy(train_dataset)
+            dataset.requested_episode_indices = episode_indices
+            episode_set = set(episode_indices)
+            dataset.windows = [
+                window
+                for window in dataset._build_windows()
+                if int(window[2]) in episode_set
+            ]
+            dataset.window_lookup = {
+                (int(anchor_t), int(ep_idx)): idx
+                for idx, (anchor_t, _ep_end, ep_idx, base_mode) in enumerate(dataset.windows)
+                if base_mode == "original"
+            }
+        else:
+            group_cfg = dict(base_cfg)
+            group_cfg["episode_indices"] = episode_indices
+            dataset = ZarrDataset.from_config(group_cfg)
+        dataset.normalizer = train_dataset.normalizer
+        dataset._precompute_normalized_actions()
+        datasets[name] = dataset
+    return datasets
 
 
 def build_policy(cfg: dict, device: torch.device, dataset: ZarrDataset) -> FlowMatchingPolicy:
@@ -202,6 +269,12 @@ def main(cfg: dict) -> None:
 
     dataset, train_loader = build_dataset_and_loader(cfg)
     print(f"Train windows: {len(dataset)}")
+    eval_datasets = build_eval_datasets(cfg, dataset)
+    for name, eval_dataset in eval_datasets.items():
+        print(
+            f"Eval {name}: episodes={len(eval_dataset.requested_episode_indices or ())}, "
+            f"windows={len(eval_dataset)}, root={eval_dataset.root_dir}"
+        )
 
     # Persist data→fm action horizon into resolved_config for deploy/infer.
     cfg = dict(cfg)
@@ -260,6 +333,9 @@ def main(cfg: dict) -> None:
     resume_path = train_cfg.get("resume_path")
     if resume_path:
         resume_state = load_checkpoint(resume_path, policy, optimizer, dataset)
+        for eval_dataset in eval_datasets.values():
+            eval_dataset.normalizer = dataset.normalizer
+            eval_dataset._precompute_normalized_actions()
         global_step = int(resume_state.get("global_step", 0))
         start_epoch = int(resume_state.get("epoch", 0)) + 1
         policy.to(device)
@@ -280,24 +356,33 @@ def main(cfg: dict) -> None:
         )
         train_loss = train_avg["loss"]
 
-        open_loop_metrics = None
+        open_loop_metrics: dict[str, dict[str, float]] = {}
         if open_loop_every > 0 and (epoch % open_loop_every == 0 or epoch == epochs):
-            open_loop_metrics = evaluate_open_loop(
-                policy,
-                dataset,
-                dataset.normalizer,
-                device,
-                epoch=epoch,
-                seed=int(cfg.get("seed", 42)),
-                max_batches=open_loop_max_batches,
-                batch_size=int(train_cfg.get("batch_size", 32)),
-                plot_samples=plot_samples,
-                plot_dims=plot_dims,
-                out_dir=run_dir / "open_loop",
-                writer=writer,
-                num_inference_steps=num_inference_steps,
-                solver=solver,
-            )
+            targets = eval_datasets or {"train": dataset}
+            for name, eval_dataset in targets.items():
+                metrics = evaluate_open_loop(
+                    policy,
+                    eval_dataset,
+                    dataset.normalizer,
+                    device,
+                    epoch=epoch,
+                    seed=int(cfg.get("seed", 42)),
+                    max_batches=open_loop_max_batches,
+                    batch_size=int(train_cfg.get("batch_size", 32)),
+                    plot_samples=plot_samples,
+                    plot_dims=plot_dims,
+                    out_dir=run_dir / "open_loop" / name,
+                    writer=None,
+                    num_inference_steps=num_inference_steps,
+                    solver=solver,
+                )
+                open_loop_metrics[name] = metrics
+                writer.add_scalar(
+                    f"OpenLoop/{name}/action_mse", metrics["action_mse"], epoch
+                )
+                writer.add_scalar(
+                    f"OpenLoop/{name}/action_l1", metrics["action_l1"], epoch
+                )
 
         curr_lr = optimizer.param_groups[0]["lr"]
         writer.add_scalar("Epoch/lr", curr_lr, epoch)
@@ -307,10 +392,10 @@ def main(cfg: dict) -> None:
                 writer.add_scalar(f"Epoch/train_{key}", value, epoch)
 
         message = f"[Epoch {epoch:03d}] train_loss={train_loss:.6f}"
-        if open_loop_metrics is not None:
+        for name, metrics in open_loop_metrics.items():
             message += (
-                f", open_loop_l1={open_loop_metrics['action_l1']:.6f}"
-                f", open_loop_mse={open_loop_metrics['action_mse']:.6f}"
+                f", {name}_l1={metrics['action_l1']:.6f}"
+                f", {name}_mse={metrics['action_mse']:.6f}"
             )
         print(message)
 

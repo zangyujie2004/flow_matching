@@ -4,10 +4,11 @@ runtime:
 
 output:
   root_dir: outputs/huanggua_office
-  run_name: huanggua_office_mem_unet
+  run_name: huanggua_0807_ep0_265_train
 
 data:
-  root_dir: /mnt/workspace/zyj/data/huanggua_office/huanggua_office_0723_1724
+  root_dir: /mnt/workspace/lyc/data/huanggua_office/huanggua_office_0807_2110
+  episode_range: [0, 266]  # train episodes [0, 266)
   # window
   window_size: 8
   stride: 1
@@ -15,7 +16,7 @@ data:
   action_horizon: 64
   # robot
   action_type: joint
-  action_representation: relative
+  action_representation: absolute
   # tatile
   use_tactile: false
   # camera
@@ -24,6 +25,9 @@ data:
   image_size: 224
   image_as_uint8: true
   use_camera_latent: true
+  # Set true when view_pool uses patch tokens from a cls_local_npy cache.
+  # global_concat only needs the RAM-resident CLS cache.
+  use_local_camera_latent: false
   latent_cache_root_dir: ${data.root_dir}/latent_cache/{auto}
   # keys
   camera_key: camera
@@ -41,13 +45,21 @@ data:
     sample_stride: 4
     recent_frame: 4   # n=t-n
 
+# Held-out test episodes. Every group reuses the normalizer fitted on `data`.
+# Episode ranges are half-open: [start, stop).
+eval_data:
+  root_dir: /mnt/workspace/lyc/data/huanggua_office/huanggua_office_0807_2110
+  latent_cache_root_dir: /mnt/workspace/lyc/data/huanggua_office/huanggua_office_0807_2110/latent_cache/dinov2_b14
+  episode_groups:
+    "0807_test": [266, 285]
+
 models:
   fm:
     cond_dim: 256
     # vision — DINOv2 (timm)
     n_image_views: 3
-    image_encoder_name: dinov2_small
-    dino_model_name: vit_small_patch14_dinov2.lvd142m  # vit_small_patch14_dinov2.lvd142m
+    image_encoder_name: dinov2_base
+    dino_model_name: vit_base_patch14_dinov2.lvd142m
     freeze_image_encoder: true
     image_pretrained: true
     image_feat_dim: 256
@@ -118,11 +130,17 @@ checkpoint:
   save_every: 200
 
 precompute:
-  batch_size: 1024
+  batch_size: 64  # per GPU; each frame contains all 3 camera views
   device: cuda
   overwrite: false
+  include_eval_data: false  # same Zarr/cache as training data
   output_path: null
-  token_mode: cls  # cls | all
+  # cls_local_npy keeps CLS in frame_backbone.zarr and writes one
+  # [3,256,D] FP16 patch file per frame under frame_backbone_local/.
+  token_mode: cls_local_npy  # cls | all | cls_local_npy
+  local_feature:
+    dtype: float16
+    frames_per_directory: 1000
 
 deploy:
   action_process: abs_qpos # abs_qpos

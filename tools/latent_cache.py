@@ -5,16 +5,24 @@ from typing import Any, Literal, Mapping
 
 FRAME_CACHE_BASENAME = "frame_backbone.zarr"
 FRAME_CACHE_BASE_REMOVE_HAND_BASENAME = "frame_backbone_base_remove_hand.zarr"
+FRAME_LOCAL_FEATURE_DIRNAME = "frame_backbone_local"
+FRAME_LOCAL_FEATURE_BASE_REMOVE_HAND_DIRNAME = "frame_backbone_base_remove_hand_local"
 LEGACY_CACHE_BASENAME = "policy_latent_cache.zarr"
 LATENT_CACHE_BASENAME = FRAME_CACHE_BASENAME  # preferred write/read name
 DEFAULT_DINOV2_MODEL = "vit_small_patch14_dinov2.lvd142m"
 DINOV2_BASE_MODEL = "vit_base_patch14_dinov2.lvd142m"
-# v3: full tokens (T,V,257,D) or CLS (T,V,D) via token_mode attr
+# v3: full tokens (T,V,257,D) or CLS (T,V,D). cls_local_npy keeps the
+# v3 CLS tensor and describes its sibling patch store through extra attrs.
 FRAME_CACHE_VERSION = 3
 DINOV2_NUM_TOKENS = 257
 TOKEN_MODE_CLS = "cls"
 TOKEN_MODE_ALL = "all"
 TokenMode = Literal["cls", "all"]
+CACHE_MODE_CLS_LOCAL_NPY = "cls_local_npy"
+CacheMode = Literal["cls", "all", "cls_local_npy"]
+LOCAL_FEATURE_INDEX_KEY = "local_feature_index"
+LOCAL_FEATURE_STORAGE = "npy_per_frame"
+LOCAL_FEATURE_NUM_TOKENS = DINOV2_NUM_TOKENS - 1
 CACHE_SUBDIR_SMALL = "dinov2_s14"
 CACHE_SUBDIR_BASE = "dinov2_b14"
 DEFAULT_CACHE_SUBDIR = os.path.join("latent_cache", CACHE_SUBDIR_SMALL)
@@ -30,6 +38,26 @@ def normalize_token_mode(value: Any, *, default: TokenMode = TOKEN_MODE_ALL) -> 
     if key in {"all", "full", "tokens", "257", "patch", "patches"}:
         return TOKEN_MODE_ALL
     raise ValueError(f"invalid token_mode={value!r}; expected 'cls' or 'all'")
+
+
+def normalize_cache_mode(value: Any, *, default: CacheMode = TOKEN_MODE_ALL) -> CacheMode:
+    """Resolve the physical frame-cache layout requested by precompute.
+
+    ``cls_local_npy`` keeps the zarr tensor CLS-only while storing the 256 patch
+    tokens in one FP16 ``.npy`` file per frame. Keeping ``token_mode=cls`` in
+    the zarr attrs preserves compatibility with existing CLS-only readers.
+    """
+    if value is None or str(value).strip() == "":
+        return default
+    key = str(value).strip().lower().replace("-", "_")
+    if key in {"cls_local_npy", "cls_with_local_npy", "local_npy", "local"}:
+        return CACHE_MODE_CLS_LOCAL_NPY
+    return normalize_token_mode(key)
+
+
+def stored_token_mode(cache_mode: CacheMode | str) -> TokenMode:
+    mode = normalize_cache_mode(cache_mode)
+    return TOKEN_MODE_CLS if mode == CACHE_MODE_CLS_LOCAL_NPY else normalize_token_mode(mode)
 
 
 def token_mode_num_tokens(token_mode: TokenMode | str) -> int:
@@ -144,6 +172,37 @@ def resolve_frame_backbone_base_remove_hand_zarr_path(cache_root_dir: str) -> st
     return os.path.join(str(cache_root_dir), FRAME_CACHE_BASE_REMOVE_HAND_BASENAME)
 
 
+def resolve_frame_local_feature_dir(cache_root_dir: str) -> str:
+    return os.path.join(str(cache_root_dir), FRAME_LOCAL_FEATURE_DIRNAME)
+
+
+def resolve_frame_local_feature_base_remove_hand_dir(cache_root_dir: str) -> str:
+    return os.path.join(str(cache_root_dir), FRAME_LOCAL_FEATURE_BASE_REMOVE_HAND_DIRNAME)
+
+
+def local_feature_file_path(
+    root_dir: str,
+    feature_id: int,
+    *,
+    frames_per_directory: int,
+) -> str:
+    """Deterministic path for one frame's [V,256,D] local feature array."""
+    feature_id = int(feature_id)
+    frames_per_directory = int(frames_per_directory)
+    if feature_id < 0:
+        raise ValueError(f"feature_id must be non-negative, got {feature_id}")
+    if frames_per_directory < 1:
+        raise ValueError(
+            f"frames_per_directory must be positive, got {frames_per_directory}"
+        )
+    directory_id = feature_id // frames_per_directory
+    return os.path.join(
+        str(root_dir),
+        f"{directory_id:06d}",
+        f"{feature_id:09d}.npy",
+    )
+
+
 def resolve_latent_cache_zarr_path(cache_root_dir: str) -> str:
     """Resolve existing cache for reading; prefer frame_backbone, else legacy."""
     root = str(cache_root_dir)
@@ -234,6 +293,61 @@ def _feat_shape_matches_token_mode(feat_shape: tuple[int, ...], token_mode: Toke
     return len(feat_shape) == 4 and int(feat_shape[2]) == int(DINOV2_NUM_TOKENS)
 
 
+def _local_npy_cache_matches(
+    root: Any,
+    *,
+    cache_path: str,
+    total_frames: int,
+) -> bool:
+    attrs = dict(getattr(root, "attrs", {}) or {})
+    if str(attrs.get("cache_mode", "")).strip() != CACHE_MODE_CLS_LOCAL_NPY:
+        return False
+    if str(attrs.get("local_feature_storage", "")).strip() != LOCAL_FEATURE_STORAGE:
+        return False
+    if attrs.get("local_feature_complete") not in (True, 1, "1", "true", "True"):
+        return False
+    data = root["data"]
+    if LOCAL_FEATURE_INDEX_KEY not in data:
+        return False
+    index = data[LOCAL_FEATURE_INDEX_KEY]
+    if tuple(int(x) for x in index.shape) != (int(total_frames),):
+        return False
+    try:
+        import numpy as np
+
+        values = np.asarray(index[:], dtype=np.int64)
+    except Exception:
+        return False
+    if values.size != int(total_frames) or bool((values < 0).any()):
+        return False
+
+    directory_name = str(attrs.get("local_feature_dir", "")).strip()
+    if not directory_name or os.path.isabs(directory_name):
+        return False
+    local_root = os.path.join(os.path.dirname(cache_path), directory_name)
+    if not os.path.isdir(local_root):
+        return False
+    try:
+        frames_per_directory = int(attrs["local_feature_frames_per_directory"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if frames_per_directory < 1:
+        return False
+    # Full directory scans are expensive. Completeness is committed only after
+    # all atomic npy writes finish; additionally verify both boundary files.
+    if values.size:
+        for feature_id in (int(values[0]), int(values[-1])):
+            if not os.path.isfile(
+                local_feature_file_path(
+                    local_root,
+                    feature_id,
+                    frames_per_directory=frames_per_directory,
+                )
+            ):
+                return False
+    return True
+
+
 def frame_cache_matches(
     cache_path: str,
     *,
@@ -242,7 +356,7 @@ def frame_cache_matches(
     image_size: int,
     camera_views: tuple[str, ...] | list[str],
     total_frames: int,
-    token_mode: TokenMode | str = TOKEN_MODE_ALL,
+    token_mode: CacheMode | str = TOKEN_MODE_ALL,
     color_order: str = "rgb",
 ) -> bool:
     """True if existing frame cache can be reused (scheme A skip)."""
@@ -282,14 +396,23 @@ def frame_cache_matches(
     feat = root["data"]["frame_image_backbone_feat"]
     if int(feat.shape[0]) != int(total_frames):
         return False
-    want = normalize_token_mode(token_mode)
+    want_mode = normalize_cache_mode(token_mode)
+    want = stored_token_mode(want_mode)
     try:
         have = infer_token_mode_from_attrs_and_shape(attrs, tuple(int(x) for x in feat.shape))
     except ValueError:
         return False
     if have != want:
         return False
-    return _feat_shape_matches_token_mode(tuple(int(x) for x in feat.shape), want)
+    if not _feat_shape_matches_token_mode(tuple(int(x) for x in feat.shape), want):
+        return False
+    if want_mode == CACHE_MODE_CLS_LOCAL_NPY:
+        return _local_npy_cache_matches(
+            root,
+            cache_path=cache_path,
+            total_frames=total_frames,
+        )
+    return True
 
 
 def remove_hand_frame_cache_matches(
@@ -299,7 +422,7 @@ def remove_hand_frame_cache_matches(
     source_zarr_path: str,
     image_size: int,
     total_frames: int,
-    token_mode: TokenMode | str = TOKEN_MODE_ALL,
+    token_mode: CacheMode | str = TOKEN_MODE_ALL,
     color_order: str = "rgb",
 ) -> bool:
     """True if compact base_0 remove-hand frame cache can be reused."""
@@ -345,11 +468,20 @@ def remove_hand_frame_cache_matches(
         return False
     if int(feat.shape[1]) != 1:
         return False
-    want = normalize_token_mode(token_mode)
+    want_mode = normalize_cache_mode(token_mode)
+    want = stored_token_mode(want_mode)
     try:
         have = infer_token_mode_from_attrs_and_shape(attrs, tuple(int(x) for x in feat.shape))
     except ValueError:
         return False
     if have != want:
         return False
-    return _feat_shape_matches_token_mode(tuple(int(x) for x in feat.shape), want)
+    if not _feat_shape_matches_token_mode(tuple(int(x) for x in feat.shape), want):
+        return False
+    if want_mode == CACHE_MODE_CLS_LOCAL_NPY:
+        return _local_npy_cache_matches(
+            root,
+            cache_path=cache_path,
+            total_frames=total_frames,
+        )
+    return True
