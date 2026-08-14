@@ -181,6 +181,14 @@ def test_local_feature_rows_load_selected_views(tmp_path) -> None:
     assert patches_only.shape == (1, 2, 256, 4)
     assert combined.shape == (1, 2, 257, 4)
 
+    # Patch-only LIP callers must not require the CLS array to be resident in RAM.
+    dataset.cached_frame_image_backbone_feat = None
+    patches_without_cls_ram = dataset._gather_frame_latent(
+        np.asarray([1], dtype=np.int64),
+        include_cls=False,
+    )
+    assert np.array_equal(patches_without_cls_ram, patches_only)
+
 
 def test_precompute_cls_local_npy_layout(tmp_path, monkeypatch) -> None:
     class FakeDataset:

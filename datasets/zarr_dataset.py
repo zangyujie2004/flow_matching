@@ -115,6 +115,7 @@ class ZarrDataset(Dataset):
         image_as_uint8: bool = True,
         use_camera_latent: bool = False,
         use_local_camera_latent: bool = False,
+        load_camera_latent_cls_to_ram: bool = True,
         latent_cache_root_dir: str | None = None,
         latent_cache_image_encoder_name: str | None = None,
         latent_cache_image_model_name: str | None = None,
@@ -151,6 +152,7 @@ class ZarrDataset(Dataset):
         self.image_as_uint8 = bool(image_as_uint8)
         self.use_camera_latent = bool(use_camera_latent)
         self.use_local_camera_latent = bool(use_local_camera_latent)
+        self.load_camera_latent_cls_to_ram = bool(load_camera_latent_cls_to_ram)
         if self.use_local_camera_latent and not self.use_camera_latent:
             raise ValueError(
                 "use_local_camera_latent=true requires use_camera_latent=true"
@@ -200,6 +202,9 @@ class ZarrDataset(Dataset):
         self.latent_cache_group = None
         self.cached_image_backbone_feat = None
         self.cached_frame_image_backbone_feat = None
+        self.frame_latent_cache_path: str | None = None
+        self.frame_latent_cache_view_indices: tuple[int, ...] | None = None
+        self.remove_hand_frame_latent_cache_path: str | None = None
         self._frame_latent_view_indices: tuple[int, ...] | None = None
         self.latent_token_mode: str | None = None
         self.image_backbone_dim: int | None = None
@@ -666,28 +671,28 @@ class ZarrDataset(Dataset):
             )
 
         self.image_backbone_dim = int(cache_attrs.get("image_backbone_dim", frame_src.shape[-1]))
-        # Materialize full frame cache into RAM so DataLoader workers avoid zarr I/O.
-        frame = np.asarray(frame_src[:], dtype=np.float32)
+        frame_shape = tuple(int(x) for x in frame_src.shape)
         try:
             token_mode = infer_token_mode_from_attrs_and_shape(
-                cache_attrs, tuple(int(x) for x in frame.shape)
+                cache_attrs, frame_shape
             )
         except ValueError as exc:
             raise ValueError(
-                f"Latent cache at {cache_path} has unsupported shape {tuple(frame.shape)}: {exc}"
+                f"Latent cache at {cache_path} has unsupported shape {frame_shape}: {exc}"
             ) from exc
         if token_mode == "cls":
-            # Prefer canonical (T, V, D); squeeze legacy (T, V, 1, D).
-            if frame.ndim == 4 and int(frame.shape[2]) == 1:
-                frame = frame[:, :, 0, :]
-            if frame.ndim != 3:
+            if len(frame_shape) == 4 and int(frame_shape[2]) == 1:
+                canonical_shape = (frame_shape[0], frame_shape[1], frame_shape[3])
+            else:
+                canonical_shape = frame_shape
+            if len(canonical_shape) != 3:
                 raise ValueError(
-                    f"CLS latent cache expected (T,V,D), got {tuple(frame.shape)} at {cache_path}"
+                    f"CLS latent cache expected (T,V,D), got {frame_shape} at {cache_path}"
                 )
         else:
-            if frame.ndim != 4:
+            if len(frame_shape) != 4:
                 raise ValueError(
-                    f"all-token latent cache expected (T,V,257,D), got {tuple(frame.shape)} "
+                    f"all-token latent cache expected (T,V,257,D), got {frame_shape} "
                     f"at {cache_path}"
                 )
         view_idx = [int(i) for i in latent_view_indices]
@@ -716,18 +721,38 @@ class ZarrDataset(Dataset):
             self.latent_token_mode = CACHE_MODE_CLS_LOCAL_NPY
         else:
             self.latent_token_mode = token_mode
-        if view_idx != list(range(int(frame.shape[1]))):
-            frame = np.ascontiguousarray(frame[:, view_idx])
-        self._frame_latent_view_indices = tuple(range(int(frame.shape[1])))
-        self.cached_frame_image_backbone_feat = frame
+        selected_view_count = len(view_idx)
+        self._frame_latent_view_indices = tuple(range(selected_view_count))
         self.cached_image_backbone_feat = None
-        frame_gb = frame.nbytes / (1024**3)
-        print(
-            f"[ZarrDataset] frame latent cache loaded: {cache_path}, "
-            f"shape={tuple(frame.shape)}, token_mode={self.latent_token_mode}, "
-            f"using_views={self.n_image_views}, "
-            f"backbone_dim={self.image_backbone_dim}, size={frame_gb:.3f} GB"
+        skip_cls_ram = (
+            self.latent_token_mode == CACHE_MODE_CLS_LOCAL_NPY
+            and not self.load_camera_latent_cls_to_ram
         )
+        if skip_cls_ram:
+            self.frame_latent_cache_path = cache_path
+            self.frame_latent_cache_view_indices = tuple(view_idx)
+            self.cached_frame_image_backbone_feat = None
+            print(
+                f"[ZarrDataset] frame CLS cache validated but not loaded into RAM: "
+                f"{cache_path}, shape={frame_shape}, token_mode={self.latent_token_mode}, "
+                f"using_views={self.n_image_views}, backbone_dim={self.image_backbone_dim}"
+            )
+        else:
+            # Generic policies may consume CLS/all tokens, so retain the original
+            # eager-RAM behavior unless the patch-only LIP path explicitly opts out.
+            frame = np.asarray(frame_src[:], dtype=np.float32)
+            if token_mode == "cls" and frame.ndim == 4 and int(frame.shape[2]) == 1:
+                frame = frame[:, :, 0, :]
+            if view_idx != list(range(int(frame.shape[1]))):
+                frame = np.ascontiguousarray(frame[:, view_idx])
+            self.cached_frame_image_backbone_feat = frame
+            frame_gb = frame.nbytes / (1024**3)
+            print(
+                f"[ZarrDataset] frame latent cache loaded: {cache_path}, "
+                f"shape={tuple(frame.shape)}, token_mode={self.latent_token_mode}, "
+                f"using_views={self.n_image_views}, "
+                f"backbone_dim={self.image_backbone_dim}, size={frame_gb:.3f} GB"
+            )
         self.latent_cache_group = None
         self.latent_cache_zarr = None
 
@@ -772,14 +797,14 @@ class ZarrDataset(Dataset):
                 f"remove-hand latent expected 1 view, got V={frame_src.shape[1]} at {cache_path}"
             )
 
-        frame = np.asarray(frame_src[:], dtype=np.float32)
+        frame_shape = tuple(int(x) for x in frame_src.shape)
         try:
             token_mode = infer_token_mode_from_attrs_and_shape(
-                cache_attrs, tuple(int(x) for x in frame.shape)
+                cache_attrs, frame_shape
             )
         except ValueError as exc:
             raise ValueError(
-                f"Remove-hand latent cache unsupported shape {tuple(frame.shape)}: {exc}"
+                f"Remove-hand latent cache unsupported shape {frame_shape}: {exc}"
             ) from exc
 
         effective_token_mode = token_mode
@@ -813,28 +838,45 @@ class ZarrDataset(Dataset):
             )
 
         if token_mode == "cls":
-            if frame.ndim == 4 and int(frame.shape[2]) == 1:
-                frame = frame[:, :, 0, :]
-            # Accept (T,1,D) → squeeze view for storage as (T,D) for easier replace,
-            # or keep (T,1,D). Prefer (T, D) after squeeze view dim.
-            if frame.ndim == 3 and int(frame.shape[1]) == 1:
-                frame = frame[:, 0, :]
-            if frame.ndim != 2:
+            canonical_shape = frame_shape
+            if len(canonical_shape) == 4 and int(canonical_shape[2]) == 1:
+                canonical_shape = (canonical_shape[0], canonical_shape[1], canonical_shape[3])
+            if len(canonical_shape) == 3 and int(canonical_shape[1]) == 1:
+                canonical_shape = (canonical_shape[0], canonical_shape[2])
+            if len(canonical_shape) != 2:
                 raise ValueError(
-                    f"CLS remove-hand latent expected (T,D) after squeeze, got {tuple(frame.shape)}"
+                    f"CLS remove-hand latent expected (T,D) after squeeze, got {frame_shape}"
                 )
         else:
-            if frame.ndim != 4:
+            if len(frame_shape) != 4:
                 raise ValueError(
-                    f"all-token remove-hand latent expected (T,1,257,D), got {tuple(frame.shape)}"
+                    f"all-token remove-hand latent expected (T,1,257,D), got {frame_shape}"
                 )
 
-        self.cached_frame_image_backbone_feat_remove_hand = np.ascontiguousarray(frame)
-        frame_gb = frame.nbytes / (1024**3)
-        print(
-            f"[ZarrDataset] remove-hand latent cache loaded: {cache_path}, "
-            f"shape={tuple(frame.shape)}, token_mode={effective_token_mode}, size={frame_gb:.3f} GB"
+        skip_cls_ram = (
+            effective_token_mode == CACHE_MODE_CLS_LOCAL_NPY
+            and not self.load_camera_latent_cls_to_ram
         )
+        if skip_cls_ram:
+            self.remove_hand_frame_latent_cache_path = cache_path
+            self.cached_frame_image_backbone_feat_remove_hand = None
+            print(
+                f"[ZarrDataset] remove-hand CLS cache validated but not loaded into RAM: "
+                f"{cache_path}, shape={frame_shape}, token_mode={effective_token_mode}"
+            )
+        else:
+            frame = np.asarray(frame_src[:], dtype=np.float32)
+            if token_mode == "cls" and frame.ndim == 4 and int(frame.shape[2]) == 1:
+                frame = frame[:, :, 0, :]
+            if token_mode == "cls" and frame.ndim == 3 and int(frame.shape[1]) == 1:
+                frame = frame[:, 0, :]
+            self.cached_frame_image_backbone_feat_remove_hand = np.ascontiguousarray(frame)
+            frame_gb = frame.nbytes / (1024**3)
+            print(
+                f"[ZarrDataset] remove-hand latent cache loaded: {cache_path}, "
+                f"shape={tuple(frame.shape)}, token_mode={effective_token_mode}, "
+                f"size={frame_gb:.3f} GB"
+            )
 
     def _gather_frame_latent(
         self,
@@ -842,14 +884,13 @@ class ZarrDataset(Dataset):
         *,
         include_cls: bool = True,
     ) -> np.ndarray:
-        if self.cached_frame_image_backbone_feat is None:
-            raise RuntimeError(
-                "frame camera latent cache is not loaded; run ./scripts/precompute.sh"
-            )
         idx = np.asarray(indices, dtype=np.int64)
-        cls_or_tokens = self.cached_frame_image_backbone_feat[idx]
         if self.latent_token_mode != CACHE_MODE_CLS_LOCAL_NPY:
-            return cls_or_tokens
+            if self.cached_frame_image_backbone_feat is None:
+                raise RuntimeError(
+                    "frame camera latent cache is not loaded; run ./scripts/precompute.sh"
+                )
+            return self.cached_frame_image_backbone_feat[idx]
         if (
             self.cached_local_feature_index is None
             or self.local_feature_root is None
@@ -868,7 +909,19 @@ class ZarrDataset(Dataset):
         )
         if not include_cls:
             return local
-        cls = np.asarray(cls_or_tokens, dtype=np.float32)
+        if self.cached_frame_image_backbone_feat is not None:
+            cls = np.asarray(self.cached_frame_image_backbone_feat[idx], dtype=np.float32)
+        else:
+            if self.frame_latent_cache_path is None:
+                raise RuntimeError("frame CLS cache path is not initialized")
+            cache = zarr.open_group(self.frame_latent_cache_path, mode="r")
+            source = cache["data"]["frame_image_backbone_feat"]
+            cls = np.asarray(source[idx], dtype=np.float32)
+            if cls.ndim == 4 and int(cls.shape[2]) == 1:
+                cls = cls[:, :, 0, :]
+            view_indices = self.frame_latent_cache_view_indices
+            if view_indices is not None and tuple(view_indices) != tuple(range(cls.shape[1])):
+                cls = np.ascontiguousarray(cls[:, list(view_indices)])
         return np.concatenate((cls[:, :, None, :], local), axis=2)
 
     def _gather_remove_hand_frame_latent(
@@ -877,14 +930,14 @@ class ZarrDataset(Dataset):
         *,
         include_cls: bool = True,
     ) -> np.ndarray:
-        if self.cached_frame_image_backbone_feat_remove_hand is None:
-            raise RuntimeError(
-                "remove-hand frame latent cache is not loaded; run ./scripts/precompute.sh"
-            )
         idx = np.asarray(compact_indices, dtype=np.int64)
-        cls_or_tokens = self.cached_frame_image_backbone_feat_remove_hand[idx]
         if self.latent_token_mode != CACHE_MODE_CLS_LOCAL_NPY:
-            return cls_or_tokens
+            if self.cached_frame_image_backbone_feat_remove_hand is None:
+                raise RuntimeError(
+                    "remove-hand frame latent cache is not loaded; "
+                    "run ./scripts/precompute.sh"
+                )
+            return self.cached_frame_image_backbone_feat_remove_hand[idx]
         if (
             self.cached_local_feature_index_remove_hand is None
             or self.local_feature_root_remove_hand is None
@@ -902,7 +955,18 @@ class ZarrDataset(Dataset):
         )
         if not include_cls:
             return local
-        cls = np.asarray(cls_or_tokens, dtype=np.float32)
+        if self.cached_frame_image_backbone_feat_remove_hand is not None:
+            cls = np.asarray(
+                self.cached_frame_image_backbone_feat_remove_hand[idx], dtype=np.float32
+            )
+        else:
+            if self.remove_hand_frame_latent_cache_path is None:
+                raise RuntimeError("remove-hand CLS cache path is not initialized")
+            cache = zarr.open_group(self.remove_hand_frame_latent_cache_path, mode="r")
+            source = cache["data"]["frame_image_backbone_feat"]
+            cls = np.asarray(source[idx], dtype=np.float32)
+            if cls.ndim == 4 and int(cls.shape[2]) == 1:
+                cls = cls[:, :, 0, :]
         if cls.ndim == 2:
             cls = cls[:, None, :]
         return np.concatenate((cls[:, :, None, :], local), axis=2)
