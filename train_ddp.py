@@ -3,17 +3,17 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from trainers.policy_trainer import main as train_main
+from trainers.ddp_trainer import main as train_ddp_main
 from tools.latent_cache import apply_resolved_latent_cache_root_dir
 from utils.train_utils import load_config
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train flow-matching policy")
+    parser = argparse.ArgumentParser(description="DDP train flow-matching policy (torchrun)")
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/config.yaml",
+        default="configs/train/config.yaml",
         help="Path to training config yaml",
     )
     parser.add_argument(
@@ -34,7 +34,7 @@ def main() -> None:
         cfg["train"] = dict(cfg["train"])
         cfg["train"]["mixed_precision"] = args.amp
     cfg = apply_resolved_latent_cache_root_dir(cfg)
-    train_main(cfg)
+    train_ddp_main(cfg)
 
 
 if __name__ == "__main__":

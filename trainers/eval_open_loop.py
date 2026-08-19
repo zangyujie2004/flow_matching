@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import errno
 import os
+import warnings
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
@@ -124,9 +126,11 @@ def _plot_dual_arm_curves(
     fig.legend(handles, labels, loc="upper right")
     fig.suptitle(title)
     fig.tight_layout(rect=(0, 0, 0.98, 0.95))
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=160)
-    plt.close(fig)
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=160)
+    finally:
+        plt.close(fig)
 
 
 def _plot_dual_arm_joint_curves(
@@ -172,9 +176,11 @@ def _plot_dual_arm_joint_curves(
     fig.legend(handles, labels, loc="upper right")
     fig.suptitle(title)
     fig.tight_layout(rect=(0, 0, 0.98, 0.95))
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=160)
-    plt.close(fig)
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=160)
+    finally:
+        plt.close(fig)
 
 
 def plot_action_curves(
@@ -211,9 +217,33 @@ def plot_action_curves(
     fig.legend(handles, labels, loc="upper right")
     fig.suptitle(title)
     fig.tight_layout(rect=(0, 0, 0.98, 0.95))
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=160)
-    plt.close(fig)
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=160)
+    finally:
+        plt.close(fig)
+
+
+def _try_plot_action_curves(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    dims: list[int],
+    out_path: Path,
+    title: str,
+) -> bool:
+    """Save one plot, returning False only when the output filesystem is full."""
+    try:
+        plot_action_curves(pred, gt, dims, out_path, title)
+    except OSError as exc:
+        if exc.errno != errno.ENOSPC:
+            raise
+        warnings.warn(
+            f"Skipping open-loop plots because the output filesystem is full: {out_path}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return False
+    return True
 
 
 def _absolute_actions_for_batch(
@@ -318,14 +348,16 @@ def _evaluate_open_loop_impl(
 
     chosen = rng.choice(len(dataset), size=total_windows, replace=False)
     plot_dir = None if out_dir is None else out_dir / "plots"
-    if plot_dir is not None:
-        plot_dir.mkdir(parents=True, exist_ok=True)
 
     sq_sum = 0.0
     abs_sum = 0.0
     elem_count = 0
     sample_count = 0
+    tactile_sq_sum = 0.0
+    tactile_abs_sum = 0.0
+    tactile_elem_count = 0
     plotted = 0
+    plotting_enabled = plot_samples != 0 and plot_dir is not None
     dims_for_plot: list[int] | None = None
 
     pbar = tqdm(range(int(max_batches)), desc="OpenLoop", leave=False)
@@ -345,6 +377,17 @@ def _evaluate_open_loop_impl(
             solver=solver,
         )
         pred_norm = result["action_pred_normalized"]
+        if bool(getattr(policy, "predict_tactile", False)):
+            pred_tactile = result["tactile_latent_pred_normalized"]
+            target_tactile = batch["tactile_target_latent"]
+            tactile_horizon = min(pred_tactile.shape[1], target_tactile.shape[1])
+            tactile_diff = (
+                pred_tactile[:, :tactile_horizon]
+                - target_tactile[:, :tactile_horizon]
+            )
+            tactile_sq_sum += float(torch.sum(tactile_diff.square()).item())
+            tactile_abs_sum += float(torch.sum(tactile_diff.abs()).item())
+            tactile_elem_count += int(tactile_diff.numel())
         pred_abs, gt_abs = _absolute_actions_for_batch(
             dataset,
             normalizer,
@@ -369,19 +412,20 @@ def _evaluate_open_loop_impl(
         batch_l1 = float(np.mean(np.abs(diff)))
         pbar.set_postfix(l1=f"{batch_l1:.4f}")
 
-        if plot_samples != 0 and plot_dir is not None:
+        if plotting_enabled:
             if dims_for_plot is None:
                 dims_for_plot = parse_dims(plot_dims, action_dim)
             if plot_samples < 0 or plotted < plot_samples:
                 out_path = plot_dir / f"epoch_{epoch:04d}_batch{batch_idx:04d}_item00.png"
-                plot_action_curves(
+                plotting_enabled = _try_plot_action_curves(
                     pred_abs[0],
                     gt_abs[0],
                     dims_for_plot,
                     out_path,
                     title=f"Open-loop absolute action | epoch={epoch}, batch={batch_idx}",
                 )
-                plotted += 1
+                if plotting_enabled:
+                    plotted += 1
 
     if elem_count == 0:
         raise RuntimeError("No valid open-loop samples were evaluated.")
@@ -392,9 +436,23 @@ def _evaluate_open_loop_impl(
         "num_samples": float(sample_count),
         "num_plots": float(plotted),
     }
+    if tactile_elem_count > 0:
+        metrics["tactile_latent_mse"] = tactile_sq_sum / tactile_elem_count
+        metrics["tactile_latent_l1"] = tactile_abs_sum / tactile_elem_count
 
     if writer is not None:
         writer.add_scalar("OpenLoop/action_mse", metrics["action_mse"], epoch)
         writer.add_scalar("OpenLoop/action_l1", metrics["action_l1"], epoch)
+        if tactile_elem_count > 0:
+            writer.add_scalar(
+                "OpenLoop/tactile_latent_mse",
+                metrics["tactile_latent_mse"],
+                epoch,
+            )
+            writer.add_scalar(
+                "OpenLoop/tactile_latent_l1",
+                metrics["tactile_latent_l1"],
+                epoch,
+            )
 
     return metrics

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import sys
+import json
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import numpy as np
@@ -21,10 +23,8 @@ from tools.latent_cache import (
     resolve_latent_cache_zarr_path,
     validate_latent_cache_identity,
 )
-from tools.normalizer import DatasetNormalizer
+from tools.normalizer import DatasetNormalizer, FieldNormalizer
 from tools.tactile_feat import TACTILE_FEATURE_DIM, extract_tactile_deformation
-
-from .image_augment import apply_photometric_augment
 
 _ACTION_TYPES = ("joint", "eef")
 _ROBOT_SLICES = {"joint": slice(0, 14), "eef": slice(14, 34)}
@@ -33,9 +33,10 @@ CAMERA_BUNDLE_ORDER = ("base_0", "left_wrist_0", "right_wrist_0")
 CAMERA_BASE_REMOVE_HAND_KEY = "camera_base_remove_hand"
 META_EPISODE_ENDS_REMOVE_HAND = "episode_ends_remove_hand"
 BASE_REMOVE_HAND_PRESENT = "present"
+BASE_REMOVE_HAND_NONE = "none"
 BASE_MODE_ORIGINAL = "original"
 BASE_MODE_REMOVE = "remove"
-WindowTuple = Tuple[int, int, int, str]
+WindowTuple = Tuple[int, int, int, str]  # (anchor_t, ep_end, ep_idx, base_mode)
 
 
 def resolve_camera_views(
@@ -97,16 +98,6 @@ def parse_cache_camera_views(cache_views: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in str(cache_views).split(",") if part.strip())
 
 
-def resolve_camera_data_config(data_cfg: Mapping[str, Any]) -> dict[str, Any]:
-    """Apply camera_augmentation ↔ use_camera_latent rules from workload."""
-    cfg = dict(data_cfg)
-    if bool(cfg.get("camera_augmentation", False)):
-        if bool(cfg.get("use_camera_latent", False)):
-            print("[ZarrDataset] camera_augmentation=true; forcing use_camera_latent=false")
-        cfg["use_camera_latent"] = False
-    return cfg
-
-
 class ZarrDataset(Dataset):
     def __init__(
         self,
@@ -118,6 +109,14 @@ class ZarrDataset(Dataset):
         action_type: str = "eef",
         action_representation: str = "relative",
         use_tactile: bool = True,
+        predict_tactile: bool = False,
+        tactile_obs_steps: int = 1,
+        tactile_condition_encoder_type: str | None = None,
+        tactile_target_offset: int = 1,
+        tactile_latent_cache_path: str | None = None,
+        tactile_deformation_cache_path: str | None = None,
+        tactile_deformation_cache_required: bool = False,
+        preload_raw_tactile_to_ram: bool = True,
         image_size: int = 224,
         image_as_uint8: bool = True,
         use_camera_latent: bool = False,
@@ -130,11 +129,12 @@ class ZarrDataset(Dataset):
         state_key: str = "state_30hz",
         action_key: str = "action_30hz",
         camera_views: Sequence[str] | None = None,
-        camera_augmentation: bool = False,
         mix_base_remove_hand: bool = False,
         memory: Mapping[str, Any] | None = None,
         norm_output_range: Tuple[float, float] = (-1.0, 1.0),
         normalizer_max_windows: int | None = None,
+        normalizer_batch_windows: int = 1024,
+        cache_normalized_actions: bool = True,
         max_windows: int | None = None,
     ):
         self.root_dir = root_dir
@@ -152,10 +152,71 @@ class ZarrDataset(Dataset):
         self.action_dim = _ROBOT_DIMS[self.action_type]
 
         self.use_tactile = bool(use_tactile)
+        self.predict_tactile = bool(predict_tactile)
+        if self.predict_tactile and not self.use_tactile:
+            raise ValueError("predict_tactile=true requires use_tactile=true")
+        self.tactile_obs_steps = max(1, int(tactile_obs_steps))
+        condition_type = (
+            "precomputed"
+            if tactile_condition_encoder_type is None and self.predict_tactile
+            else tactile_condition_encoder_type or "temporal_cnn"
+        )
+        condition_aliases = {
+            "temporal_cnn": "temporal_cnn",
+            "cnn": "temporal_cnn",
+            "legacy": "temporal_cnn",
+            "residual_token": "residual_token",
+            "res_token": "residual_token",
+            "token": "residual_token",
+            "precomputed": "precomputed",
+            "precomputed_latent": "precomputed",
+        }
+        condition_key = str(condition_type).strip().lower()
+        if condition_key not in condition_aliases:
+            raise ValueError(
+                "unsupported tactile_condition_encoder_type="
+                f"{tactile_condition_encoder_type!r}"
+            )
+        self.tactile_condition_encoder_type = condition_aliases[condition_key]
+        if self.tactile_condition_encoder_type == "precomputed":
+            if not self.predict_tactile:
+                raise ValueError(
+                    "precomputed tactile conditioning requires predict_tactile=true"
+                )
+            if self.tactile_obs_steps != 1:
+                raise ValueError(
+                    "legacy precomputed tactile conditioning requires "
+                    "tactile_obs_steps=1"
+                )
+        self.tactile_target_offset = int(tactile_target_offset)
+        if self.tactile_target_offset < 0:
+            raise ValueError("tactile_target_offset must be non-negative")
+        self.tactile_latent_cache_path = (
+            None
+            if tactile_latent_cache_path is None
+            else str(Path(tactile_latent_cache_path).expanduser())
+        )
+        if self.predict_tactile and not self.tactile_latent_cache_path:
+            raise ValueError(
+                "predict_tactile=true requires data.tactile_latent_cache_path"
+            )
+        self.tactile_deformation_cache_path = (
+            None
+            if tactile_deformation_cache_path is None
+            else str(Path(tactile_deformation_cache_path).expanduser())
+        )
+        self.tactile_deformation_cache_required = bool(
+            tactile_deformation_cache_required
+        )
+        self.preload_raw_tactile_to_ram = bool(preload_raw_tactile_to_ram)
+        self.cached_tactile_deformation: np.ndarray | None = None
+        self.cached_tactile_latent: np.ndarray | None = None
+        self.tactile_latent_mean: np.ndarray | None = None
+        self.tactile_latent_std: np.ndarray | None = None
+        self.tactile_normalizer_override: FieldNormalizer | None = None
         self.tactile_dim = TACTILE_FEATURE_DIM
         self.image_as_uint8 = bool(image_as_uint8)
         self.use_camera_latent = bool(use_camera_latent)
-        self.camera_augmentation = bool(camera_augmentation)
         self.mix_base_remove_hand_requested = bool(mix_base_remove_hand)
         self.mix_base_remove_hand = False
         self.ep_has_rh: np.ndarray | None = None
@@ -166,45 +227,15 @@ class ZarrDataset(Dataset):
         self.latent_cache_image_encoder_name = latent_cache_image_encoder_name
         self.latent_cache_image_model_name = latent_cache_image_model_name
         self.fit_normalizer = bool(fit_normalizer)
-        self.training = True
 
         memory_cfg = dict(memory or {})
         self.memory_enabled = bool(memory_cfg.get("enabled", False))
-        self.memory_history_frames = max(1, int(memory_cfg.get("history_frames", 128)))
-        self.memory_visual_history_length = max(
-            1, int(memory_cfg.get("visual_history_length", 128))
-        )
-        self.memory_sample_stride = max(1, int(memory_cfg.get("sample_stride", 8)))
-        self.memory_recent_frame = max(0, int(memory_cfg.get("recent_frame", 0)))
-        self.memory_visual_recent_frame = max(
-            0, int(memory_cfg.get("visual_recent_frame", 0))
-        )
-        if (
-            self.memory_enabled
-            and self.memory_history_frames != self.memory_visual_history_length
-        ):
-            raise ValueError(
-                "state and visual Memory must share history_length: "
-                f"{self.memory_history_frames} != {self.memory_visual_history_length}"
-            )
-        if (
-            self.memory_enabled
-            and self.memory_recent_frame != self.memory_visual_recent_frame
-        ):
-            raise ValueError(
-                "state and visual Memory must share the same anchor/recent_frame: "
-                f"{self.memory_recent_frame} != {self.memory_visual_recent_frame}"
-            )
+        self.memory_history_frames = max(1, int(memory_cfg.get("history_frames", 64)))
+        self.memory_sample_stride = max(1, int(memory_cfg.get("sample_stride", 4)))
+        self.memory_recent_frame = max(1, int(memory_cfg.get("recent_frame", 2)))
         # Locked: pad_first only (ignore any start_mode in config).
         self.memory_start_mode = "pad_first"
         self.memory_visual_offsets = self._build_memory_visual_offsets()
-        self.memory_state_offsets = self.memory_visual_offsets
-
-        if self.camera_augmentation and self.use_camera_latent:
-            raise ValueError(
-                "camera_augmentation=true is incompatible with use_camera_latent=true. "
-                "Set use_camera_latent=false or disable camera_augmentation."
-            )
 
         self.latent_cache_zarr = None
         self.latent_cache_group = None
@@ -220,6 +251,8 @@ class ZarrDataset(Dataset):
         self.action_key = action_key
         self.norm_output_range = (float(norm_output_range[0]), float(norm_output_range[1]))
         self.normalizer_max_windows = normalizer_max_windows
+        self.normalizer_batch_windows = max(1, int(normalizer_batch_windows))
+        self.cache_normalized_actions = bool(cache_normalized_actions)
 
         self.zarr_path = self._resolve_zarr_path(root_dir)
         self.zarr_root = zarr.open_group(self.zarr_path, mode="r")
@@ -231,6 +264,15 @@ class ZarrDataset(Dataset):
         self._validate_required_keys()
         self.episode_ends = np.asarray(self.meta_group["episode_ends"][:], dtype=np.int64)
         self.episode_starts = np.concatenate([np.array([0], dtype=np.int64), self.episode_ends[:-1]])
+        # The deformation file is only an optional I/O acceleration cache.
+        # When tactile input is enabled and the file is absent, get_tactile()
+        # computes the exact same deformation from short raw-Zarr windows.
+        # Callers that need a hard cache requirement can explicitly set
+        # tactile_deformation_cache_required=true.
+        if self.use_tactile and self.tactile_deformation_cache_path:
+            self._open_tactile_deformation_cache()
+        if self.predict_tactile:
+            self._load_tactile_latent_cache()
 
         n_zarr_views = self._zarr_camera_view_count()
         self.camera_views = resolve_camera_views(camera_views, n_zarr_views=n_zarr_views)
@@ -243,15 +285,16 @@ class ZarrDataset(Dataset):
         if self.memory_enabled:
             print(
                 "[ZarrDataset] memory enabled: "
-                f"history_length={self.memory_visual_history_length}, "
+                f"history_frames={self.memory_history_frames}, "
                 f"sample_stride={self.memory_sample_stride}, "
-                f"recent_frame={self.memory_visual_recent_frame}, "
-                f"shared_offsets={self.memory_visual_offsets.tolist()}, "
+                f"recent_frame={self.memory_recent_frame}, "
+                f"visual_offsets={self.memory_visual_offsets.tolist()}, "
                 f"start_mode={self.memory_start_mode}"
             )
 
         self._setup_mix_base_remove_hand()
         self._preload_to_ram()
+
         self.windows = self._build_windows()
         if self.max_windows is not None:
             cap = max(1, int(self.max_windows))
@@ -262,8 +305,10 @@ class ZarrDataset(Dataset):
             raise ValueError(
                 "No valid strict anchor windows. "
                 f"window_size={self.window_size}, n_image_steps={self.n_image_steps}, "
+                f"tactile_obs_steps={self.tactile_obs_steps}, "
                 f"action_horizon={self.action_horizon}, stride={self.stride}"
             )
+        # Lookup maps to the original-base sample for an anchor (vis / stitch helpers).
         self.window_lookup = {
             (int(anchor_t), int(ep_idx)): idx
             for idx, (anchor_t, _ep_end, ep_idx, base_mode) in enumerate(self.windows)
@@ -288,8 +333,13 @@ class ZarrDataset(Dataset):
                 self,
                 output_range=self.norm_output_range,
                 max_windows=self.normalizer_max_windows,
+                batch_windows=self.normalizer_batch_windows,
             )
-            self._precompute_normalized_actions()
+            if self.cache_normalized_actions:
+                self._precompute_normalized_actions()
+            else:
+                self.cached_norm_action = None
+                print("[ZarrDataset] normalized actions will be computed per sample")
         else:
             self.normalizer = None
             self.cached_norm_action = None
@@ -297,27 +347,21 @@ class ZarrDataset(Dataset):
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "ZarrDataset":
         """Build dataset from policy/configs/config.yaml data section."""
-        cfg = resolve_camera_data_config(config)
-        cfg = dict(cfg)
+        cfg = dict(config)
         norm = cfg.pop("norm", None) or {}
         if "output_range" in norm:
             out = norm["output_range"]
             cfg["norm_output_range"] = (float(out[0]), float(out[1]))
         if "max_windows" in norm:
             cfg["normalizer_max_windows"] = norm["max_windows"]
+        if "batch_windows" in norm:
+            cfg["normalizer_batch_windows"] = norm["batch_windows"]
+        if "cache_actions" in norm:
+            cfg["cache_normalized_actions"] = bool(norm["cache_actions"])
         if "fit_normalizer" in cfg:
             cfg["fit_normalizer"] = bool(cfg["fit_normalizer"])
         memory = cfg.pop("memory", None)
         return cls(**cfg, memory=memory)
-
-    def set_training(self, training: bool) -> None:
-        self.training = bool(training)
-
-    def _maybe_augment_camera(self, camera: np.ndarray) -> np.ndarray:
-        if not self.camera_augmentation or not self.training:
-            return camera
-        rng = np.random.default_rng()
-        return apply_photometric_augment(camera, rng)
 
     @staticmethod
     def _resolve_action_type(value: str) -> str:
@@ -354,9 +398,140 @@ class ZarrDataset(Dataset):
             keys.insert(0, self.camera_key)
             if self.mix_base_remove_hand:
                 keys.append(CAMERA_BASE_REMOVE_HAND_KEY)
-        if self.use_tactile:
+        # Match the legacy policy data path: when no compact deformation mmap
+        # is available, preload raw tactile once per rank and serve all sample
+        # windows from RAM.  The explicit switch keeps a low-memory lazy-Zarr
+        # fallback for datasets that are too large to replicate per rank.
+        if (
+            self.use_tactile
+            and self.tactile_condition_encoder_type != "precomputed"
+            and self.cached_tactile_deformation is None
+            and self.preload_raw_tactile_to_ram
+        ):
             keys.append(self.tactile_key)
         return keys
+
+    def _open_tactile_deformation_cache(self) -> None:
+        path = Path(str(self.tactile_deformation_cache_path))
+        if not path.is_file():
+            if not self.tactile_deformation_cache_required:
+                fallback = (
+                    "raw-tactile RAM preload"
+                    if self.preload_raw_tactile_to_ram
+                    else "lazy raw-Zarr windows"
+                )
+                print(
+                    "[ZarrDataset] tactile deformation cache missing; "
+                    f"falling back to {fallback}: {path}"
+                )
+                self.tactile_deformation_cache_path = None
+                return
+            raise FileNotFoundError(
+                f"tactile deformation cache not found: {path}. Run "
+                "tools/precompute_tactile_deformation_cache.py first."
+            )
+        metadata_path = Path(f"{path}.json")
+        if not metadata_path.is_file():
+            raise FileNotFoundError(
+                f"tactile deformation cache metadata not found: {metadata_path}"
+            )
+        with metadata_path.open(encoding="utf-8") as handle:
+            metadata = json.load(handle)
+        cache_episode_ends = np.asarray(
+            metadata.get("episode_ends", []), dtype=np.int64
+        )
+        if not np.array_equal(cache_episode_ends, self.episode_ends):
+            raise ValueError(
+                "tactile deformation cache episode_ends do not match "
+                f"replay_buffer.zarr: {metadata_path}"
+            )
+        deformation = np.load(path, mmap_mode="r", allow_pickle=False)
+        expected_frames = int(self.episode_ends[-1])
+        expected_shape = (expected_frames, 35, 20, self.tactile_dim)
+        if deformation.shape != expected_shape:
+            raise ValueError(
+                f"tactile deformation cache shape {deformation.shape} != "
+                f"{expected_shape}: {path}"
+            )
+        if deformation.dtype != np.float32:
+            raise ValueError(
+                f"tactile deformation cache must be float32, got "
+                f"{deformation.dtype}: {path}"
+            )
+        self.cached_tactile_deformation = deformation
+        print(
+            "[ZarrDataset] tactile deformation mmap loaded: "
+            f"path={path}, shape={deformation.shape}, "
+            f"logical_size={deformation.nbytes / (1024**3):.3f} GiB"
+        )
+
+    def _load_tactile_latent_cache(self) -> None:
+        if not self.tactile_latent_cache_path:
+            raise RuntimeError("tactile latent cache path is not configured")
+        path = Path(self.tactile_latent_cache_path)
+        if not path.is_dir():
+            raise FileNotFoundError(f"tactile latent cache not found: {path}")
+        cache = zarr.open_group(str(path), mode="r")
+        if "latent" not in cache or "episode_ends" not in cache:
+            raise KeyError(
+                f"invalid tactile latent cache {path}: expected latent and episode_ends"
+            )
+        attrs = dict(cache.attrs)
+        if attrs.get("format") != "flow_matching_tactile_latent_v1":
+            raise ValueError(
+                f"unsupported tactile latent cache format={attrs.get('format')!r}: {path}"
+            )
+        if not bool(attrs.get("normalized", False)):
+            raise ValueError(f"tactile latent cache must contain normalized latents: {path}")
+
+        cache_episode_ends = np.asarray(cache["episode_ends"][:], dtype=np.int64)
+        if not np.array_equal(cache_episode_ends, self.episode_ends):
+            raise ValueError(
+                "tactile latent cache episode_ends do not match replay_buffer.zarr"
+            )
+        latent = np.asarray(cache["latent"][:], dtype=np.float32)
+        expected_frames = int(self.episode_ends[-1])
+        if latent.ndim != 2 or latent.shape[0] != expected_frames:
+            raise ValueError(
+                f"tactile latent cache shape {latent.shape} does not match "
+                f"num_frames={expected_frames}"
+            )
+
+        latent_dim = int(attrs.get("latent_dim", latent.shape[1]))
+        if latent.shape[1] != latent_dim:
+            raise ValueError(
+                f"tactile cache latent_dim attr={latent_dim} != array {latent.shape[1]}"
+            )
+        mean = np.asarray(attrs.get("latent_mean"), dtype=np.float32)
+        std = np.asarray(attrs.get("latent_std"), dtype=np.float32)
+        tactile_scale = np.asarray(
+            attrs.get("tactile_normalizer_scale"),
+            dtype=np.float32,
+        )
+        tactile_offset = np.asarray(
+            attrs.get("tactile_normalizer_offset"),
+            dtype=np.float32,
+        )
+        if mean.shape != (latent_dim,) or std.shape != (latent_dim,):
+            raise ValueError("invalid latent mean/std in tactile cache attrs")
+        if tactile_scale.shape != (self.tactile_dim,) or tactile_offset.shape != (
+            self.tactile_dim,
+        ):
+            raise ValueError("invalid tactile normalizer state in cache attrs")
+        if np.any(std <= 0):
+            raise ValueError("tactile latent std must be strictly positive")
+
+        self.cached_tactile_latent = latent
+        self.tactile_latent_mean = mean
+        self.tactile_latent_std = std
+        self.tactile_normalizer_override = FieldNormalizer(
+            scale=torch.from_numpy(tactile_scale),
+            offset=torch.from_numpy(tactile_offset),
+        )
+        print(
+            f"[ZarrDataset] tactile latent cache loaded: path={path} "
+            f"shape={latent.shape}, size={latent.nbytes / (1024**2):.1f} MiB"
+        )
 
     def _meta_json_path(self) -> str:
         if self.root_dir.endswith(".zarr"):
@@ -369,17 +544,28 @@ class ZarrDataset(Dataset):
         path = self._meta_json_path()
         if not os.path.isfile(path):
             return {}
-        with open(path, encoding="utf-8") as handle:
-            payload = json.load(handle)
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
         return payload if isinstance(payload, dict) else {}
 
     def _setup_mix_base_remove_hand(self) -> None:
-        """Duplicate eligible windows with the compact remove-hand base view."""
+        """Enable dual original/remove samples when dual zarr bypass is present."""
+        self.mix_base_remove_hand = False
+        self.ep_has_rh = None
+        self.ep_to_compact = None
+        self.episode_ends_remove_hand = None
         if not self.mix_base_remove_hand_requested:
             return
+
+        if self.memory_enabled:
+            raise ValueError(
+                "mix_base_remove_hand=true is incompatible with data.memory.enabled=true "
+                "(first-phase constraint)."
+            )
         if "base_0" not in self.camera_views:
             raise ValueError(
-                "mix_base_remove_hand=true requires base_0 in data.camera_views"
+                "mix_base_remove_hand=true requires 'base_0' in data.camera_views; "
+                f"got {list(self.camera_views)}"
             )
 
         run_meta = self._load_run_meta()
@@ -388,91 +574,97 @@ class ZarrDataset(Dataset):
         ).get("per_episode")
         has_array = CAMERA_BASE_REMOVE_HAND_KEY in self.data_group
         has_ends = META_EPISODE_ENDS_REMOVE_HAND in self.meta_group
-        if not flags or not any(str(flag) == BASE_REMOVE_HAND_PRESENT for flag in flags):
+
+        if not flags or not any(str(f) == BASE_REMOVE_HAND_PRESENT for f in flags):
             print(
-                "[ZarrDataset] no remove-hand episodes found; "
-                "mix_base_remove_hand degrades to original-only"
+                "[ZarrDataset] mix_base_remove_hand=true but no present remove-hand episodes "
+                f"(meta={self._meta_json_path()}, has_array={has_array}); degrading to single-sample."
             )
             return
+
         if len(flags) != self.num_episodes:
             raise ValueError(
-                "dataset.base_remove_hand.per_episode length "
-                f"{len(flags)} != num_episodes {self.num_episodes}"
+                f"dataset.base_remove_hand.per_episode length {len(flags)} "
+                f"!= num_episodes {self.num_episodes}"
             )
         if not has_array or not has_ends:
             raise ValueError(
-                "remove-hand metadata exists but replay_buffer.zarr is missing "
-                f"data/{CAMERA_BASE_REMOVE_HAND_KEY} or meta/{META_EPISODE_ENDS_REMOVE_HAND}"
+                "mix_base_remove_hand=true and present flags found, but zarr missing "
+                f"data/{CAMERA_BASE_REMOVE_HAND_KEY} or meta/{META_EPISODE_ENDS_REMOVE_HAND} "
+                f"(has_array={has_array}, has_ends={has_ends}). Re-run preprocess with impainting=dual."
             )
 
         ep_has_rh = np.asarray(
-            [str(flag) == BASE_REMOVE_HAND_PRESENT for flag in flags],
-            dtype=np.bool_,
+            [str(f) == BASE_REMOVE_HAND_PRESENT for f in flags], dtype=np.bool_
         )
         ep_to_compact = np.full(self.num_episodes, -1, dtype=np.int64)
-        compact_idx = 0
-        for ep_idx, present in enumerate(ep_has_rh):
-            if present:
-                ep_to_compact[ep_idx] = compact_idx
-                compact_idx += 1
+        compact_i = 0
+        for ep_idx, has in enumerate(ep_has_rh):
+            if has:
+                ep_to_compact[ep_idx] = compact_i
+                compact_i += 1
 
-        ends_rh = np.asarray(
-            self.meta_group[META_EPISODE_ENDS_REMOVE_HAND][:], dtype=np.int64
-        )
-        if len(ends_rh) != compact_idx:
+        ends_rh = np.asarray(self.meta_group[META_EPISODE_ENDS_REMOVE_HAND][:], dtype=np.int64)
+        if int(ends_rh.shape[0]) != int(compact_i):
             raise ValueError(
-                f"episode_ends_remove_hand length {len(ends_rh)} != present_count {compact_idx}"
+                f"episode_ends_remove_hand length {ends_rh.shape[0]} != present_count {compact_i}"
             )
-        remove_frames = int(self.data_group[CAMERA_BASE_REMOVE_HAND_KEY].shape[0])
-        if int(ends_rh[-1]) != remove_frames:
+        rh_shape0 = int(self.data_group[CAMERA_BASE_REMOVE_HAND_KEY].shape[0])
+        if int(ends_rh[-1]) != rh_shape0:
             raise ValueError(
-                f"episode_ends_remove_hand[-1]={int(ends_rh[-1])} "
-                f"!= remove-hand frames={remove_frames}"
+                f"episode_ends_remove_hand[-1]={int(ends_rh[-1])} != "
+                f"{CAMERA_BASE_REMOVE_HAND_KEY}.T={rh_shape0}"
             )
-        for ep_idx, present in enumerate(ep_has_rh):
-            if not present:
+
+        # Present ep length must match main camera T.
+        for ep_idx, has in enumerate(ep_has_rh):
+            if not has:
                 continue
-            compact_ep = int(ep_to_compact[ep_idx])
-            rh_start = 0 if compact_ep == 0 else int(ends_rh[compact_ep - 1])
-            rh_end = int(ends_rh[compact_ep])
-            main_length = int(
-                self.episode_ends[ep_idx] - self.episode_starts[ep_idx]
-            )
-            if rh_end - rh_start != main_length:
+            c = int(ep_to_compact[ep_idx])
+            rh_start = 0 if c == 0 else int(ends_rh[c - 1])
+            rh_end = int(ends_rh[c])
+            main_t = int(self.episode_ends[ep_idx] - self.episode_starts[ep_idx])
+            if rh_end - rh_start != main_t:
                 raise ValueError(
-                    f"episode {ep_idx}: remove-hand length {rh_end - rh_start} "
-                    f"!= main length {main_length}"
+                    f"episode {ep_idx}: remove-hand T={rh_end - rh_start} != main T={main_t}"
                 )
 
         self.ep_has_rh = ep_has_rh
         self.ep_to_compact = ep_to_compact
         self.episode_ends_remove_hand = ends_rh
         self.mix_base_remove_hand = True
+        present = int(ep_has_rh.sum())
+        none_c = int(self.num_episodes - present)
         print(
-            "[ZarrDataset] mix_base_remove_hand enabled: "
-            f"present={int(ep_has_rh.sum())}, "
-            f"none={self.num_episodes - int(ep_has_rh.sum())}"
+            f"[ZarrDataset] mix_base_remove_hand enabled: "
+            f"present={present} none={none_c} T_rh={rh_shape0}"
         )
 
-    def _compact_indices(self, main_indices: np.ndarray, ep_idx: int) -> np.ndarray:
+    def main_t_to_compact_t(self, t: int, ep_idx: int) -> int:
         if self.ep_to_compact is None or self.episode_ends_remove_hand is None:
-            raise RuntimeError("remove-hand compact index map is not initialized")
-        compact_ep = int(self.ep_to_compact[int(ep_idx)])
-        if compact_ep < 0:
-            raise ValueError(f"episode {ep_idx} has no remove-hand data")
-        main_start = int(self.episode_starts[int(ep_idx)])
-        rh_start = (
-            0
-            if compact_ep == 0
-            else int(self.episode_ends_remove_hand[compact_ep - 1])
-        )
-        return rh_start + (np.asarray(main_indices, dtype=np.int64) - main_start)
+            raise RuntimeError("remove-hand compact map is not initialized")
+        c = int(self.ep_to_compact[int(ep_idx)])
+        if c < 0:
+            raise ValueError(f"episode {ep_idx} has no remove-hand compact mapping")
+        ep_start = int(self.episode_starts[int(ep_idx)])
+        rh_start = 0 if c == 0 else int(self.episode_ends_remove_hand[c - 1])
+        return rh_start + (int(t) - ep_start)
+
+    def _compact_indices_for_range(self, t0: int, t1: int, ep_idx: int) -> np.ndarray:
+        if self.ep_to_compact is None or self.episode_ends_remove_hand is None:
+            raise RuntimeError("remove-hand compact map is not initialized")
+        c = int(self.ep_to_compact[int(ep_idx)])
+        if c < 0:
+            raise ValueError(f"episode {ep_idx} has no remove-hand compact mapping")
+        ep_start = int(self.episode_starts[int(ep_idx)])
+        rh_start = 0 if c == 0 else int(self.episode_ends_remove_hand[c - 1])
+        return rh_start + (np.arange(int(t0), int(t1), dtype=np.int64) - ep_start)
 
     def _window_fields(self, idx: int) -> WindowTuple:
-        window = self.windows[int(idx)]
-        if len(window) == 3:
-            return int(window[0]), int(window[1]), int(window[2]), BASE_MODE_ORIGINAL
-        return int(window[0]), int(window[1]), int(window[2]), str(window[3])
+        w = self.windows[int(idx)]
+        if len(w) == 3:
+            return int(w[0]), int(w[1]), int(w[2]), BASE_MODE_ORIGINAL
+        return int(w[0]), int(w[1]), int(w[2]), str(w[3])
 
     def _zarr_camera_view_count(self) -> int:
         if self.camera_key not in self.data_group:
@@ -483,6 +675,12 @@ class ZarrDataset(Dataset):
         for key in self._data_keys_to_load():
             if key not in self.data_group:
                 raise KeyError(f"Missing key in zarr data group: {key}")
+        if (
+            self.use_tactile
+            and self.tactile_condition_encoder_type != "precomputed"
+            and self.tactile_key not in self.data_group
+        ):
+            raise KeyError(f"Missing key in zarr data group: {self.tactile_key}")
         if "episode_ends" not in self.meta_group:
             raise KeyError("Missing key in zarr meta group: episode_ends")
         if self.camera_key not in self.data_group:
@@ -566,21 +764,29 @@ class ZarrDataset(Dataset):
         self.image_backbone_dim = int(cache_attrs.get("image_backbone_dim", frame_src.shape[-1]))
         # Materialize full frame cache into RAM so DataLoader workers avoid zarr I/O.
         frame = np.asarray(frame_src[:], dtype=np.float32)
-        token_mode = infer_token_mode_from_attrs_and_shape(
-            cache_attrs, tuple(int(x) for x in frame.shape)
-        )
+        try:
+            token_mode = infer_token_mode_from_attrs_and_shape(
+                cache_attrs, tuple(int(x) for x in frame.shape)
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"Latent cache at {cache_path} has unsupported shape {tuple(frame.shape)}: {exc}"
+            ) from exc
         self.latent_token_mode = token_mode
         if token_mode == "cls":
+            # Prefer canonical (T, V, D); squeeze legacy (T, V, 1, D).
             if frame.ndim == 4 and int(frame.shape[2]) == 1:
                 frame = frame[:, :, 0, :]
             if frame.ndim != 3:
                 raise ValueError(
-                    f"CLS cache expected (T,V,D), got {tuple(frame.shape)} at {cache_path}"
+                    f"CLS latent cache expected (T,V,D), got {tuple(frame.shape)} at {cache_path}"
                 )
-        elif frame.ndim != 4:
-            raise ValueError(
-                f"all-token cache expected (T,V,N,D), got {tuple(frame.shape)} at {cache_path}"
-            )
+        else:
+            if frame.ndim != 4:
+                raise ValueError(
+                    f"all-token latent cache expected (T,V,257,D), got {tuple(frame.shape)} "
+                    f"at {cache_path}"
+                )
         view_idx = [int(i) for i in latent_view_indices]
         if view_idx != list(range(int(frame.shape[1]))):
             frame = np.ascontiguousarray(frame[:, view_idx])
@@ -598,56 +804,85 @@ class ZarrDataset(Dataset):
         self.latent_cache_zarr = None
 
     def _maybe_open_remove_hand_latent_cache(self) -> None:
+        """Load compact base_0 remove-hand frame cache for mix latent samples."""
+        if not self.mix_base_remove_hand:
+            return
+        if self.ep_to_compact is None or self.episode_ends_remove_hand is None:
+            raise RuntimeError("mix remove-hand map missing before opening RH latent cache")
+
         root = self.latent_cache_root_dir or self.root_dir
         cache_path = resolve_frame_backbone_base_remove_hand_zarr_path(str(root))
         if not os.path.isdir(cache_path):
             raise FileNotFoundError(
-                f"Remove-hand latent cache not found: {cache_path}"
+                f"Remove-hand latent cache not found: {cache_path}. "
+                "Run ./scripts/precompute.sh after dual preprocess "
+                "(writes frame_backbone_base_remove_hand.zarr)."
             )
-        cache_root = zarr.open_group(cache_path, mode="r")
-        if "data" not in cache_root or "frame_image_backbone_feat" not in cache_root["data"]:
-            raise KeyError(f"Invalid remove-hand latent cache: {cache_path}")
 
-        attrs = dict(getattr(cache_root, "attrs", {}) or {})
-        self._validate_latent_cache_identity(cache_path, attrs)
-        if str(attrs.get("camera_views", "")).strip() != "base_0":
-            raise ValueError("remove-hand latent cache must contain only base_0")
+        rh_root = zarr.open_group(cache_path, mode="r")
+        if "data" not in rh_root or "frame_image_backbone_feat" not in rh_root["data"]:
+            raise KeyError(f"Invalid remove-hand latent cache structure: {cache_path}")
 
-        source = cache_root["data"]["frame_image_backbone_feat"]
-        if self.episode_ends_remove_hand is None:
-            raise RuntimeError("remove-hand episode mapping is not initialized")
-        if int(source.shape[0]) != int(self.episode_ends_remove_hand[-1]):
-            raise ValueError("remove-hand latent frame count does not match metadata")
-        if int(source.shape[1]) != 1:
+        cache_attrs = dict(getattr(rh_root, "attrs", {}) or {})
+        self._validate_latent_cache_identity(cache_path, cache_attrs)
+
+        if str(cache_attrs.get("camera_views", "")).strip() != "base_0":
             raise ValueError(
-                f"remove-hand latent cache expected one view, got {source.shape[1]}"
+                f"Remove-hand latent cache camera_views must be 'base_0', got "
+                f"{cache_attrs.get('camera_views')!r} at {cache_path}"
             )
 
-        frame = np.asarray(source[:], dtype=np.float32)
-        token_mode = infer_token_mode_from_attrs_and_shape(
-            attrs, tuple(int(x) for x in frame.shape)
-        )
-        if token_mode != self.latent_token_mode:
+        frame_src = rh_root["data"]["frame_image_backbone_feat"]
+        expect_t = int(self.episode_ends_remove_hand[-1])
+        if int(frame_src.shape[0]) != expect_t:
             raise ValueError(
-                f"remove-hand token_mode={token_mode} != main token_mode={self.latent_token_mode}"
+                "remove-hand latent T mismatch: "
+                f"cache={frame_src.shape[0]}, episode_ends_remove_hand[-1]={expect_t}"
             )
+        if int(frame_src.shape[1]) != 1:
+            raise ValueError(
+                f"remove-hand latent expected 1 view, got V={frame_src.shape[1]} at {cache_path}"
+            )
+
+        frame = np.asarray(frame_src[:], dtype=np.float32)
+        try:
+            token_mode = infer_token_mode_from_attrs_and_shape(
+                cache_attrs, tuple(int(x) for x in frame.shape)
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"Remove-hand latent cache unsupported shape {tuple(frame.shape)}: {exc}"
+            ) from exc
+
+        if self.latent_token_mode is not None and token_mode != self.latent_token_mode:
+            raise ValueError(
+                "remove-hand latent token_mode mismatch with main cache: "
+                f"rh={token_mode!r}, main={self.latent_token_mode!r}. Rebuild both with same "
+                "precompute.token_mode."
+            )
+
         if token_mode == "cls":
             if frame.ndim == 4 and int(frame.shape[2]) == 1:
                 frame = frame[:, :, 0, :]
+            # Accept (T,1,D) → squeeze view for storage as (T,D) for easier replace,
+            # or keep (T,1,D). Prefer (T, D) after squeeze view dim.
             if frame.ndim == 3 and int(frame.shape[1]) == 1:
                 frame = frame[:, 0, :]
             if frame.ndim != 2:
                 raise ValueError(
-                    f"remove-hand CLS cache expected (T,D), got {tuple(frame.shape)}"
+                    f"CLS remove-hand latent expected (T,D) after squeeze, got {tuple(frame.shape)}"
                 )
-        elif frame.ndim != 4:
-            raise ValueError(
-                f"remove-hand all-token cache expected (T,1,N,D), got {tuple(frame.shape)}"
-            )
+        else:
+            if frame.ndim != 4:
+                raise ValueError(
+                    f"all-token remove-hand latent expected (T,1,257,D), got {tuple(frame.shape)}"
+                )
+
         self.cached_frame_image_backbone_feat_remove_hand = np.ascontiguousarray(frame)
+        frame_gb = frame.nbytes / (1024**3)
         print(
             f"[ZarrDataset] remove-hand latent cache loaded: {cache_path}, "
-            f"shape={tuple(frame.shape)}, token_mode={token_mode}"
+            f"shape={tuple(frame.shape)}, token_mode={token_mode}, size={frame_gb:.3f} GB"
         )
 
     def _gather_frame_latent(self, indices) -> np.ndarray:
@@ -658,50 +893,18 @@ class ZarrDataset(Dataset):
         idx = np.asarray(indices, dtype=np.int64)
         return self.cached_frame_image_backbone_feat[idx]
 
-    def _gather_remove_hand_frame_latent(self, compact_indices) -> np.ndarray:
+    def _gather_remove_hand_frame_latent(self, compact_indices: np.ndarray) -> np.ndarray:
         if self.cached_frame_image_backbone_feat_remove_hand is None:
-            raise RuntimeError("remove-hand frame latent cache is not loaded")
-        indices = np.asarray(compact_indices, dtype=np.int64)
-        return self.cached_frame_image_backbone_feat_remove_hand[indices]
-
-    def _replace_base_latent(
-        self,
-        feature: np.ndarray,
-        main_indices: np.ndarray,
-        ep_idx: int,
-    ) -> np.ndarray:
-        base_view = int(self.camera_views.index("base_0"))
-        compact = self._compact_indices(main_indices, ep_idx)
-        remove = self._gather_remove_hand_frame_latent(compact)
-        output = np.array(feature, copy=True)
-        if self.latent_token_mode == "cls":
-            if remove.ndim != 2 or remove.shape != (
-                feature.shape[0],
-                feature.shape[-1],
-            ):
-                raise ValueError(
-                    f"remove-hand CLS shape {remove.shape} incompatible with {feature.shape}"
-                )
-            output[:, base_view, :] = remove
-            return output
-        if remove.ndim == 4 and int(remove.shape[1]) == 1:
-            remove = remove[:, 0]
-        if remove.ndim != 3 or remove.shape != (
-            feature.shape[0],
-            feature.shape[2],
-            feature.shape[3],
-        ):
-            raise ValueError(
-                f"remove-hand token shape {remove.shape} incompatible with {feature.shape}"
+            raise RuntimeError(
+                "remove-hand frame latent cache is not loaded; run ./scripts/precompute.sh"
             )
-        output[:, base_view, :, :] = remove
-        return output
+        idx = np.asarray(compact_indices, dtype=np.int64)
+        return self.cached_frame_image_backbone_feat_remove_hand[idx]
 
     def get_camera_latent(self, idx: int) -> np.ndarray:
         _anchor_t, _ep_end, ep_idx, base_mode = self._window_fields(idx)
         i0, i1 = self.image_range(idx)
-        indices = np.arange(i0, i1, dtype=np.int64)
-        feat = self._gather_frame_latent(indices)
+        feat = self._gather_frame_latent(np.arange(i0, i1, dtype=np.int64))
         if feat.ndim == 2:
             feat = feat[None, ...]
         if feat.shape[0] != self.n_image_steps:
@@ -712,16 +915,38 @@ class ZarrDataset(Dataset):
             raise ValueError(
                 f"camera latent view mismatch: {feat.shape[1]} != {self.n_image_views}"
             )
-        if base_mode == BASE_MODE_REMOVE:
-            feat = self._replace_base_latent(feat, indices, ep_idx)
-        return np.ascontiguousarray(feat)
 
-    def get_memory_camera_latent(
-        self,
-        anchor_t: int,
-        ep_idx: int,
-        base_mode: str = BASE_MODE_ORIGINAL,
-    ) -> np.ndarray:
+        if base_mode == BASE_MODE_REMOVE:
+            if "base_0" not in self.camera_views:
+                raise RuntimeError("remove latent requires base_0 in camera_views")
+            base_view_i = int(self.camera_views.index("base_0"))
+            compact = self._compact_indices_for_range(i0, i1, ep_idx)
+            rh = self._gather_remove_hand_frame_latent(compact)
+            feat = np.array(feat, copy=True)
+            if self.latent_token_mode == "cls":
+                # main (T,V,D); rh (T,D)
+                if rh.ndim != 2:
+                    raise ValueError(f"expected RH CLS (T,D), got {rh.shape}")
+                if rh.shape[0] != feat.shape[0] or rh.shape[-1] != feat.shape[-1]:
+                    raise ValueError(
+                        f"RH CLS shape {rh.shape} incompatible with main {feat.shape}"
+                    )
+                feat[:, base_view_i, :] = rh
+            else:
+                # main (T,V,N,D); rh (T,1,N,D) or (T,N,D)
+                if rh.ndim == 4 and int(rh.shape[1]) == 1:
+                    rh = rh[:, 0]
+                if rh.ndim != 3:
+                    raise ValueError(f"expected RH all-tokens (T,N,D), got {rh.shape}")
+                if rh.shape[0] != feat.shape[0] or rh.shape[1:] != feat.shape[2:]:
+                    raise ValueError(
+                        f"RH all-token shape {rh.shape} incompatible with main {feat.shape}"
+                    )
+                feat[:, base_view_i, :, :] = rh
+
+        return feat
+
+    def get_memory_camera_latent(self, anchor_t: int, ep_idx: int) -> np.ndarray:
         indices = self.memory_visual_indices(anchor_t, ep_idx)
         feat = self._gather_frame_latent(indices)
         if feat.shape[0] != len(self.memory_visual_offsets):
@@ -732,29 +957,26 @@ class ZarrDataset(Dataset):
             raise ValueError(
                 f"memory camera latent view mismatch: {feat.shape[1]} != {self.n_image_views}"
             )
-        if base_mode == BASE_MODE_REMOVE:
-            feat = self._replace_base_latent(feat, indices, ep_idx)
-        # Full-token cache is (T, V, 257, D); Temporal Memory consumes global CLS only.
-        # Take token 0 -> (T, V, D). CLS-only caches (T, V, D) pass through unchanged.
-        if feat.ndim == 4:
-            feat = feat[:, :, 0, :]
-        return np.ascontiguousarray(feat)
+        return feat
 
     def _precompute_normalized_actions(self) -> None:
         n = len(self.windows)
         if n == 0 or self.normalizer is None:
             self.cached_norm_action = None
             return
-        print(f"[ZarrDataset] precomputing normalized actions for {n} windows...")
+        batch_windows = self.normalizer_batch_windows
+        print(
+            f"[ZarrDataset] precomputing normalized actions for {n} windows "
+            f"(batch_windows={batch_windows})..."
+        )
         cached = np.empty((n, self.action_horizon, self.action_dim), dtype=np.float32)
-        for idx in range(n):
-            s0, s1 = self.state_range(idx)
-            a0, a1 = self.action_range(idx)
-            state_raw = self.get_state(s0, s1)
-            action_raw = self.get_action(a0, a1)
-            cached[idx] = self.normalizer.normalize_action_np(action_raw, state_raw)
-            if idx > 0 and idx % 10000 == 0:
-                print(f"[ZarrDataset]   normalized actions: {idx}/{n}")
+        for start in range(0, n, batch_windows):
+            stop = min(start + batch_windows, n)
+            indices = np.arange(start, stop, dtype=np.int64)
+            state_raw, action_raw = self.get_state_action_batch(indices)
+            cached[start:stop] = self.normalizer.normalize_action_np(action_raw, state_raw)
+            if stop == n or stop % 10000 < batch_windows:
+                print(f"[ZarrDataset]   normalized actions: {stop}/{n}")
         self.cached_norm_action = cached
         print(
             f"[ZarrDataset] normalized action cache: shape={cached.shape}, "
@@ -775,36 +997,65 @@ class ZarrDataset(Dataset):
                 f"shape={arr.shape}, dtype={arr.dtype}, size={arr_gb:.3f} GB"
             )
         print(f"[ZarrDataset] total RAM preload: {total_gb:.3f} GB")
+        if (
+            self.use_tactile
+            and self.tactile_condition_encoder_type != "precomputed"
+            and self.cached_tactile_deformation is None
+        ):
+            if self.tactile_key in self.ram_data:
+                tactile = self.ram_data[self.tactile_key]
+                print(
+                    "[ZarrDataset] raw tactile mode: RAM window reads "
+                    f"shape={tuple(tactile.shape)}, "
+                    f"size={tactile.nbytes / (1024**3):.3f} GiB"
+                )
+            else:
+                tactile = self.data_group[self.tactile_key]
+                logical_gb = (
+                    int(np.prod(tactile.shape)) * np.dtype(tactile.dtype).itemsize
+                    / (1024**3)
+                )
+                print(
+                    "[ZarrDataset] raw tactile mode: lazy Zarr window reads "
+                    f"shape={tuple(tactile.shape)}, "
+                    f"logical_size={logical_gb:.3f} GiB"
+                )
 
     def _build_windows(self) -> List[WindowTuple]:
         windows: List[WindowTuple] = []
-        cond_len = max(self.window_size, self.n_image_steps)
+        tactile_cond_len = (
+            self.tactile_obs_steps
+            if self.use_tactile
+            and self.tactile_condition_encoder_type != "precomputed"
+            else 1
+        )
+        cond_len = max(self.window_size, self.n_image_steps, tactile_cond_len)
 
         for ep_idx, (ep_start, ep_end) in enumerate(zip(self.episode_starts, self.episode_ends)):
             ep_start = int(ep_start)
             ep_end = int(ep_end)
             first_t = ep_start + cond_len - 1
             last_t = ep_end - self.action_horizon
+            if self.predict_tactile:
+                last_t -= self.tactile_target_offset
             if last_t < first_t:
                 continue
-            has_remove = bool(
+            has_rh = bool(
                 self.mix_base_remove_hand
                 and self.ep_has_rh is not None
                 and self.ep_has_rh[ep_idx]
             )
             for t in range(first_t, last_t + 1, self.stride):
                 windows.append((t, ep_end, ep_idx, BASE_MODE_ORIGINAL))
-                if has_remove:
+                if has_rh:
                     windows.append((t, ep_end, ep_idx, BASE_MODE_REMOVE))
 
         return windows
 
     def _build_memory_visual_offsets(self) -> np.ndarray:
-        start = (
-            -self.memory_visual_recent_frame
-            - self.memory_sample_stride * (self.memory_visual_history_length - 1)
-        )
-        stop = -self.memory_visual_recent_frame + 1
+        n_tokens = max(1, int(np.ceil(self.memory_history_frames / self.memory_sample_stride)))
+        start = -self.memory_recent_frame - self.memory_sample_stride * (n_tokens - 1)
+        stop = -self.memory_recent_frame + 1
         return np.arange(start, stop, self.memory_sample_stride, dtype=np.int64)
 
     def _clamp_memory_indices(self, indices: np.ndarray, ep_idx: int) -> np.ndarray:
@@ -821,16 +1072,20 @@ class ZarrDataset(Dataset):
         return self._clamp_memory_indices(raw, ep_idx)
 
     def memory_visual_valid(self, anchor_t: int, ep_idx: int) -> np.ndarray:
-        # Out-of-episode visual indices are clamped to the first episode frame.
-        # Those repeated first-frame tokens intentionally participate in attention.
-        return np.ones(self.memory_visual_history_length, dtype=np.bool_)
+        raw = int(anchor_t) + self.memory_visual_offsets
+        return self._memory_index_valid(raw, ep_idx)
 
     def memory_state_indices(self, anchor_t: int, ep_idx: int) -> np.ndarray:
-        # State and visual features must come from the exact same episode frames.
-        return self.memory_visual_indices(anchor_t, ep_idx)
+        end = int(anchor_t) - self.memory_recent_frame + 1
+        start = end - self.memory_history_frames
+        raw = np.arange(start, end, dtype=np.int64)
+        return self._clamp_memory_indices(raw, ep_idx)
 
     def memory_state_valid(self, anchor_t: int, ep_idx: int) -> np.ndarray:
-        return self.memory_visual_valid(anchor_t, ep_idx)
+        end = int(anchor_t) - self.memory_recent_frame + 1
+        start = end - self.memory_history_frames
+        raw = np.arange(start, end, dtype=np.int64)
+        return self._memory_index_valid(raw, ep_idx)
 
     def _obs_window_indices(self, anchor_t: int, ep_idx: int) -> Tuple[int, int]:
         obs_start = int(anchor_t - self.window_size + 1)
@@ -857,6 +1112,19 @@ class ZarrDataset(Dataset):
                 f"Image history start out of episode bounds: image_start={image_start}, ep_start={ep_start}"
             )
         return image_start, image_end
+
+    def tactile_range(self, idx: int) -> Tuple[int, int]:
+        anchor_t, _, ep_idx, _ = self._window_fields(idx)
+        tactile_start = int(anchor_t - self.tactile_obs_steps + 1)
+        tactile_end = int(anchor_t + 1)
+        ep_start, ep_end = self.episode_bounds(ep_idx)
+        if tactile_start < ep_start or tactile_end > ep_end:
+            raise ValueError(
+                "Tactile history out of episode bounds: "
+                f"window=({tactile_start},{tactile_end}), "
+                f"ep_bounds=({ep_start},{ep_end})"
+            )
+        return tactile_start, tactile_end
 
     def action_range(self, idx: int) -> Tuple[int, int]:
         anchor_t, episode_end, _, _ = self._window_fields(idx)
@@ -887,6 +1155,37 @@ class ZarrDataset(Dataset):
     def get_action(self, t0: int, t1: int) -> np.ndarray:
         return self._slice_robot(self._read_array(self.action_key, slice(t0, t1), dtype=np.float32))
 
+    def get_state_action_batch(
+        self,
+        window_indices: Sequence[int] | np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Gather state/action windows with one vectorized RAM lookup."""
+        indices = np.asarray(window_indices, dtype=np.int64)
+        if indices.ndim != 1 or len(indices) == 0:
+            raise ValueError(f"window_indices must be a non-empty 1-D array, got {indices.shape}")
+        if int(indices.min()) < 0 or int(indices.max()) >= len(self.windows):
+            raise IndexError(
+                f"window index out of range: min={indices.min()}, max={indices.max()}, "
+                f"len={len(self.windows)}"
+            )
+
+        anchors = np.fromiter(
+            (int(self.windows[int(idx)][0]) for idx in indices),
+            dtype=np.int64,
+            count=len(indices),
+        )
+        state_offsets = np.arange(-self.window_size + 1, 1, dtype=np.int64)
+        action_offsets = np.arange(self.action_horizon, dtype=np.int64)
+        state_indices = anchors[:, None] + state_offsets[None, :]
+        action_indices = anchors[:, None] + action_offsets[None, :]
+
+        state = self._slice_robot(self.ram_data[self.state_key][state_indices])
+        action = self._slice_robot(self.ram_data[self.action_key][action_indices])
+        return (
+            np.asarray(state, dtype=np.float32),
+            np.asarray(action, dtype=np.float32),
+        )
+
     def get_camera(
         self,
         t0: int,
@@ -896,21 +1195,23 @@ class ZarrDataset(Dataset):
         ep_idx: int | None = None,
     ) -> np.ndarray:
         camera = self._read_array(self.camera_key, slice(t0, t1))
-        if base_mode == BASE_MODE_REMOVE:
-            if not self.mix_base_remove_hand or ep_idx is None:
-                raise RuntimeError(
-                    "base_mode=remove requires mix_base_remove_hand and ep_idx"
-                )
-            main_indices = np.arange(t0, t1, dtype=np.int64)
-            compact = self._compact_indices(main_indices, ep_idx)
+        mode = str(base_mode)
+        if mode == BASE_MODE_REMOVE:
+            if not self.mix_base_remove_hand:
+                raise RuntimeError("base_mode=remove requires mix_base_remove_hand enabled")
+            if ep_idx is None:
+                raise ValueError("ep_idx is required when base_mode=remove")
+            if CAMERA_BASE_REMOVE_HAND_KEY not in self.ram_data:
+                raise RuntimeError(f"{CAMERA_BASE_REMOVE_HAND_KEY} not preloaded")
+            compact = self._compact_indices_for_range(t0, t1, int(ep_idx))
             remove = np.asarray(self.ram_data[CAMERA_BASE_REMOVE_HAND_KEY][compact])
-            if remove.shape != (*camera.shape[:-1], 3):
+            if remove.shape != (camera.shape[0], camera.shape[1], camera.shape[2], 3):
                 raise ValueError(
-                    f"remove-hand image shape {remove.shape} incompatible with {camera.shape}"
+                    f"remove-hand shape {remove.shape} incompatible with camera {camera.shape}"
                 )
             camera = np.array(camera, copy=True)
             camera[..., 0:3] = remove
-        elif base_mode != BASE_MODE_ORIGINAL:
+        elif mode != BASE_MODE_ORIGINAL:
             raise ValueError(f"unknown base_mode={base_mode!r}")
         return self._select_camera_channels(camera)
 
@@ -935,7 +1236,17 @@ class ZarrDataset(Dataset):
 
     def get_tactile(self, t0: int, t1: int) -> np.ndarray:
         """Deformation map (T, H, W, 12): 4 sensors x (dx, dy, dz)."""
+        if self.cached_tactile_deformation is not None:
+            return np.asarray(
+                self.cached_tactile_deformation[int(t0) : int(t1)],
+                dtype=np.float32,
+            )
         return extract_tactile_deformation(self.get_tactile_raw(t0, t1))
+
+    def get_tactile_latent(self, t0: int, t1: int) -> np.ndarray:
+        if not self.predict_tactile or self.cached_tactile_latent is None:
+            raise RuntimeError("normalized tactile latent cache is not available")
+        return np.asarray(self.cached_tactile_latent[t0:t1], dtype=np.float32)
 
     @property
     def num_episodes(self) -> int:
@@ -1033,14 +1344,11 @@ class ZarrDataset(Dataset):
             latent = self.get_camera_latent(idx)
             obs["image_backbone_feat"] = torch.from_numpy(latent.astype(np.float32))
         else:
-            camera = self.get_camera(
-                i0, i1, base_mode=base_mode, ep_idx=ep_idx
-            )
+            camera = self.get_camera(i0, i1, base_mode=base_mode, ep_idx=ep_idx)
             if camera.shape[0] != self.n_image_steps:
                 raise ValueError(
                     f"image length mismatch: {camera.shape[0]} != {self.n_image_steps}"
                 )
-            camera = self._maybe_augment_camera(camera)
             image = self._process_image(camera)
             if image.shape[0] != self.n_image_steps or image.shape[1] != self.n_image_views:
                 raise ValueError(
@@ -1059,9 +1367,7 @@ class ZarrDataset(Dataset):
             memory_state = self.normalizer.normalize_state_np(memory_state_raw)
             obs["memory_state"] = torch.from_numpy(memory_state.astype(np.float32))
             obs["memory_image_backbone_feat"] = torch.from_numpy(
-                self.get_memory_camera_latent(
-                    anchor_t, ep_idx, base_mode=base_mode
-                ).astype(np.float32)
+                self.get_memory_camera_latent(anchor_t, ep_idx).astype(np.float32)
             )
             obs["memory_visual_offsets"] = torch.from_numpy(
                 self.memory_visual_offsets.astype(np.int64, copy=False)
@@ -1073,11 +1379,39 @@ class ZarrDataset(Dataset):
                 self.memory_state_valid(anchor_t, ep_idx)
             )
 
-        if self.use_tactile:
-            tactile = self.normalizer.normalize_tactile_np(self.get_tactile(s0, s1))
+        tactile_target = None
+        if self.predict_tactile:
+            if self.tactile_condition_encoder_type == "precomputed":
+                current_latent = self.get_tactile_latent(anchor_t, anchor_t + 1)
+                obs["tactile_latent"] = torch.from_numpy(current_latent[0])
+            else:
+                t0, t1 = self.tactile_range(idx)
+                tactile = self.normalizer.normalize_tactile_np(
+                    self.get_tactile(t0, t1)
+                )
+                if tactile.shape[0] != self.tactile_obs_steps:
+                    raise ValueError(
+                        f"tactile observation length {tactile.shape[0]} != "
+                        f"{self.tactile_obs_steps}"
+                    )
+                obs["tactile"] = torch.from_numpy(tactile.astype(np.float32))
+            target_start = int(anchor_t + self.tactile_target_offset)
+            target_end = int(target_start + self.action_horizon)
+            tactile_target = self.get_tactile_latent(target_start, target_end)
+            if tactile_target.shape != (
+                self.action_horizon,
+                self.cached_tactile_latent.shape[1],
+            ):
+                raise ValueError(
+                    f"tactile target shape {tactile_target.shape} != "
+                    f"({self.action_horizon},{self.cached_tactile_latent.shape[1]})"
+                )
+        elif self.use_tactile:
+            t0, t1 = self.tactile_range(idx)
+            tactile = self.normalizer.normalize_tactile_np(self.get_tactile(t0, t1))
             obs["tactile"] = torch.from_numpy(tactile.astype(np.float32))
 
-        return {
+        sample = {
             "obs": obs,
             "action": torch.from_numpy(action.astype(np.float32)),
             "meta": {
@@ -1087,6 +1421,11 @@ class ZarrDataset(Dataset):
                 "base_mode": str(base_mode),
             },
         }
+        if tactile_target is not None:
+            sample["tactile_target_latent"] = torch.from_numpy(
+                tactile_target.astype(np.float32, copy=False)
+            )
+        return sample
 
 
 def build_dataloader(
@@ -1099,22 +1438,20 @@ def build_dataloader(
     pin_memory: bool = True,
     persistent_workers: bool | None = None,
     prefetch_factor: int = 2,
-    sampler: Any = None,
+    sampler=None,
 ) -> DataLoader:
-    """Standard DataLoader for ZarrDataset; default collate handles nested obs dict.
-
-    When ``sampler`` is provided (e.g. a ``DistributedSampler`` for DDP), it
-    owns shuffling, so ``shuffle`` is forced off to satisfy DataLoader.
-    """
+    """Standard DataLoader for ZarrDataset; default collate handles nested obs dict."""
     kwargs: Dict[str, Any] = {
         "batch_size": batch_size,
-        "shuffle": shuffle if sampler is None else False,
         "num_workers": num_workers,
         "drop_last": drop_last,
         "pin_memory": pin_memory,
     }
     if sampler is not None:
         kwargs["sampler"] = sampler
+        kwargs["shuffle"] = False
+    else:
+        kwargs["shuffle"] = shuffle
     if num_workers > 0:
         kwargs["persistent_workers"] = (
             persistent_workers if persistent_workers is not None else True

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
 
 import torch
@@ -10,7 +11,15 @@ from models.diffusion.conditional_unet1d import ConditionalUnet1D
 from models.diffusion.mask_generator import LowdimMaskGenerator
 
 from .action_dit import ActionDiT
-from .condition_encoder import ConditionEncoder
+from .condition_encoder import (
+    ConditionEncoder,
+    resolve_tactile_condition_encoder_type,
+)
+from .encoders.tactile_autoencoder import (
+    TactileAutoencoder,
+    build_tactile_autoencoder,
+    load_tactile_autoencoder_checkpoint,
+)
 from .memory import build_memory_encoder
 
 
@@ -36,10 +45,22 @@ class FlowMatchingPolicy(nn.Module):
         local_pool_size: int = 2,
         local_attn_heads: int = 4,
         local_attn_dropout: float = 0.0,
+        tactile_encoder_type: str = "temporal_cnn",
+        tactile_condition_encoder_type: str | None = None,
         tactile_feat_dim: int = 256,
         tactile_temporal_pool: str = "conv1d",
+        tactile_num_sensors: int = 4,
+        tactile_channels_per_sensor: int = 3,
+        tactile_token_dim: int = 16,
+        predict_tactile: bool = False,
+        tactile_ae_checkpoint: str | None = None,
+        tactile_ae_model_config: Mapping[str, Any] | None = None,
+        action_loss_weight: float = 1.0,
+        tactile_loss_weight: float = 1.0,
         state_feat_dim: int = 256,
         state_pool: str = "flatten",
+        fusion_hidden_dim: int = 512,
+        dropout: float = 0.1,
         diffusion_step_embed_dim: int = 256,
         down_dims=(256, 512, 1024),
         kernel_size: int = 5,
@@ -78,6 +99,28 @@ class FlowMatchingPolicy(nn.Module):
         self.cond_steps = int(cond_steps)
         self.cond_dim = int(cond_dim)
         self.use_tactile = bool(use_tactile)
+        self.predict_tactile = bool(predict_tactile)
+        if self.predict_tactile and not self.use_tactile:
+            raise ValueError("predict_tactile=true requires use_tactile=true")
+        self.tactile_latent_dim = (
+            int(tactile_num_sensors) * int(tactile_token_dim)
+        )
+        self.tactile_condition_encoder_type = (
+            resolve_tactile_condition_encoder_type(
+                predict_tactile=self.predict_tactile,
+                tactile_encoder_type=tactile_encoder_type,
+                tactile_condition_encoder_type=tactile_condition_encoder_type,
+            )
+        )
+        self.trajectory_dim = self.action_dim + (
+            self.tactile_latent_dim if self.predict_tactile else 0
+        )
+        self.action_loss_weight = float(action_loss_weight)
+        self.tactile_loss_weight = float(tactile_loss_weight)
+        if self.action_loss_weight <= 0:
+            raise ValueError("action_loss_weight must be positive")
+        if self.predict_tactile and self.tactile_loss_weight <= 0:
+            raise ValueError("tactile_loss_weight must be positive")
         self.action_horizon = int(action_horizon)
         self.n_action_steps = int(n_action_steps)
         self.num_inference_steps = int(num_inference_steps)
@@ -120,6 +163,52 @@ class FlowMatchingPolicy(nn.Module):
         if self.solver not in {"euler", "heun"}:
             raise ValueError(f"unsupported solver={solver!r}")
 
+        self.tactile_autoencoder: TactileAutoencoder | None = None
+        if self.predict_tactile:
+            checkpoint_exists = bool(
+                tactile_ae_checkpoint
+                and Path(tactile_ae_checkpoint).expanduser().is_file()
+            )
+            if checkpoint_exists:
+                codec, _ = load_tactile_autoencoder_checkpoint(
+                    str(tactile_ae_checkpoint)
+                )
+            elif isinstance(tactile_ae_model_config, Mapping):
+                codec = build_tactile_autoencoder(tactile_ae_model_config)
+            else:
+                raise ValueError(
+                    "predict_tactile=true requires an existing "
+                    "models.fm.tactile_ae_checkpoint during Stage 2 training; "
+                    "a saved Stage 2 config may instead provide "
+                    "tactile_ae_model_config for self-contained loading"
+                )
+            if codec.num_sensors != int(tactile_num_sensors):
+                raise ValueError(
+                    f"AE num_sensors={codec.num_sensors} != "
+                    f"config={tactile_num_sensors}"
+                )
+            if codec.token_dim != int(tactile_token_dim):
+                raise ValueError(
+                    f"AE token_dim={codec.token_dim} != config={tactile_token_dim}"
+                )
+            if codec.channels_per_sensor != int(tactile_channels_per_sensor):
+                raise ValueError(
+                    "AE channels_per_sensor="
+                    f"{codec.channels_per_sensor} != "
+                    f"config={tactile_channels_per_sensor}"
+                )
+            codec.requires_grad_(False)
+            codec.eval()
+            self.tactile_autoencoder = codec
+            self.register_buffer(
+                "tactile_latent_mean",
+                torch.zeros(self.tactile_latent_dim, dtype=torch.float32),
+            )
+            self.register_buffer(
+                "tactile_latent_std",
+                torch.ones(self.tactile_latent_dim, dtype=torch.float32),
+            )
+
         self.condition_encoder = ConditionEncoder(
             state_dim=self.state_dim,
             cond_dim=self.cond_dim,
@@ -136,10 +225,16 @@ class FlowMatchingPolicy(nn.Module):
             local_pool_size=local_pool_size,
             local_attn_heads=local_attn_heads,
             local_attn_dropout=local_attn_dropout,
+            tactile_encoder_type=self.tactile_condition_encoder_type,
             tactile_feat_dim=tactile_feat_dim,
             tactile_temporal_pool=tactile_temporal_pool,
+            tactile_num_sensors=tactile_num_sensors,
+            tactile_channels_per_sensor=tactile_channels_per_sensor,
+            tactile_token_dim=tactile_token_dim,
             state_feat_dim=state_feat_dim,
             state_pool=state_pool,
+            fusion_hidden_dim=fusion_hidden_dim,
+            dropout=dropout,
         )
 
         self.memory_encoder = None
@@ -182,7 +277,7 @@ class FlowMatchingPolicy(nn.Module):
 
         if self.velocity_model == "unet":
             self.model = ConditionalUnet1D(
-                input_dim=self.action_dim,
+                input_dim=self.trajectory_dim,
                 local_cond_dim=None,
                 global_cond_dim=self.global_cond_dim,
                 diffusion_step_embed_dim=diffusion_step_embed_dim,
@@ -193,7 +288,7 @@ class FlowMatchingPolicy(nn.Module):
             )
         elif self.velocity_model == "dit":
             self.model = ActionDiT(
-                input_dim=self.action_dim,
+                input_dim=self.trajectory_dim,
                 action_horizon=self.action_horizon,
                 global_cond_dim=self.global_cond_dim,
                 diffusion_step_embed_dim=diffusion_step_embed_dim,
@@ -217,7 +312,7 @@ class FlowMatchingPolicy(nn.Module):
             raise ValueError(f"unsupported velocity_model={velocity_model!r}")
 
         self.mask_generator = LowdimMaskGenerator(
-            action_dim=self.action_dim,
+            action_dim=self.trajectory_dim,
             obs_dim=0,
             max_n_obs_steps=1,
             fix_obs_steps=True,
@@ -322,16 +417,105 @@ class FlowMatchingPolicy(nn.Module):
         pad = x[:, -1:].expand(-1, target_t - t, -1)
         return torch.cat([x, pad], dim=1)
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.tactile_autoencoder is not None:
+            self.tactile_autoencoder.eval()
+        return self
+
+    def set_tactile_latent_stats(
+        self,
+        mean: torch.Tensor | Sequence[float],
+        std: torch.Tensor | Sequence[float],
+    ) -> None:
+        if not self.predict_tactile:
+            raise RuntimeError("tactile latent stats require predict_tactile=true")
+        mean_tensor = torch.as_tensor(
+            mean,
+            dtype=self.tactile_latent_mean.dtype,
+            device=self.tactile_latent_mean.device,
+        )
+        std_tensor = torch.as_tensor(
+            std,
+            dtype=self.tactile_latent_std.dtype,
+            device=self.tactile_latent_std.device,
+        )
+        expected = (self.tactile_latent_dim,)
+        if tuple(mean_tensor.shape) != expected or tuple(std_tensor.shape) != expected:
+            raise ValueError(
+                f"latent stats must both have shape {expected}, got "
+                f"{tuple(mean_tensor.shape)} and {tuple(std_tensor.shape)}"
+            )
+        if torch.any(std_tensor <= 0):
+            raise ValueError("tactile latent std must be strictly positive")
+        self.tactile_latent_mean.copy_(mean_tensor)
+        self.tactile_latent_std.copy_(std_tensor)
+
+    def _normalize_tactile_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        return (latent - self.tactile_latent_mean.to(latent)) / (
+            self.tactile_latent_std.to(latent)
+        )
+
+    def _unnormalize_tactile_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        return latent * self.tactile_latent_std.to(latent) + (
+            self.tactile_latent_mean.to(latent)
+        )
+
+    def _current_tactile_latent(
+        self,
+        obs: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        cached = obs.get("tactile_latent")
+        if cached is not None:
+            if cached.ndim != 2 or cached.shape[-1] != self.tactile_latent_dim:
+                raise ValueError(
+                    f"expected obs.tactile_latent (B,{self.tactile_latent_dim}), "
+                    f"got {tuple(cached.shape)}"
+                )
+            return cached
+        tactile = obs.get("tactile")
+        if tactile is None:
+            raise KeyError(
+                "predict_tactile=true requires obs.tactile_latent or obs.tactile"
+            )
+        if self.tactile_autoencoder is None:
+            raise RuntimeError("tactile autoencoder is not configured")
+        with torch.no_grad():
+            raw_latent = self.tactile_autoencoder.encode_flattened(tactile)
+        return self._normalize_tactile_latent(raw_latent)
+
+    def decode_tactile_latent(
+        self,
+        normalized_latent: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.tactile_autoencoder is None:
+            raise RuntimeError("tactile autoencoder is not configured")
+        if normalized_latent.ndim not in {2, 3}:
+            raise ValueError(
+                "normalized tactile latent must be (B,64) or (B,T,64), "
+                f"got {tuple(normalized_latent.shape)}"
+            )
+        leading = normalized_latent.shape[:-1]
+        flat = normalized_latent.reshape(-1, self.tactile_latent_dim)
+        decoded = self.tactile_autoencoder.decode_flattened(
+            self._unnormalize_tactile_latent(flat)
+        )
+        return decoded.reshape(*leading, *decoded.shape[1:])
+
     def _build_obs_condition(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
         image = obs.get("image")
         image_backbone_feat = obs.get("image_backbone_feat")
         state = obs["state"]
         tactile = obs.get("tactile") if self.use_tactile else None
+        tactile_latent = None
+        if self.use_tactile and self.tactile_condition_encoder_type == "precomputed":
+            tactile_latent = self._current_tactile_latent(obs)
         return self.condition_encoder(
             state=state,
             image=image,
             image_backbone_feat=image_backbone_feat,
             tactile=tactile,
+            tactile_latent=tactile_latent,
         )
 
     def _build_memory(self, obs: Dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -418,15 +602,33 @@ class FlowMatchingPolicy(nn.Module):
                 f"action dim mismatch: got {actions.shape[-1]}, expected {self.action_dim}"
             )
 
+        target = actions
+        if self.predict_tactile:
+            tactile_target = batch.get("tactile_target_latent")
+            if tactile_target is None:
+                raise KeyError(
+                    "predict_tactile=true requires batch.tactile_target_latent"
+                )
+            tactile_target = self._pad_or_trim_time(
+                tactile_target,
+                self.action_horizon,
+            )
+            if tactile_target.shape[-1] != self.tactile_latent_dim:
+                raise ValueError(
+                    f"tactile target dim {tactile_target.shape[-1]} != "
+                    f"{self.tactile_latent_dim}"
+                )
+            target = torch.cat([actions, tactile_target], dim=-1)
+
         global_cond, condition_tokens = self._build_condition(obs)
 
-        condition_mask = self.mask_generator(actions.shape)
+        condition_mask = self.mask_generator(target.shape)
         loss_mask = ~condition_mask
 
-        x1 = actions
+        x1 = target
         x0 = torch.randn_like(x1)
-        bsz = actions.shape[0]
-        t = torch.rand(bsz, device=actions.device, dtype=actions.dtype)
+        bsz = target.shape[0]
+        t = torch.rand(bsz, device=target.device, dtype=target.dtype)
         t_broadcast = t.view(bsz, 1, 1)
         xt = (1.0 - t_broadcast) * x0 + t_broadcast * x1
         target_velocity = x1 - x0
@@ -438,13 +640,36 @@ class FlowMatchingPolicy(nn.Module):
             global_cond=global_cond,
             condition_tokens=condition_tokens,
         )
-        loss = F.mse_loss(pred_velocity, target_velocity, reduction="none")
-        loss = loss * loss_mask.to(loss.dtype)
-        loss = loss.reshape(loss.shape[0], -1).mean(dim=1).mean()
+        element_loss = F.mse_loss(
+            pred_velocity,
+            target_velocity,
+            reduction="none",
+        )
+        element_loss = element_loss * loss_mask.to(element_loss.dtype)
+        action_loss = element_loss[..., : self.action_dim]
+        action_loss = action_loss.reshape(action_loss.shape[0], -1).mean(dim=1).mean()
+        if not self.predict_tactile:
+            return {
+                "loss": action_loss,
+                "metrics": {"flow_matching_loss": action_loss.detach()},
+            }
 
+        tactile_loss = element_loss[..., self.action_dim :]
+        tactile_loss = tactile_loss.reshape(
+            tactile_loss.shape[0],
+            -1,
+        ).mean(dim=1).mean()
+        loss = (
+            self.action_loss_weight * action_loss
+            + self.tactile_loss_weight * tactile_loss
+        )
         return {
             "loss": loss,
-            "metrics": {"flow_matching_loss": loss.detach()},
+            "metrics": {
+                "flow_matching_loss": loss.detach(),
+                "action_flow_loss": action_loss.detach(),
+                "tactile_flow_loss": tactile_loss.detach(),
+            },
         }
 
     @torch.no_grad()
@@ -464,7 +689,7 @@ class FlowMatchingPolicy(nn.Module):
         trajectory = torch.randn(
             bsz,
             self.action_horizon,
-            self.action_dim,
+            self.trajectory_dim,
             device=device,
             dtype=dtype,
         )
@@ -501,16 +726,26 @@ class FlowMatchingPolicy(nn.Module):
         obs: Dict[str, torch.Tensor],
         num_inference_steps: int | None = None,
         solver: str | None = None,
+        decode_tactile: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        action_norm = self.conditional_sample(
+        joint_norm = self.conditional_sample(
             obs=obs,
             num_inference_steps=num_inference_steps,
             solver=solver,
         )
-        return {
+        action_norm = joint_norm[..., : self.action_dim]
+        result = {
             "action_normalized": action_norm[:, : self.n_action_steps],
             "action_pred_normalized": action_norm,
         }
+        if self.predict_tactile:
+            tactile_latent = joint_norm[..., self.action_dim :]
+            result["tactile_latent_pred_normalized"] = tactile_latent
+            if decode_tactile:
+                result["tactile_pred_normalized"] = self.decode_tactile_latent(
+                    tactile_latent
+                )
+        return result
 
     def forward(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         return self.compute_loss(batch)

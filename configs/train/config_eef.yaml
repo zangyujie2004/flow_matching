@@ -1,30 +1,36 @@
 seed: 42
 runtime:
   device: cuda
+  ddp:
+    backend: nccl
+    find_unused_parameters: true
+    timeout_s: 3600
 
 output:
-  root_dir: outputs/visual_test/huanggua_office
-  run_name: v3_small_local_pool_unet
+  root_dir: outputs/huanggua_office_0729_eef_tactile_history8_condition
+  run_name: huanggua_office_unet
 
 data:
-  root_dir: /mnt/oss_data/data/processed/huanggua_office/huanggua_office_0722_1746
+  root_dir: /mnt/workspace/lyc/data/huanggua_office/huanggua_office_0729_2248
   # window
   window_size: 8
   stride: 1
   n_image_steps: 1
-  action_horizon: 64
+  action_horizon: 128
   # robot
-  action_type: joint
+  action_type: eef
   action_representation: relative
   # tatile
-  use_tactile: false
+  use_tactile: true
+  tactile_obs_steps: 8
+  tactile_deformation_cache_path: /mnt/workspace/lyc/data/huanggua_office/huanggua_office_0729_2248/tactile_deformation_f32.npy
   # camera
+  mix_base_remove_hand: true
   camera_views: ['base_0', 'left_wrist_0', 'right_wrist_0']
   image_size: 224
   image_as_uint8: true
   use_camera_latent: true
   latent_cache_root_dir: ${data.root_dir}/latent_cache/{auto}
-  camera_augmentation: false
   # keys
   camera_key: camera
   tactile_key: tactile
@@ -34,14 +40,13 @@ data:
   norm:
     output_range: [-1, 1]
     max_windows: 100000
+    batch_windows: 1024
   # memory
   memory:
     enabled: false
-    history_frames: 128
-    sample_stride: 8
-    recent_frame: 0
-    visual_history_length: 128
-    visual_recent_frame: 0
+    history_frames: 64
+    sample_stride: 4
+    recent_frame: 4   # n=t-n
 
 models:
   fm:
@@ -49,20 +54,27 @@ models:
     # vision — DINOv2 (timm)
     n_image_views: 3
     image_encoder_name: dinov2_small
-    dino_model_name: vit_small_patch14_dinov2.lvd142m
+    dino_model_name: vit_small_patch14_dinov2.lvd142m  # vit_small_patch14_dinov2.lvd142m
     freeze_image_encoder: true
     image_pretrained: true
     image_feat_dim: 256
-    view_pool: local_pool  # global_concat | local_pool | local_attn
+    view_pool: global_concat  # global_concat | local_pool | local_attn
     local_pool_size: 2
     local_attn_heads: 4
     local_attn_dropout: 0.1
-    # tactile CNN
-    use_tactile: false
+    # tactile: 4 sensors x 16-D tokens from the latest frame -> 64-D
+    use_tactile: true
+    # false: tactile is global_cond only; true: jointly predict action+tactile latent
+    predict_tactile: false
+    tactile_encoder_type: temporal_cnn
+    tactile_condition_encoder_type: temporal_cnn
     tactile_feat_dim: 256
-    tactile_temporal_pool: conv1d   # mean | conv1d
+    tactile_temporal_pool: conv1d
+    tactile_num_sensors: 4
+    tactile_channels_per_sensor: 3
+    tactile_token_dim: 16
     state_feat_dim: 256
-    state_pool: flatten
+    state_pool: flatten           
     diffusion_step_embed_dim: 256
     velocity_model: unet  # unet | dit
     # unet config
@@ -77,7 +89,7 @@ models:
     dit_dropout: 0.1
     # common config
     num_inference_steps: 32
-    solver: euler
+    solver: euler 
   memory:
     method: fusion # fusion | multi-scale
     injection: concat_global_cond # cross_attn | concat_global_cond
@@ -96,7 +108,7 @@ models:
     state_mem_dim: 64
 
 train:
-  batch_size: 1024
+  batch_size: 256
   num_workers: 32
   drop_last: true
   pin_memory: true
@@ -108,9 +120,9 @@ train:
   open_loop_test_every: 300
   open_loop_test_max_batches: 16
   plot_samples: 64
-  plot_dims: auto
-  max_train_batches: null
-  resume_path: null
+  plot_dims: auto  
+  max_train_batches: null   
+  resume_path: null        
   optimizer:
     lr: 3.0e-4
     min_lr: 1.0e-6
@@ -124,7 +136,8 @@ precompute:
   device: cuda
   overwrite: false
   output_path: null
+  token_mode: cls  # cls | all
 
 deploy:
-  action_process: abs_qpos # abs_qpos
+  action_process: abs_eef # abs_qpos
   action_hz: 30.0

@@ -7,7 +7,7 @@ runtime:
     timeout_s: 3600
 
 output:
-  root_dir: outputs/peel_cucumber_fm2
+  root_dir: outputs/peel_cucumber_fm3
   run_name: peel_cucumber
 
 data:
@@ -24,6 +24,8 @@ data:
   # tatile
   use_tactile: true
   tactile_obs_steps: 8
+  tactile_target_offset: 1
+  tactile_latent_cache_path: ${data.root_dir}/tactile_latent_4x16.zarr
   tactile_deformation_cache_path: ${data.root_dir}/tactile_deformation_f32.npy
   # Optional compact mmap cache. If absent, use the raw-tactile mode below.
   tactile_deformation_cache_required: false
@@ -70,7 +72,8 @@ models:
     # tactile: eight raw deformation frames -> legacy TemporalCNN -> 256-D
     use_tactile: true
     # false: tactile is global_cond only; true: jointly predict action+tactile latent
-    predict_tactile: false
+    predict_tactile: true
+    tactile_ae_checkpoint: /mnt/workspace/lyc/flow_matching/outputs/huanggua_office_0729_tactile_ae/tactile_residual_4x16/checkpoints/best.pt
     tactile_encoder_type: temporal_cnn
     tactile_condition_encoder_type: temporal_cnn
     tactile_feat_dim: 256
@@ -78,6 +81,8 @@ models:
     tactile_num_sensors: 4
     tactile_channels_per_sensor: 3
     tactile_token_dim: 16
+    action_loss_weight: 1.0
+    tactile_loss_weight: 1.0
     state_feat_dim: 256
     state_pool: flatten           
     diffusion_step_embed_dim: 256

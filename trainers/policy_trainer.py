@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import os
 from collections import defaultdict
 from contextlib import nullcontext
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Mapping, Optional
 
 import torch
 import yaml
@@ -17,7 +16,11 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from datasets import ZarrDataset, build_dataloader
-from models.fm import FlowMatchingPolicy, build_flow_policy
+from models.fm import (
+    FlowMatchingPolicy,
+    build_flow_policy,
+    resolve_tactile_condition_encoder_type,
+)
 from tools.normalizer import DatasetNormalizer
 from trainers.eval_open_loop import evaluate_open_loop
 from utils.distributed import DistInfo, barrier, cleanup, init_distributed, is_main_process, reduce_mean
@@ -25,11 +28,77 @@ from utils.tensor import move_to_device
 from utils.train_utils import cfg_get, detach_scalar_dict, log_hparams_to_tensorboard, set_seed, sync_fm_action_horizon_from_data
 
 
-def get_autocast_context(device: torch.device, use_amp: bool):
-    enabled = bool(use_amp and device.type == "cuda")
-    if not enabled:
+_MIXED_PRECISION_ALIASES = {
+    "off": "off",
+    "none": "off",
+    "false": "off",
+    "fp32": "off",
+    "float32": "off",
+    "fp16": "fp16",
+    "float16": "fp16",
+    "half": "fp16",
+    "bf16": "bf16",
+    "bfloat16": "bf16",
+}
+
+
+def normalize_mixed_precision(value: object) -> str:
+    """Normalize the public AMP option while keeping use_amp compatibility."""
+    if isinstance(value, bool):
+        return "fp16" if value else "off"
+    key = str(value if value is not None else "off").strip().lower()
+    try:
+        return _MIXED_PRECISION_ALIASES[key]
+    except KeyError as exc:
+        choices = "off, fp16, bf16"
+        raise ValueError(
+            f"unsupported mixed precision mode {value!r}; choose one of: {choices}"
+        ) from exc
+
+
+def resolve_mixed_precision(train_cfg: Mapping[str, Any], device: torch.device) -> str:
+    """Resolve AMP enablement and dtype while preserving the use_amp switch."""
+    raw_mode = train_cfg.get("mixed_precision")
+    if raw_mode is None:
+        use_amp = bool(train_cfg.get("use_amp", False))
+        raw_mode = train_cfg.get("amp_dtype", "fp16") if use_amp else "off"
+    mode = normalize_mixed_precision(raw_mode)
+    if mode == "off":
+        return mode
+    if device.type != "cuda":
+        raise RuntimeError(f"mixed_precision={mode} requires a CUDA device, got {device}")
+    if mode == "bf16":
+        is_supported = getattr(torch.cuda, "is_bf16_supported", lambda: False)
+        if not is_supported():
+            raise RuntimeError(
+                "mixed_precision=bf16 was requested, but this GPU/PyTorch build "
+                "does not report BF16 support; use fp16 or off."
+            )
+    return mode
+
+
+def get_autocast_context(device: torch.device, mixed_precision: str | bool = "off"):
+    mode = normalize_mixed_precision(mixed_precision)
+    if mode == "off":
         return nullcontext()
-    return torch.autocast(device_type="cuda", dtype=torch.float16)
+    if device.type != "cuda":
+        raise RuntimeError(f"mixed_precision={mode} requires CUDA, got {device}")
+    dtype = torch.bfloat16 if mode == "bf16" else torch.float16
+    return torch.autocast(device_type="cuda", dtype=dtype)
+
+
+def build_grad_scaler(mixed_precision: str | bool):
+    """FP16 needs loss scaling; BF16's exponent range does not."""
+    mode = normalize_mixed_precision(mixed_precision)
+    if mode != "fp16":
+        return None
+    grad_scaler = getattr(getattr(torch, "amp", None), "GradScaler", None)
+    if grad_scaler is not None:
+        try:
+            return grad_scaler("cuda", enabled=True)
+        except TypeError:
+            pass
+    return torch.cuda.amp.GradScaler(enabled=True)
 
 
 def build_dataset_and_loader(
@@ -37,6 +106,16 @@ def build_dataset_and_loader(
 ) -> tuple[ZarrDataset, DataLoader, DistributedSampler | None]:
     data_cfg = dict(cfg["data"])
     fm_cfg = dict(cfg.get("models", {}).get("fm", {}))
+    data_cfg["predict_tactile"] = bool(fm_cfg.get("predict_tactile", False))
+    data_cfg["tactile_condition_encoder_type"] = (
+        resolve_tactile_condition_encoder_type(
+            predict_tactile=data_cfg["predict_tactile"],
+            tactile_encoder_type=fm_cfg.get("tactile_encoder_type"),
+            tactile_condition_encoder_type=fm_cfg.get(
+                "tactile_condition_encoder_type"
+            ),
+        )
+    )
     data_cfg = dict(data_cfg)
     if bool(data_cfg.get("use_camera_latent", False)):
         from models.fm.encoders.dino_v2 import resolve_dino_model_name
@@ -109,6 +188,20 @@ def build_policy(cfg: dict, device: torch.device, dataset: ZarrDataset) -> FlowM
         state_dim=dataset.action_dim,
         cond_steps=dataset.window_size,
     ).to(device)
+    if policy.predict_tactile:
+        if dataset.tactile_latent_mean is None or dataset.tactile_latent_std is None:
+            raise RuntimeError(
+                "predict_tactile=true but dataset has no latent mean/std"
+            )
+        policy.set_tactile_latent_stats(
+            dataset.tactile_latent_mean,
+            dataset.tactile_latent_std,
+        )
+        if policy.tactile_autoencoder is None:
+            raise RuntimeError("predict_tactile=true but tactile codec is missing")
+        cfg["models"]["fm"]["tactile_ae_model_config"] = (
+            policy.tactile_autoencoder.config_dict()
+        )
     return policy
 
 
@@ -123,6 +216,7 @@ def train_one_epoch(
     writer: SummaryWriter | None = None,
     scaler: Optional[torch.amp.GradScaler] = None,
     use_amp: bool = False,
+    mixed_precision: str | None = None,
     max_batches: int | None = None,
     is_main: bool = True,
 ) -> tuple[dict[str, float], int]:
@@ -138,7 +232,8 @@ def train_one_epoch(
         batch = move_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
 
-        with get_autocast_context(device, use_amp):
+        amp_mode = mixed_precision if mixed_precision is not None else use_amp
+        with get_autocast_context(device, amp_mode):
             out = policy(batch)
             loss = out["loss"]
             scalar_metrics = detach_scalar_dict(out.get("metrics", {}))
@@ -169,8 +264,9 @@ def train_one_epoch(
             for key, value in scalar_metrics.items():
                 writer.add_scalar(f"Step/{key}", value, global_step)
 
-        postfix = {"loss": f"{loss.detach().item():.4f}", "lr": f"{step_lr:.2e}"}
-        pbar.set_postfix(postfix)
+        if is_main:
+            postfix = {"loss": f"{loss.detach().item():.4f}", "lr": f"{step_lr:.2e}"}
+            pbar.set_postfix(postfix)
 
     avg = {key: value / max(count, 1) for key, value in metric_sum.items()}
     return avg, global_step
@@ -309,8 +405,20 @@ def main(cfg: dict) -> None:
         max_train_batches = max(1, int(max_train_batches))
     plot_samples = int(train_cfg.get("plot_samples", 4))
     plot_dims = str(train_cfg.get("plot_dims", "auto"))
-    use_amp = bool(train_cfg.get("use_amp", False) and device.type == "cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    mixed_precision = resolve_mixed_precision(train_cfg, device)
+    scaler = build_grad_scaler(mixed_precision)
+
+    per_gpu_bs = int(train_cfg.get("batch_size", 32))
+    world_size = int(dist_info.world_size) if dist_info.enabled else 1
+    mode = "ddp" if dist_info.enabled else "single-gpu"
+    print(
+        f"[train] mode={mode} epochs={epochs} "
+        f"open_loop_every={open_loop_every}(epoch) save_every={save_every}(epoch) "
+        f"batch_size={per_gpu_bs}/gpu nproc={world_size} "
+        f"global_batch={per_gpu_bs * world_size} "
+        f"mixed_precision={mixed_precision} "
+        f"| TB: Step/*=global_step, Epoch/* & OpenLoop/*=epoch"
+    )
 
     fm_cfg = cfg["models"]["fm"]
     num_inference_steps = int(fm_cfg.get("num_inference_steps", 16))
@@ -327,8 +435,8 @@ def main(cfg: dict) -> None:
             grad_clip=grad_clip,
             global_step=global_step,
             writer=writer,
-            scaler=scaler if use_amp else None,
-            use_amp=use_amp,
+            scaler=scaler,
+            mixed_precision=mixed_precision,
             max_batches=max_train_batches,
             is_main=main_proc,
         )

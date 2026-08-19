@@ -7,32 +7,49 @@ from .action import rot6d_to_matrix
 
 def matrix_to_rot6d(rot_mat: np.ndarray) -> np.ndarray:
     rot_mat = np.asarray(rot_mat, dtype=np.float32)
-    if rot_mat.ndim == 2:
+    single = rot_mat.ndim == 2
+    if single:
         rot_mat = rot_mat[None, ...]
-    return np.concatenate([rot_mat[:, :, 0], rot_mat[:, :, 1]], axis=-1)
+    if rot_mat.shape[-2:] != (3, 3):
+        raise ValueError(f"rotation matrix must end with (3, 3), got {rot_mat.shape}")
+    return np.concatenate([rot_mat[..., :, 0], rot_mat[..., :, 1]], axis=-1)
 
 
 def _transform_arm_eef_absolute_to_relative(actions: np.ndarray, base: np.ndarray) -> np.ndarray:
-    """Per-arm layout: xyz(3) + rot6d(6) + gripper(1)."""
+    """Vectorized per-arm transform for (T,10) or (B,T,10) actions."""
     actions = np.asarray(actions, dtype=np.float32).copy()
     base = np.asarray(base, dtype=np.float32)
+    squeeze_batch = actions.ndim == 2
+    if squeeze_batch:
+        actions = actions[None, ...]
+    if actions.ndim != 3 or actions.shape[-1] != 10:
+        raise ValueError(f"arm EEF actions must be (T,10) or (B,T,10), got {actions.shape}")
+    if base.ndim == 1:
+        base = base[None, ...]
+    if base.ndim != 2 or base.shape != (actions.shape[0], 10):
+        raise ValueError(
+            f"arm EEF base must be (10,) or (B,10), got {base.shape} for actions {actions.shape}"
+        )
 
-    base_rot = rot6d_to_matrix(base[3:9][None])[0]
-    base_mat = np.eye(4, dtype=np.float64)
-    base_mat[:3, :3] = base_rot
-    base_mat[:3, 3] = base[:3]
-    inv_base = np.linalg.inv(base_mat)
+    batch_size, horizon = actions.shape[:2]
+    base_mat = np.broadcast_to(
+        np.eye(4, dtype=np.float64), (batch_size, 4, 4)
+    ).copy()
+    base_mat[:, :3, :3] = rot6d_to_matrix(base[:, 3:9])
+    base_mat[:, :3, 3] = base[:, :3]
 
-    for t in range(actions.shape[0]):
-        rot = rot6d_to_matrix(actions[t, 3:9][None])[0]
-        mat = np.eye(4, dtype=np.float64)
-        mat[:3, :3] = rot
-        mat[:3, 3] = actions[t, :3]
-        rel = inv_base @ mat
-        actions[t, :3] = rel[:3, 3].astype(np.float32)
-        actions[t, 3:9] = matrix_to_rot6d(rel[:3, :3]).astype(np.float32)
-        actions[t, 9] = actions[t, 9] - base[9]
-    return actions
+    action_mat = np.broadcast_to(
+        np.eye(4, dtype=np.float64), (batch_size, horizon, 4, 4)
+    ).copy()
+    action_rot = rot6d_to_matrix(actions[..., 3:9].reshape(-1, 6))
+    action_mat[..., :3, :3] = action_rot.reshape(batch_size, horizon, 3, 3)
+    action_mat[..., :3, 3] = actions[..., :3]
+
+    relative = np.linalg.inv(base_mat)[:, None, :, :] @ action_mat
+    actions[..., :3] = relative[..., :3, 3].astype(np.float32)
+    actions[..., 3:9] = matrix_to_rot6d(relative[..., :3, :3]).astype(np.float32)
+    actions[..., 9] -= base[:, None, 9]
+    return actions[0] if squeeze_batch else actions
 
 
 def transform_eef_absolute_to_relative(actions: np.ndarray, anchor_state: np.ndarray) -> np.ndarray:
@@ -42,31 +59,50 @@ def transform_eef_absolute_to_relative(actions: np.ndarray, anchor_state: np.nda
         raise ValueError(
             f"eef relative expects dim 20, got action={actions.shape[-1]}, anchor={anchor_state.shape[-1]}"
         )
-    actions[:, :10] = _transform_arm_eef_absolute_to_relative(actions[:, :10], anchor_state[:10])
-    actions[:, 10:] = _transform_arm_eef_absolute_to_relative(actions[:, 10:], anchor_state[10:])
+    actions[..., :10] = _transform_arm_eef_absolute_to_relative(
+        actions[..., :10], anchor_state[..., :10]
+    )
+    actions[..., 10:] = _transform_arm_eef_absolute_to_relative(
+        actions[..., 10:], anchor_state[..., 10:]
+    )
     return actions
 
 
 def _transform_arm_eef_relative_to_absolute(actions: np.ndarray, base: np.ndarray) -> np.ndarray:
-    """Inverse of _transform_arm_eef_absolute_to_relative."""
+    """Vectorized inverse for (T,10) or (B,T,10) actions."""
     actions = np.asarray(actions, dtype=np.float32).copy()
     base = np.asarray(base, dtype=np.float32)
+    squeeze_batch = actions.ndim == 2
+    if squeeze_batch:
+        actions = actions[None, ...]
+    if actions.ndim != 3 or actions.shape[-1] != 10:
+        raise ValueError(f"arm EEF actions must be (T,10) or (B,T,10), got {actions.shape}")
+    if base.ndim == 1:
+        base = base[None, ...]
+    if base.ndim != 2 or base.shape != (actions.shape[0], 10):
+        raise ValueError(
+            f"arm EEF base must be (10,) or (B,10), got {base.shape} for actions {actions.shape}"
+        )
 
-    base_rot = rot6d_to_matrix(base[3:9][None])[0]
-    base_mat = np.eye(4, dtype=np.float64)
-    base_mat[:3, :3] = base_rot
-    base_mat[:3, 3] = base[:3]
+    batch_size, horizon = actions.shape[:2]
+    base_mat = np.broadcast_to(
+        np.eye(4, dtype=np.float64), (batch_size, 4, 4)
+    ).copy()
+    base_mat[:, :3, :3] = rot6d_to_matrix(base[:, 3:9])
+    base_mat[:, :3, 3] = base[:, :3]
 
-    for t in range(actions.shape[0]):
-        rel_rot = rot6d_to_matrix(actions[t, 3:9][None])[0]
-        rel_mat = np.eye(4, dtype=np.float64)
-        rel_mat[:3, :3] = rel_rot
-        rel_mat[:3, 3] = actions[t, :3]
-        abs_mat = base_mat @ rel_mat
-        actions[t, :3] = abs_mat[:3, 3].astype(np.float32)
-        actions[t, 3:9] = matrix_to_rot6d(abs_mat[:3, :3][None]).astype(np.float32)[0]
-        actions[t, 9] = actions[t, 9] + base[9]
-    return actions
+    relative_mat = np.broadcast_to(
+        np.eye(4, dtype=np.float64), (batch_size, horizon, 4, 4)
+    ).copy()
+    relative_rot = rot6d_to_matrix(actions[..., 3:9].reshape(-1, 6))
+    relative_mat[..., :3, :3] = relative_rot.reshape(batch_size, horizon, 3, 3)
+    relative_mat[..., :3, 3] = actions[..., :3]
+
+    absolute = base_mat[:, None, :, :] @ relative_mat
+    actions[..., :3] = absolute[..., :3, 3].astype(np.float32)
+    actions[..., 3:9] = matrix_to_rot6d(absolute[..., :3, :3]).astype(np.float32)
+    actions[..., 9] += base[:, None, 9]
+    return actions[0] if squeeze_batch else actions
 
 
 def transform_eef_relative_to_absolute(actions: np.ndarray, anchor_state: np.ndarray) -> np.ndarray:
@@ -76,8 +112,12 @@ def transform_eef_relative_to_absolute(actions: np.ndarray, anchor_state: np.nda
         raise ValueError(
             f"eef absolute expects dim 20, got action={actions.shape[-1]}, anchor={anchor_state.shape[-1]}"
         )
-    actions[:, :10] = _transform_arm_eef_relative_to_absolute(actions[:, :10], anchor_state[:10])
-    actions[:, 10:] = _transform_arm_eef_relative_to_absolute(actions[:, 10:], anchor_state[10:])
+    actions[..., :10] = _transform_arm_eef_relative_to_absolute(
+        actions[..., :10], anchor_state[..., :10]
+    )
+    actions[..., 10:] = _transform_arm_eef_relative_to_absolute(
+        actions[..., 10:], anchor_state[..., 10:]
+    )
     return actions
 
 
@@ -92,9 +132,10 @@ def transform_robot_action_to_absolute(
     if action_representation == "absolute":
         return action
 
-    anchor = np.asarray(state_history[-1], dtype=np.float32)
+    state_history = np.asarray(state_history, dtype=np.float32)
+    anchor = state_history[-1] if state_history.ndim == 2 else state_history[..., -1, :]
     if action_type == "joint":
-        return action + anchor[None, :]
+        return action + anchor[..., None, :]
     if action_type == "eef":
         return transform_eef_relative_to_absolute(action, anchor)
     raise ValueError(f"unsupported action_type={action_type}")
@@ -111,9 +152,10 @@ def transform_robot_action(
     if action_representation == "absolute":
         return action
 
-    anchor = np.asarray(state_history[-1], dtype=np.float32)
+    state_history = np.asarray(state_history, dtype=np.float32)
+    anchor = state_history[-1] if state_history.ndim == 2 else state_history[..., -1, :]
     if action_type == "joint":
-        return action - anchor[None, :]
+        return action - anchor[..., None, :]
     if action_type == "eef":
         return transform_eef_absolute_to_relative(action, anchor)
     raise ValueError(f"unsupported action_type={action_type}")

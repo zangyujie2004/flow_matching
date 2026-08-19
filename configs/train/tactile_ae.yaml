@@ -1,0 +1,49 @@
+seed: 42
+predict_tactile: true
+
+runtime:
+  device: cuda
+  ddp:
+    backend: nccl
+    find_unused_parameters: false
+    timeout_s: 1800
+
+output:
+  root_dir: outputs/huanggua_office_0729_tactile_ae
+  run_name: tactile_residual_4x16
+
+data:
+  root_dir: /mnt/workspace/lyc/data/huanggua_office/huanggua_office_0729_2248
+  tactile_key: tactile
+  val_fraction: 0.1
+  frame_stride: 1
+  output_range: [-1, 1]
+  normalizer_batch_frames: 512
+
+model:
+  num_sensors: 4
+  channels_per_sensor: 3
+  token_dim: 16
+  hidden_dims: [32, 64, 128]
+  spatial_shape: [35, 20]
+  n_groups: 8
+  output_activation: tanh
+
+loss:
+  type: l1  # l1 | mse
+
+train:
+  batch_size: 256
+  num_workers: 8
+  drop_last: true
+  pin_memory: true
+  persistent_workers: true
+  epochs: 100
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  mixed_precision: bf16  # off | fp16 | bf16
+  resume_path: null
+
+checkpoint:
+  save_every: 10

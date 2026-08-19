@@ -7,70 +7,62 @@ runtime:
     timeout_s: 3600
 
 output:
-  root_dir: outputs/peel_cucumber_fm2
-  run_name: peel_cucumber
+  root_dir: outputs/huanggua_office_0729_eef_joint_tactile_history8
+  run_name: huanggua_office_unet
 
 data:
-  root_dir: /mnt/workspace/lyc/data/peel_cucumber/peel_cucumber_0819_1102
-
-  # window
+  root_dir: /mnt/workspace/lyc/data/huanggua_office/huanggua_office_0729_2248
   window_size: 8
   stride: 1
   n_image_steps: 1
   action_horizon: 128
-  # robot
-  action_type: joint
-  action_representation: absolute # relative
-  # tatile
+  action_type: eef
+  action_representation: relative
   use_tactile: true
+  # Eight raw deformation frames are the tactile observation condition.
   tactile_obs_steps: 8
-  tactile_deformation_cache_path: ${data.root_dir}/tactile_deformation_f32.npy
-  # Optional compact mmap cache. If absent, use the raw-tactile mode below.
-  tactile_deformation_cache_required: false
-  # Match zyj/policy: without deformation mmap, preload full raw tactile per rank.
-  preload_raw_tactile_to_ram: true
-  # camera
+  tactile_target_offset: 1
+  tactile_latent_cache_path: /mnt/workspace/lyc/data/huanggua_office/huanggua_office_0729_2248/tactile_latent_4x16.zarr
+  tactile_deformation_cache_path: /mnt/workspace/lyc/data/huanggua_office/huanggua_office_0729_2248/tactile_deformation_f32.npy
   mix_base_remove_hand: true
-  camera_views: ['base_0', 'left_wrist_0', 'right_wrist_0']
+  camera_views: [base_0, left_wrist_0, right_wrist_0]
   image_size: 224
   image_as_uint8: true
   use_camera_latent: true
   latent_cache_root_dir: ${data.root_dir}/latent_cache/{auto}
-  # keys
   camera_key: camera
   tactile_key: tactile
   state_key: state_30hz
   action_key: action_30hz
-  # norm
   norm:
     output_range: [-1, 1]
     max_windows: 100000
     batch_windows: 1024
-  # memory
   memory:
     enabled: false
     history_frames: 64
     sample_stride: 4
-    recent_frame: 4   # n=t-n
+    recent_frame: 4
 
 models:
   fm:
     cond_dim: 256
-    # vision — DINOv2 (timm)
     n_image_views: 3
     image_encoder_name: dinov2_small
-    dino_model_name: vit_small_patch14_dinov2.lvd142m  # vit_small_patch14_dinov2.lvd142m
+    dino_model_name: vit_small_patch14_dinov2.lvd142m
     freeze_image_encoder: true
     image_pretrained: true
     image_feat_dim: 256
-    view_pool: global_concat  # global_concat | local_pool | local_attn
+    view_pool: global_concat
     local_pool_size: 2
     local_attn_heads: 4
     local_attn_dropout: 0.1
-    # tactile: eight raw deformation frames -> legacy TemporalCNN -> 256-D
     use_tactile: true
-    # false: tactile is global_cond only; true: jointly predict action+tactile latent
-    predict_tactile: false
+    # true = Stage 2 joint qpos-action + future-tactile-latent prediction.
+    predict_tactile: true
+    tactile_ae_checkpoint: /mnt/workspace/lyc/flow_matching/outputs/huanggua_office_0729_tactile_ae/tactile_residual_4x16/checkpoints/best.pt
+    # Input conditioning is the original 8-frame TemporalCNN. The frozen AE is
+    # used only for the 64-D future tactile target/decoder.
     tactile_encoder_type: temporal_cnn
     tactile_condition_encoder_type: temporal_cnn
     tactile_feat_dim: 256
@@ -78,27 +70,25 @@ models:
     tactile_num_sensors: 4
     tactile_channels_per_sensor: 3
     tactile_token_dim: 16
+    action_loss_weight: 1.0
+    tactile_loss_weight: 1.0
     state_feat_dim: 256
-    state_pool: flatten           
+    state_pool: flatten
     diffusion_step_embed_dim: 256
-    velocity_model: unet  # unet | dit
-    # unet config
+    velocity_model: unet
     down_dims: [256, 512, 1024]
     kernel_size: 5
     n_groups: 8
-    # dit config
     dit_hidden_dim: 512
     dit_depth: 14
     dit_num_heads: 8
     dit_mlp_ratio: 4.0
     dit_dropout: 0.1
-    # common config
     num_inference_steps: 32
-    solver: euler 
+    solver: euler
   memory:
-    method: fusion # fusion | multi-scale
-    injection: concat_global_cond # cross_attn | concat_global_cond
-    # multi-scale
+    method: fusion
+    injection: concat_global_cond
     dim: 256
     num_queries: 3
     visual_heads: 4
@@ -107,13 +97,13 @@ models:
     state_heads: 4
     dropout: 0.1
     cross_attn_layers: [3, 7, 11]
-    # fusion
     visual_layers: 2
     state_channels: 128
     state_mem_dim: 64
 
 train:
-  batch_size: 128 #1024
+  # Per-GPU batch size under DDP.
+  batch_size: 256
   num_workers: 32
   drop_last: true
   pin_memory: true
@@ -122,7 +112,7 @@ train:
   epochs: 256
   grad_clip: 1.0
   use_amp: true
-  amp_dtype: bf16  # fp16 | bf16; H20/Ampere+ 推荐 bf16
+  amp_dtype: bf16
   open_loop_test_every: 10
   open_loop_test_max_batches: 16
   plot_samples: 64
@@ -135,21 +125,15 @@ train:
     weight_decay: 1.0e-4
 
 checkpoint:
-  save_every: 200
+  save_every: 20
 
 precompute:
   batch_size: 2048
-  # Parallel Zarr readers and bounded CPU batch prefetch. These are independent
-  # of train.num_workers and do not preload tactile/state/action arrays.
-  num_workers: 8
-  prefetch_batches: 8
-  # Uses all devices exposed by scripts/precompute.sh --gpus.
-  multi_gpu: true
   device: cuda
   overwrite: false
   output_path: null
-  token_mode: cls  # cls | all
+  token_mode: cls
 
 deploy:
-  action_process: abs_qpos # abs_qpos
+  action_process: abs_eef
   action_hz: 30.0

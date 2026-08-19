@@ -323,6 +323,80 @@ class FMInferenceRuntime:
         )
 
     @torch.inference_mode()
+    def predict_rot6d_abs_with_tactile(
+        self,
+        obs: Mapping[str, Any],
+        *,
+        state_raw: np.ndarray,
+        num_inference_steps: int | None = None,
+        solver: str | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Return absolute EEF/QPos actions and decoded future tactile maps."""
+        if not bool(getattr(self.policy, "predict_tactile", False)):
+            raise RuntimeError(
+                "this checkpoint has models.fm.predict_tactile=false"
+            )
+        state_raw = as_float32_array(state_raw, name="state_raw")
+        if state_raw.shape != (self.window_size, self.action_dim):
+            raise ValueError(
+                f"state_raw shape {state_raw.shape} != "
+                f"({self.window_size}, {self.action_dim})"
+            )
+        obs_torch = numpy_obs_to_torch(
+            obs,
+            self.device,
+            use_tactile=self.use_tactile,
+            normalizer=self.normalizer,
+            window_size=self.window_size,
+        )
+        if self.policy.memory_enabled:
+            memory_obs = self._get_async_memory_obs()
+            if memory_obs is None:
+                raise RuntimeError(
+                    "memory not ready: DINO buffer needs its first processed sample"
+                )
+            obs_torch.update(memory_obs)
+        result = self.policy.predict_action(
+            obs_torch,
+            num_inference_steps=(
+                self.num_inference_steps
+                if num_inference_steps is None
+                else int(num_inference_steps)
+            ),
+            solver=self.solver if solver is None else str(solver),
+            decode_tactile=True,
+        )
+        action_norm = result["action_pred_normalized"].detach().cpu().numpy()
+        tactile_norm = result["tactile_pred_normalized"].detach().cpu().numpy()
+        latent_norm = result[
+            "tactile_latent_pred_normalized"
+        ].detach().cpu().numpy()
+        if action_norm.ndim == 3:
+            action_norm = action_norm[0]
+            tactile_norm = tactile_norm[0]
+            latent_norm = latent_norm[0]
+        if self.normalizer.tactile is None:
+            raise RuntimeError("checkpoint has no tactile normalization state")
+        return {
+            "action_abs": as_float32_array(
+                self.normalizer.unnormalize_action_np(action_norm, state_raw),
+                name="action_abs",
+            ),
+            "tactile_latent_normalized": as_float32_array(
+                latent_norm,
+                name="tactile_latent_normalized",
+            ),
+            "tactile_normalized": as_float32_array(
+                tactile_norm,
+                name="tactile_normalized",
+            ),
+            "tactile": as_float32_array(
+                self.normalizer.tactile.unnormalize_np(tactile_norm),
+                name="tactile",
+            ),
+        }
+
+    @torch.inference_mode()
     def predict_rot6d_abs_batch(
         self,
         obs_list: Sequence[Mapping[str, Any]],

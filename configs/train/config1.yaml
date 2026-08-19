@@ -1,30 +1,41 @@
 seed: 42
 runtime:
   device: cuda
+  ddp:
+    backend: nccl
+    find_unused_parameters: true
+    timeout_s: 3600
 
 output:
-  root_dir: outputs/visual_test/peel
-  run_name: v2_small_local_attn_unet
+  root_dir: outputs/peel_cucumber_fm1
+  run_name: peel_cucumber
 
 data:
-  root_dir: /mnt/workspace/zyj/data/processed/peel/peel_0722_1139
+  root_dir: /mnt/workspace/lyc/data/peel_cucumber/peel_cucumber_0819_1102
+
   # window
   window_size: 8
   stride: 1
   n_image_steps: 1
-  action_horizon: 64
+  action_horizon: 128
   # robot
   action_type: joint
-  action_representation: relative
+  action_representation: absolute # relative
   # tatile
   use_tactile: false
+  tactile_obs_steps: 8
+  tactile_deformation_cache_path: ${data.root_dir}/tactile_deformation_f32.npy
+  # Optional compact mmap cache. If absent, use the raw-tactile mode below.
+  tactile_deformation_cache_required: false
+  # Match zyj/policy: without deformation mmap, preload full raw tactile per rank.
+  preload_raw_tactile_to_ram: true
   # camera
-  camera_views: ['left_wrist_0', 'right_wrist_0']
+  mix_base_remove_hand: true
+  camera_views: ['base_0', 'left_wrist_0', 'right_wrist_0']
   image_size: 224
   image_as_uint8: true
   use_camera_latent: true
-  latent_cache_root_dir: /mnt/oss_data/zyj/latent_cache/peel_0722_1139/dinov2_s14
-  camera_augmentation: false
+  latent_cache_root_dir: ${data.root_dir}/latent_cache/{auto}
   # keys
   camera_key: camera
   tactile_key: tactile
@@ -34,35 +45,41 @@ data:
   norm:
     output_range: [-1, 1]
     max_windows: 100000
+    batch_windows: 1024
   # memory
   memory:
     enabled: false
-    history_frames: 128
-    sample_stride: 8
-    recent_frame: 0
-    visual_history_length: 128
-    visual_recent_frame: 0
+    history_frames: 64
+    sample_stride: 4
+    recent_frame: 4   # n=t-n
 
 models:
   fm:
     cond_dim: 256
     # vision — DINOv2 (timm)
-    n_image_views: 2
+    n_image_views: 3
     image_encoder_name: dinov2_small
-    dino_model_name: vit_small_patch14_dinov2.lvd142m
+    dino_model_name: vit_small_patch14_dinov2.lvd142m  # vit_small_patch14_dinov2.lvd142m
     freeze_image_encoder: true
     image_pretrained: true
     image_feat_dim: 256
-    view_pool: local_attn  # global_concat | local_pool | local_attn
+    view_pool: global_concat  # global_concat | local_pool | local_attn
     local_pool_size: 2
     local_attn_heads: 4
     local_attn_dropout: 0.1
-    # tactile CNN
+    # tactile: eight raw deformation frames -> legacy TemporalCNN -> 256-D
     use_tactile: false
+    # false: tactile is global_cond only; true: jointly predict action+tactile latent
+    predict_tactile: false
+    tactile_encoder_type: temporal_cnn
+    tactile_condition_encoder_type: temporal_cnn
     tactile_feat_dim: 256
-    tactile_temporal_pool: conv1d   # mean | conv1d
+    tactile_temporal_pool: conv1d
+    tactile_num_sensors: 4
+    tactile_channels_per_sensor: 3
+    tactile_token_dim: 16
     state_feat_dim: 256
-    state_pool: flatten
+    state_pool: flatten           
     diffusion_step_embed_dim: 256
     velocity_model: unet  # unet | dit
     # unet config
@@ -77,7 +94,7 @@ models:
     dit_dropout: 0.1
     # common config
     num_inference_steps: 32
-    solver: euler
+    solver: euler 
   memory:
     method: fusion # fusion | multi-scale
     injection: concat_global_cond # cross_attn | concat_global_cond
@@ -96,7 +113,7 @@ models:
     state_mem_dim: 64
 
 train:
-  batch_size: 1024
+  batch_size: 128 #1024
   num_workers: 32
   drop_last: true
   pin_memory: true
@@ -104,8 +121,9 @@ train:
   prefetch_factor: 4
   epochs: 256
   grad_clip: 1.0
-  use_amp: false
-  open_loop_test_every: 300
+  use_amp: true
+  amp_dtype: bf16  # fp16 | bf16; H20/Ampere+ 推荐 bf16
+  open_loop_test_every: 10
   open_loop_test_max_batches: 16
   plot_samples: 64
   plot_dims: auto
@@ -120,10 +138,17 @@ checkpoint:
   save_every: 200
 
 precompute:
-  batch_size: 1024
+  batch_size: 2048
+  # Parallel Zarr readers and bounded CPU batch prefetch. These are independent
+  # of train.num_workers and do not preload tactile/state/action arrays.
+  num_workers: 8
+  prefetch_batches: 8
+  # Uses all devices exposed by scripts/precompute.sh --gpus.
+  multi_gpu: true
   device: cuda
   overwrite: false
   output_path: null
+  token_mode: cls  # cls | all
 
 deploy:
   action_process: abs_qpos # abs_qpos
