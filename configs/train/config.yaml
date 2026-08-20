@@ -7,11 +7,11 @@ runtime:
     timeout_s: 3600
 
 output:
-  root_dir: outputs/peel_cucumber_fm2
-  run_name: peel_cucumber
+  root_dir: outputs/egg_fm2
+  run_name: egg
 
 data:
-  root_dir: /mnt/workspace/lyc/data/peel_cucumber/peel_cucumber_0819_1102
+  root_dir: /mnt/workspace/lyc/data/egg/egg_0820_1136
 
   # window
   window_size: 8

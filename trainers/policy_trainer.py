@@ -316,6 +316,18 @@ def load_checkpoint(
     return state
 
 
+def resolve_ddp_find_unused_parameters(cfg: Mapping[str, Any]) -> bool:
+    """Read the shared runtime.ddp option while preserving legacy configs."""
+    train_cfg = dict(cfg.get("train") or {})
+    ddp_cfg = dict(cfg_get(cfg, "runtime.ddp", {}) or {})
+    return bool(
+        ddp_cfg.get(
+            "find_unused_parameters",
+            train_cfg.get("ddp_find_unused_parameters", False),
+        )
+    )
+
+
 def main(cfg: dict) -> None:
     dist_info = init_distributed()
     main_proc = is_main_process(dist_info)
@@ -368,7 +380,9 @@ def main(cfg: dict) -> None:
             print(f"Resumed from {resume_path} at epoch={start_epoch}, global_step={global_step}")
 
     if dist_info.enabled:
-        find_unused = bool(train_cfg.get("ddp_find_unused_parameters", False))
+        find_unused = resolve_ddp_find_unused_parameters(cfg)
+        if main_proc:
+            print(f"[ddp] find_unused_parameters={find_unused}")
         policy = DistributedDataParallel(
             policy,
             device_ids=[dist_info.local_rank],

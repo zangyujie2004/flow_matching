@@ -26,6 +26,8 @@ from tools.latent_cache import (
 from tools.normalizer import DatasetNormalizer, FieldNormalizer
 from tools.tactile_feat import TACTILE_FEATURE_DIM, extract_tactile_deformation
 
+from .image_augment import apply_photometric_augment
+
 _ACTION_TYPES = ("joint", "eef")
 _ROBOT_SLICES = {"joint": slice(0, 14), "eef": slice(14, 34)}
 _ROBOT_DIMS = {"joint": 14, "eef": 20}
@@ -98,6 +100,16 @@ def parse_cache_camera_views(cache_views: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in str(cache_views).split(",") if part.strip())
 
 
+def resolve_camera_data_config(data_cfg: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve the camera augmentation and latent-cache compatibility rules."""
+    cfg = dict(data_cfg)
+    if bool(cfg.get("camera_augmentation", False)):
+        if bool(cfg.get("use_camera_latent", False)):
+            print("[ZarrDataset] camera_augmentation=true; forcing use_camera_latent=false")
+        cfg["use_camera_latent"] = False
+    return cfg
+
+
 class ZarrDataset(Dataset):
     def __init__(
         self,
@@ -129,6 +141,7 @@ class ZarrDataset(Dataset):
         state_key: str = "state_30hz",
         action_key: str = "action_30hz",
         camera_views: Sequence[str] | None = None,
+        camera_augmentation: bool = False,
         mix_base_remove_hand: bool = False,
         memory: Mapping[str, Any] | None = None,
         norm_output_range: Tuple[float, float] = (-1.0, 1.0),
@@ -217,6 +230,7 @@ class ZarrDataset(Dataset):
         self.tactile_dim = TACTILE_FEATURE_DIM
         self.image_as_uint8 = bool(image_as_uint8)
         self.use_camera_latent = bool(use_camera_latent)
+        self.camera_augmentation = bool(camera_augmentation)
         self.mix_base_remove_hand_requested = bool(mix_base_remove_hand)
         self.mix_base_remove_hand = False
         self.ep_has_rh: np.ndarray | None = None
@@ -227,6 +241,7 @@ class ZarrDataset(Dataset):
         self.latent_cache_image_encoder_name = latent_cache_image_encoder_name
         self.latent_cache_image_model_name = latent_cache_image_model_name
         self.fit_normalizer = bool(fit_normalizer)
+        self.training = True
 
         memory_cfg = dict(memory or {})
         self.memory_enabled = bool(memory_cfg.get("enabled", False))
@@ -236,6 +251,12 @@ class ZarrDataset(Dataset):
         # Locked: pad_first only (ignore any start_mode in config).
         self.memory_start_mode = "pad_first"
         self.memory_visual_offsets = self._build_memory_visual_offsets()
+
+        if self.camera_augmentation and self.use_camera_latent:
+            raise ValueError(
+                "camera_augmentation=true is incompatible with use_camera_latent=true. "
+                "Set use_camera_latent=false or disable camera_augmentation."
+            )
 
         self.latent_cache_zarr = None
         self.latent_cache_group = None
@@ -347,7 +368,8 @@ class ZarrDataset(Dataset):
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "ZarrDataset":
         """Build dataset from policy/configs/config.yaml data section."""
-        cfg = dict(config)
+        cfg = resolve_camera_data_config(config)
+        cfg = dict(cfg)
         norm = cfg.pop("norm", None) or {}
         if "output_range" in norm:
             out = norm["output_range"]
@@ -362,6 +384,15 @@ class ZarrDataset(Dataset):
             cfg["fit_normalizer"] = bool(cfg["fit_normalizer"])
         memory = cfg.pop("memory", None)
         return cls(**cfg, memory=memory)
+
+    def set_training(self, training: bool) -> None:
+        self.training = bool(training)
+
+    def _maybe_augment_camera(self, camera: np.ndarray) -> np.ndarray:
+        if not self.camera_augmentation or not self.training:
+            return camera
+        rng = np.random.default_rng()
+        return apply_photometric_augment(camera, rng)
 
     @staticmethod
     def _resolve_action_type(value: str) -> str:
@@ -1349,6 +1380,7 @@ class ZarrDataset(Dataset):
                 raise ValueError(
                     f"image length mismatch: {camera.shape[0]} != {self.n_image_steps}"
                 )
+            camera = self._maybe_augment_camera(camera)
             image = self._process_image(camera)
             if image.shape[0] != self.n_image_steps or image.shape[1] != self.n_image_views:
                 raise ValueError(
