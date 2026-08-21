@@ -23,6 +23,7 @@ import os
 import sys
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -465,7 +466,11 @@ def select_plot_window_keys(
     return selected
 
 
-def initialize_distributed(*, dry_run: bool = False) -> DistributedContext:
+def initialize_distributed(
+    *,
+    dry_run: bool = False,
+    timeout_s: int = 10800,
+) -> DistributedContext:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -476,7 +481,11 @@ def initialize_distributed(*, dry_run: bool = False) -> DistributedContext:
     backend = "gloo" if dry_run else "nccl"
     if backend == "nccl":
         torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend=backend, init_method="env://")
+    dist.init_process_group(
+        backend=backend,
+        init_method="env://",
+        timeout=timedelta(seconds=int(timeout_s)),
+    )
     return DistributedContext(
         rank=rank,
         local_rank=local_rank,
@@ -1952,6 +1961,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-inference-steps", type=int, default=None)
     parser.add_argument("--solver", choices=("euler", "heun"), default=None)
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--ddp-timeout-s",
+        type=int,
+        default=10800,
+        help=(
+            "Distributed collective timeout. Full-episode ownership intentionally "
+            "creates uneven rank runtimes; default is 3 hours."
+        ),
+    )
     parser.add_argument("--amp", choices=("none", "bf16", "fp16"), default="bf16")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--plot-samples", type=int, default=4)
@@ -2008,10 +2026,15 @@ def main() -> None:
         raise ValueError("--plot-samples-per-episode must be positive")
     if args.full_episode_snapshot_count <= 0:
         raise ValueError("--full-episode-snapshot-count must be positive")
+    if args.ddp_timeout_s <= 0:
+        raise ValueError("--ddp-timeout-s must be positive")
     if args.contact_dz_threshold < 0:
         raise ValueError("--contact-dz-threshold must be non-negative")
 
-    context = initialize_distributed(dry_run=bool(args.dry_run))
+    context = initialize_distributed(
+        dry_run=bool(args.dry_run),
+        timeout_s=int(args.ddp_timeout_s),
+    )
     try:
         run_evaluation(args, context)
     finally:

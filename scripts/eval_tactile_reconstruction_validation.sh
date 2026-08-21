@@ -11,6 +11,7 @@ EGG_CACHE_CONFIG="configs/eval/egg_val.yaml"
 PEEL_RUN="outputs/peel_cucumber_fm3/peel_cucumber"
 EGG_RUN="outputs/egg_fm3/egg"
 OUTPUT_ROOT="outputs/tactile_reconstruction_eval"
+RUN_ID="${EVAL_RUN_ID:-full_eval_$(date +%Y%m%d_%H%M%S)}"
 TARGET="both"
 GPUS="${CUDA_VISIBLE_DEVICES:-0}"
 PYTHON_BIN="${PYTHON:-python}"
@@ -19,6 +20,7 @@ MAX_WINDOWS=-1
 FULL_EPISODE_SNAPSHOT_COUNT=8
 BASE_MODE="both"
 CONTACT_DZ_THRESHOLD=0.005
+DDP_TIMEOUT_S=10800
 SKIP_PRECOMPUTE=false
 DRY_RUN=false
 
@@ -31,11 +33,13 @@ Options:
   --target NAME                   peel | egg | both (default: both)
   --gpus IDS                     CUDA_VISIBLE_DEVICES (default: current or 0)
   --output-root PATH             Root for separate validation outputs
+  --run-id NAME                  Output subdirectory (default: full_eval_DATE_TIME)
   --sample-stride N              Window anchor stride (default: 1, full dense eval)
   --max-windows N                Random global cap; -1 means all (default: -1)
   --snapshot-count N             Tactile-field snapshots per episode (default: 8)
   --base-mode MODE               original | remove | both (default: both)
   --contact-dz-threshold VALUE   GT abs(dz) contact threshold (default: 0.005)
+  --ddp-timeout-s N              Collective timeout (default: 10800, 3 hours)
   --skip-precompute              Require an existing compatible DINO cache
   --dry-run                      Validate data/cache/windows without model inference
   -h, --help                     Show this help
@@ -57,6 +61,8 @@ while [[ $# -gt 0 ]]; do
     --gpus=*) GPUS="${1#*=}"; shift ;;
     --output-root) OUTPUT_ROOT="$2"; shift 2 ;;
     --output-root=*) OUTPUT_ROOT="${1#*=}"; shift ;;
+    --run-id) RUN_ID="$2"; shift 2 ;;
+    --run-id=*) RUN_ID="${1#*=}"; shift ;;
     --sample-stride) SAMPLE_STRIDE="$2"; shift 2 ;;
     --sample-stride=*) SAMPLE_STRIDE="${1#*=}"; shift ;;
     --max-windows) MAX_WINDOWS="$2"; shift 2 ;;
@@ -67,6 +73,8 @@ while [[ $# -gt 0 ]]; do
     --base-mode=*) BASE_MODE="${1#*=}"; shift ;;
     --contact-dz-threshold) CONTACT_DZ_THRESHOLD="$2"; shift 2 ;;
     --contact-dz-threshold=*) CONTACT_DZ_THRESHOLD="${1#*=}"; shift ;;
+    --ddp-timeout-s) DDP_TIMEOUT_S="$2"; shift 2 ;;
+    --ddp-timeout-s=*) DDP_TIMEOUT_S="${1#*=}"; shift ;;
     --skip-precompute) SKIP_PRECOMPUTE=true; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
     -h|--help|help) usage; exit 0 ;;
@@ -95,7 +103,7 @@ run_one() {
   local cache_config="$5"
   local dataset_name="$6"
   local checkpoint="$run_dir/checkpoints/epoch_0200.pt"
-  local output_dir="$OUTPUT_ROOT/$dataset_name/$label"
+  local output_dir="$OUTPUT_ROOT/$dataset_name/$label/$RUN_ID"
 
   if [[ ! -f "$data_root/meta.json" || ! -d "$data_root/replay_buffer.zarr" ]]; then
     echo "[$target] validation data is not finalized: $data_root" >&2
@@ -122,6 +130,7 @@ run_one() {
     --visualize-full-episodes
     --full-episode-snapshot-count "$FULL_EPISODE_SNAPSHOT_COUNT"
     --contact-dz-threshold "$CONTACT_DZ_THRESHOLD"
+    --ddp-timeout-s "$DDP_TIMEOUT_S"
     --seed 42
   )
   if [[ "$DRY_RUN" == true ]]; then

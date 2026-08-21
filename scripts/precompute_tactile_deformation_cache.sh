@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 PYTHON_BIN="${PYTHON:-/mnt/data/lcy/miniconda3/envs/lyc_rl/bin/python}"
-DATA_ROOT="${DATA_ROOT:-/mnt/workspace/lyc/data/peel_cucumber/peel_cucumber_0819_1102}"
+DATA_ROOT="${DATA_ROOT:-/mnt/workspace/lyc/data/plate/plate_0821_1045}"
 OUTPUT="${TACTILE_DEFORMATION_OUTPUT:-}"
 BATCH_FRAMES="${TACTILE_DEFORMATION_BATCH_FRAMES:-256}"
 OVERWRITE=0

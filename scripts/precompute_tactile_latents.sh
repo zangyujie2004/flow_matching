@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 PYTHON_BIN="${PYTHON:-/mnt/data/lcy/miniconda3/envs/lyc_rl/bin/python}"
-DATA_ROOT="${DATA_ROOT:-/mnt/workspace/lyc/data/peel_cucumber/peel_cucumber_0819_1102}"
+DATA_ROOT="${DATA_ROOT:-/mnt/workspace/lyc/data/plate/plate_0821_1045}"
 CHECKPOINT="${TACTILE_AE_CHECKPOINT:-$ROOT/outputs/huanggua_office_0729_tactile_ae/tactile_residual_4x16/checkpoints/best.pt}"
 OUTPUT="${TACTILE_LATENT_OUTPUT:-}"
 GPU="${TACTILE_CACHE_GPU:-${CUDA_VISIBLE_DEVICES:-0}}"
