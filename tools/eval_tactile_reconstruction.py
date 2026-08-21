@@ -41,17 +41,24 @@ _FLOW_MATCHING_ROOT = Path(__file__).resolve().parents[1]
 if str(_FLOW_MATCHING_ROOT) not in sys.path:
     sys.path.insert(0, str(_FLOW_MATCHING_ROOT))
 
-from infer.config import load_run_config, load_runtime_checkpoint
-from models.fm import resolve_tactile_condition_encoder_type
-from tools.latent_cache import (
+from infer.config import load_run_config, load_runtime_checkpoint  # noqa: E402
+from models.fm import resolve_tactile_condition_encoder_type  # noqa: E402
+from tools.latent_cache import (  # noqa: E402
     default_latent_cache_root_dir,
     infer_token_mode_from_attrs_and_shape,
     resolve_frame_backbone_base_remove_hand_zarr_path,
     resolve_frame_backbone_zarr_path,
     validate_latent_cache_identity,
 )
-from tools.tactile_feat import TACTILE_BUNDLE_ORDER, extract_tactile_deformation
-from utils.train_utils import cfg_get, set_seed
+from tools.tactile_feat import (  # noqa: E402
+    TACTILE_BUNDLE_ORDER,
+    extract_tactile_deformation,
+)
+from tools.tactile_resultant_metrics import (  # noqa: E402
+    PhysicalTactileMetricAccumulator,
+    compute_resultant_cosine,
+)
+from utils.train_utils import cfg_get, set_seed  # noqa: E402
 
 
 CAMERA_ORDER = ("base_0", "left_wrist_0", "right_wrist_0")
@@ -88,9 +95,12 @@ class ModeEvaluation:
     ae_raw: "ErrorAccumulator"
     ae_normalized: "ErrorAccumulator"
     latent_error: "ScalarErrorAccumulator"
+    stage2_physical_metrics: PhysicalTactileMetricAccumulator
+    ae_physical_metrics: PhysicalTactileMetricAccumulator
     per_episode: dict[int, dict[str, Any]]
     num_windows: int
     num_plots: int
+    num_full_episode_plots: int
 
 
 class ErrorAccumulator:
@@ -429,6 +439,32 @@ def limit_windows(
     return [windows[int(index)] for index in indices]
 
 
+def select_plot_window_keys(
+    windows: Sequence[EvalWindow],
+    *,
+    episode_ids: Sequence[int],
+    samples_per_episode: int,
+) -> set[tuple[int, int]]:
+    """Select deterministic, evenly spaced windows for fixed episodes."""
+    if int(samples_per_episode) <= 0:
+        raise ValueError("--plot-samples-per-episode must be positive")
+    selected: set[tuple[int, int]] = set()
+    for episode in episode_ids:
+        candidates = [window for window in windows if window.episode == int(episode)]
+        if not candidates:
+            raise ValueError(
+                f"plot episode {episode} has no selected windows; use --max-windows=-1 "
+                "or increase the cap"
+            )
+        count = min(int(samples_per_episode), len(candidates))
+        indices = np.linspace(0, len(candidates) - 1, num=count, dtype=np.int64)
+        selected.update(
+            (candidates[int(index)].episode, candidates[int(index)].anchor)
+            for index in indices
+        )
+    return selected
+
+
 def initialize_distributed(*, dry_run: bool = False) -> DistributedContext:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
@@ -452,12 +488,20 @@ def initialize_distributed(*, dry_run: bool = False) -> DistributedContext:
 def shard_windows(
     windows: Sequence[EvalWindow], context: DistributedContext
 ) -> list[EvalWindow]:
-    """Deterministic non-overlapping rank partition after global sampling."""
-    return list(windows[context.rank :: context.world_size])
+    """Assign complete episodes to ranks for collision-free episode outputs."""
+    return [
+        window
+        for window in windows
+        if int(window.episode) % int(context.world_size) == int(context.rank)
+    ]
 
 
 def _all_reduce_accumulator(
-    accumulator: ErrorAccumulator | ScalarErrorAccumulator,
+    accumulator: (
+        ErrorAccumulator
+        | ScalarErrorAccumulator
+        | PhysicalTactileMetricAccumulator
+    ),
     *,
     context: DistributedContext,
     device: torch.device,
@@ -479,6 +523,12 @@ def _serialize_per_episode(
             "num_windows": int(record["num_windows"]),
             "stage2": record["stage2"].state_dict(),
             "oracle": record["oracle"].state_dict(),
+            "stage2_physical_metrics": record[
+                "stage2_physical_metrics"
+            ].state_dict(),
+            "oracle_physical_metrics": record[
+                "oracle_physical_metrics"
+            ].state_dict(),
         }
         for episode, record in per_episode.items()
     }
@@ -495,6 +545,12 @@ def _gather_per_episode(
                 "num_windows": int(record["num_windows"]),
                 "stage2": record["stage2"],
                 "oracle": record["oracle"],
+                "stage2_physical_metrics": record[
+                    "stage2_physical_metrics"
+                ],
+                "oracle_physical_metrics": record[
+                    "oracle_physical_metrics"
+                ],
             }
             for episode, record in per_episode.items()
         }
@@ -511,21 +567,34 @@ def _gather_per_episode(
         if rank_payload is None:
             continue
         for episode, record in rank_payload.items():
-            target = merged.setdefault(
-                int(episode),
-                {
-                    "num_windows": 0,
-                    "stage2": ErrorAccumulator(),
-                    "oracle": ErrorAccumulator(),
-                },
-            )
-            target["num_windows"] += int(record["num_windows"])
-            target["stage2"].merge(
-                ErrorAccumulator.from_state_dict(record["stage2"])
-            )
-            target["oracle"].merge(
-                ErrorAccumulator.from_state_dict(record["oracle"])
-            )
+            episode = int(episode)
+            incoming = {
+                "num_windows": int(record["num_windows"]),
+                "stage2": ErrorAccumulator.from_state_dict(record["stage2"]),
+                "oracle": ErrorAccumulator.from_state_dict(record["oracle"]),
+                "stage2_physical_metrics": (
+                    PhysicalTactileMetricAccumulator.from_state_dict(
+                        record["stage2_physical_metrics"]
+                    )
+                ),
+                "oracle_physical_metrics": (
+                    PhysicalTactileMetricAccumulator.from_state_dict(
+                        record["oracle_physical_metrics"]
+                    )
+                ),
+            }
+            if episode not in merged:
+                merged[episode] = incoming
+                continue
+            target = merged[episode]
+            target["num_windows"] += incoming["num_windows"]
+            for key in (
+                "stage2",
+                "oracle",
+                "stage2_physical_metrics",
+                "oracle_physical_metrics",
+            ):
+                target[key].merge(incoming[key])
     return merged
 
 
@@ -753,6 +822,12 @@ class TactileEvalData:
             target_batch.append(deformation)
         return np.stack(target_batch)
 
+    def gather_episode_ground_truth(self, episode: int) -> np.ndarray:
+        start = int(self.episode_starts[int(episode)])
+        end = int(self.episode_ends[int(episode)])
+        raw = np.asarray(self.data["tactile"][start:end], dtype=np.float32)
+        return extract_tactile_deformation(raw)
+
 
 def build_tactile_condition_obs(
     policy: torch.nn.Module,
@@ -931,21 +1006,566 @@ def save_temporal_curves(
     plt.close(fig)
 
 
+def save_resultant_temporal_curves(
+    path: Path,
+    *,
+    prediction: np.ndarray,
+    target: np.ndarray,
+    title: str,
+    contact_dz_threshold: float,
+) -> None:
+    """Plot GT/predicted tangential resultant proxies for four sensors."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    metrics = compute_resultant_cosine(
+        prediction,
+        target,
+        contact_dz_threshold=contact_dz_threshold,
+    )
+    time = np.arange(target.shape[0], dtype=np.float32) / 30.0
+    fig, axes = plt.subplots(
+        4,
+        4,
+        figsize=(22, 13),
+        sharex="col",
+        constrained_layout=True,
+    )
+    for sensor, sensor_name in enumerate(TACTILE_BUNDLE_ORDER):
+        gt_force = metrics["gt_resultant"][:, sensor]
+        pred_force = metrics["pred_resultant"][:, sensor]
+        gt_norm = metrics["gt_resultant_norm"][:, sensor]
+        pred_norm = metrics["pred_resultant_norm"][:, sensor]
+        cosine = np.where(
+            metrics["valid_gt"][:, sensor],
+            metrics["cosine"][:, sensor],
+            np.nan,
+        )
+
+        axes[sensor, 0].plot(time, gt_norm, label="GT", color="tab:purple")
+        axes[sensor, 0].plot(
+            time, pred_norm, label="Pred", color="tab:purple", linestyle="--"
+        )
+        axes[sensor, 0].set_ylabel(sensor_name)
+
+        axes[sensor, 1].plot(time, gt_force[:, 0], label="GT sum dx")
+        axes[sensor, 1].plot(time, gt_force[:, 1], label="GT sum dy")
+        axes[sensor, 1].plot(
+            time, pred_force[:, 0], label="Pred sum dx", linestyle="--"
+        )
+        axes[sensor, 1].plot(
+            time, pred_force[:, 1], label="Pred sum dy", linestyle="--"
+        )
+        axes[sensor, 1].axhline(0.0, color="black", linewidth=0.5)
+
+        axes[sensor, 2].plot(time, cosine, color="tab:orange")
+        axes[sensor, 2].axhline(0.0, color="black", linewidth=0.5)
+        axes[sensor, 2].set_ylim(-1.05, 1.05)
+
+        axes[sensor, 3].plot(
+            time,
+            metrics["gt_contact_count"][:, sensor],
+            label="GT",
+            color="tab:green",
+        )
+        axes[sensor, 3].plot(
+            time,
+            metrics["pred_contact_count"][:, sensor],
+            label="Pred",
+            color="tab:green",
+            linestyle="--",
+        )
+        axes[sensor, 3].set_ylim(0, target.shape[1] * target.shape[2])
+
+        for axis in axes[sensor]:
+            axis.grid(alpha=0.2)
+
+    titles = (
+        "XY resultant magnitude proxy",
+        "Signed tangential components",
+        "Resultant cosine similarity",
+        "Contact taxel count",
+    )
+    for index, label in enumerate(titles):
+        axes[0, index].set_title(label)
+    axes[0, 0].legend(fontsize=8)
+    axes[0, 1].legend(ncol=2, fontsize=7)
+    axes[0, 3].legend(fontsize=8)
+    for axis in axes[-1]:
+        axis.set_xlabel("future time (s), first target is t+1")
+    fig.suptitle(
+        f"{title} | GT contact mask abs(dz)>{contact_dz_threshold:g}; "
+        "uncalibrated force proxy"
+    )
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
+def save_horizon_metrics(
+    output_dir: Path,
+    *,
+    stage2: Mapping[str, Any],
+    oracle: Mapping[str, Any],
+) -> tuple[Path, Path]:
+    """Write horizon CSV and a compact L1/cosine comparison figure."""
+    stage2_rows = list(stage2["per_horizon"])
+    oracle_rows = list(oracle["per_horizon"])
+    if len(stage2_rows) != len(oracle_rows):
+        raise ValueError("Stage-2 and AE horizon metric lengths differ")
+    rows = []
+    for stage2_row, oracle_row in zip(stage2_rows, oracle_rows, strict=True):
+        rows.append(
+            {
+                "horizon": int(stage2_row["horizon"]),
+                "future_time_s": (int(stage2_row["horizon"]) + 1) / 30.0,
+                "stage2_l1": stage2_row["l1"],
+                "stage2_contact_l1": stage2_row["contact_l1"],
+                "stage2_resultant_cosine": stage2_row["resultant_cosine"],
+                "stage2_valid_resultant_frames": stage2_row[
+                    "valid_resultant_frames"
+                ],
+                "ae_oracle_l1": oracle_row["l1"],
+                "ae_oracle_contact_l1": oracle_row["contact_l1"],
+                "ae_oracle_resultant_cosine": oracle_row["resultant_cosine"],
+                "ae_oracle_valid_resultant_frames": oracle_row[
+                    "valid_resultant_frames"
+                ],
+            }
+        )
+
+    csv_path = output_dir / "per_horizon.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    time = np.asarray([row["future_time_s"] for row in rows], dtype=np.float64)
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True, constrained_layout=True)
+    def values(key: str) -> np.ndarray:
+        return np.asarray(
+            [np.nan if row[key] is None else row[key] for row in rows],
+            dtype=np.float64,
+        )
+
+    axes[0].plot(time, values("stage2_l1"), label="Stage-2 all L1")
+    axes[0].plot(
+        time,
+        values("stage2_contact_l1"),
+        label="Stage-2 contact L1",
+    )
+    axes[0].plot(
+        time,
+        values("ae_oracle_l1"),
+        label="AE oracle all L1",
+        linestyle="--",
+    )
+    axes[0].set_ylabel("physical deformation L1")
+    axes[0].legend()
+    axes[0].grid(alpha=0.25)
+    axes[1].plot(
+        time,
+        values("stage2_resultant_cosine"),
+        label="Stage-2",
+    )
+    axes[1].plot(
+        time,
+        values("ae_oracle_resultant_cosine"),
+        label="AE oracle",
+        linestyle="--",
+    )
+    axes[1].set_ylim(-1.05, 1.05)
+    axes[1].set_ylabel("XY resultant cosine")
+    axes[1].set_xlabel("future time (s)")
+    axes[1].legend()
+    axes[1].grid(alpha=0.25)
+    plot_path = output_dir / "per_horizon.png"
+    fig.savefig(plot_path, dpi=140)
+    plt.close(fig)
+    return csv_path, plot_path
+
+
+class EpisodeReconstructionAccumulator:
+    """Stitch overlapping future predictions onto one episode time axis."""
+
+    def __init__(
+        self,
+        *,
+        episode_length: int,
+        tactile_shape: Sequence[int],
+    ) -> None:
+        self.episode_length = int(episode_length)
+        shape = (self.episode_length, *(int(value) for value in tactile_shape))
+        self.prediction_sum = np.zeros(shape, dtype=np.float32)
+        self.prediction_count = np.zeros(self.episode_length, dtype=np.uint16)
+        self.nearest_prediction = np.zeros(shape, dtype=np.float32)
+        self.nearest_horizon = np.full(
+            self.episode_length,
+            np.iinfo(np.int16).max,
+            dtype=np.int16,
+        )
+
+    def update(self, prediction: np.ndarray, *, local_start: int) -> None:
+        value = np.asarray(prediction, dtype=np.float32)
+        if value.ndim != 4 or value.shape[1:] != self.prediction_sum.shape[1:]:
+            raise ValueError(
+                "episode reconstruction expects (T,H,W,C), got "
+                f"{value.shape}; expected spatial shape "
+                f"{self.prediction_sum.shape[1:]}"
+            )
+        start = int(local_start)
+        stop = start + int(value.shape[0])
+        if start < 0 or stop > self.episode_length:
+            raise ValueError(
+                f"prediction range [{start}, {stop}) outside episode length "
+                f"{self.episode_length}"
+            )
+        self.prediction_sum[start:stop] += value
+        self.prediction_count[start:stop] += 1
+
+        indices = np.arange(start, stop, dtype=np.int64)
+        horizons = np.arange(value.shape[0], dtype=np.int16)
+        replace = horizons < self.nearest_horizon[indices]
+        if np.any(replace):
+            selected = indices[replace]
+            self.nearest_prediction[selected] = value[replace]
+            self.nearest_horizon[selected] = horizons[replace]
+
+    def finalize(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        covered = self.prediction_count > 0
+        overlap_mean = np.zeros_like(self.prediction_sum)
+        overlap_mean[covered] = self.prediction_sum[covered] / self.prediction_count[
+            covered, None, None, None
+        ]
+        nearest = np.array(self.nearest_prediction, copy=True)
+        nearest_horizon = np.array(self.nearest_horizon, copy=True)
+        nearest_horizon[~covered] = -1
+        return overlap_mean, nearest, covered, nearest_horizon
+
+
+def _contact_l1_by_frame(
+    prediction: np.ndarray,
+    target: np.ndarray,
+    *,
+    contact_dz_threshold: float,
+) -> np.ndarray:
+    target_sensor = target.reshape(*target.shape[:-1], 4, 3)
+    prediction_sensor = prediction.reshape(*prediction.shape[:-1], 4, 3)
+    contact = np.abs(target_sensor[..., 2]) > float(contact_dz_threshold)
+    absolute_error = np.abs(prediction_sensor - target_sensor)
+    numerator = np.where(contact[..., None], absolute_error, 0.0).sum(
+        axis=(1, 2, 3, 4)
+    )
+    denominator = contact.sum(axis=(1, 2, 3), dtype=np.int64) * 3
+    result = np.full(len(target), np.nan, dtype=np.float64)
+    valid = denominator > 0
+    result[valid] = numerator[valid] / denominator[valid]
+    return result
+
+
+def _masked_resultant_metrics(
+    prediction: np.ndarray,
+    target: np.ndarray,
+    *,
+    covered: np.ndarray,
+    contact_dz_threshold: float,
+) -> dict[str, np.ndarray]:
+    result = compute_resultant_cosine(
+        prediction,
+        target,
+        contact_dz_threshold=contact_dz_threshold,
+    )
+    valid = result["valid_gt"] & covered[:, None]
+    result["plot_cosine"] = np.where(valid, result["cosine"], np.nan)
+    result["plot_pred_norm"] = np.where(
+        covered[:, None], result["pred_resultant_norm"], np.nan
+    )
+    result["plot_gt_norm"] = np.where(
+        covered[:, None], result["gt_resultant_norm"], np.nan
+    )
+    return result
+
+
+def save_full_episode_curves(
+    output_dir: Path,
+    *,
+    episode: int,
+    overlap_prediction: np.ndarray,
+    nearest_prediction: np.ndarray,
+    target: np.ndarray,
+    covered: np.ndarray,
+    prediction_count: np.ndarray,
+    nearest_horizon: np.ndarray,
+    contact_dz_threshold: float,
+) -> tuple[Path, Path, Path]:
+    """Save complete-episode GT/prediction curves and a frame-level CSV."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    overlap = _masked_resultant_metrics(
+        overlap_prediction,
+        target,
+        covered=covered,
+        contact_dz_threshold=contact_dz_threshold,
+    )
+    nearest = _masked_resultant_metrics(
+        nearest_prediction,
+        target,
+        covered=covered,
+        contact_dz_threshold=contact_dz_threshold,
+    )
+    time = np.arange(len(target), dtype=np.float64) / 30.0
+
+    resultant_path = output_dir / "full_episode_resultant.png"
+    fig, axes = plt.subplots(
+        4, 2, figsize=(18, 12), sharex=True, constrained_layout=True
+    )
+    for sensor, sensor_name in enumerate(TACTILE_BUNDLE_ORDER):
+        force_axis = axes[sensor, 0]
+        force_axis.plot(
+            time,
+            overlap["plot_gt_norm"][:, sensor],
+            label="GT",
+            color="black",
+            linewidth=1.0,
+        )
+        force_axis.plot(
+            time,
+            overlap["plot_pred_norm"][:, sensor],
+            label="Pred overlap mean",
+            color="tab:blue",
+            linewidth=0.9,
+        )
+        force_axis.plot(
+            time,
+            nearest["plot_pred_norm"][:, sensor],
+            label="Pred nearest horizon",
+            color="tab:orange",
+            linewidth=0.8,
+            alpha=0.8,
+        )
+        force_axis.set_ylabel(sensor_name)
+        force_axis.grid(alpha=0.2)
+
+        cosine_axis = axes[sensor, 1]
+        cosine_axis.plot(
+            time,
+            overlap["plot_cosine"][:, sensor],
+            label="Overlap mean",
+            color="tab:blue",
+            linewidth=0.9,
+        )
+        cosine_axis.plot(
+            time,
+            nearest["plot_cosine"][:, sensor],
+            label="Nearest horizon",
+            color="tab:orange",
+            linewidth=0.8,
+            alpha=0.8,
+        )
+        cosine_axis.axhline(0.0, color="black", linewidth=0.5)
+        cosine_axis.set_ylim(-1.05, 1.05)
+        cosine_axis.grid(alpha=0.2)
+    axes[0, 0].set_title("XY resultant magnitude proxy")
+    axes[0, 1].set_title("XY resultant cosine similarity")
+    axes[0, 0].legend(fontsize=8)
+    axes[0, 1].legend(fontsize=8)
+    axes[-1, 0].set_xlabel("episode time (s)")
+    axes[-1, 1].set_xlabel("episode time (s)")
+    axes[-1, 0].set_xlim(0.0, float(time[-1]))
+    fig.suptitle(
+        f"episode {episode} complete reconstruction | "
+        f"GT contact abs(dz)>{contact_dz_threshold:g}"
+    )
+    fig.savefig(resultant_path, dpi=140)
+    plt.close(fig)
+
+    overlap_l1 = np.mean(np.abs(overlap_prediction - target), axis=(1, 2, 3))
+    nearest_l1 = np.mean(np.abs(nearest_prediction - target), axis=(1, 2, 3))
+    overlap_contact_l1 = _contact_l1_by_frame(
+        overlap_prediction,
+        target,
+        contact_dz_threshold=contact_dz_threshold,
+    )
+    nearest_contact_l1 = _contact_l1_by_frame(
+        nearest_prediction,
+        target,
+        contact_dz_threshold=contact_dz_threshold,
+    )
+    for value in (
+        overlap_l1,
+        nearest_l1,
+        overlap_contact_l1,
+        nearest_contact_l1,
+    ):
+        value[~covered] = np.nan
+
+    error_path = output_dir / "full_episode_error.png"
+    fig, axes = plt.subplots(3, 1, figsize=(15, 10), sharex=True, constrained_layout=True)
+    axes[0].plot(time, overlap_l1, label="Overlap mean")
+    axes[0].plot(time, nearest_l1, label="Nearest horizon", alpha=0.8)
+    axes[0].set_ylabel("all-taxel L1")
+    axes[1].plot(time, overlap_contact_l1, label="Overlap mean")
+    axes[1].plot(time, nearest_contact_l1, label="Nearest horizon", alpha=0.8)
+    axes[1].set_ylabel("GT-contact L1")
+    axes[2].plot(time, prediction_count, label="overlap count")
+    axes[2].plot(time, nearest_horizon, label="nearest horizon")
+    axes[2].set_ylabel("coverage / horizon")
+    axes[2].set_xlabel("episode time (s)")
+    axes[2].set_xlim(0.0, float(time[-1]))
+    for axis in axes:
+        axis.grid(alpha=0.2)
+        axis.legend(fontsize=8)
+    fig.suptitle(f"episode {episode} complete reconstruction error")
+    fig.savefig(error_path, dpi=140)
+    plt.close(fig)
+
+    csv_path = output_dir / "full_episode_metrics.csv"
+    fieldnames = [
+        "frame",
+        "time_s",
+        "covered",
+        "overlap_count",
+        "nearest_horizon",
+        "overlap_l1",
+        "nearest_l1",
+        "overlap_contact_l1",
+        "nearest_contact_l1",
+    ]
+    for sensor_name in TACTILE_BUNDLE_ORDER:
+        fieldnames.extend(
+            [
+                f"{sensor_name}_gt_resultant",
+                f"{sensor_name}_overlap_resultant",
+                f"{sensor_name}_nearest_resultant",
+                f"{sensor_name}_overlap_cosine",
+                f"{sensor_name}_nearest_cosine",
+            ]
+        )
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for frame in range(len(target)):
+            row: dict[str, Any] = {
+                "frame": frame,
+                "time_s": time[frame],
+                "covered": bool(covered[frame]),
+                "overlap_count": int(prediction_count[frame]),
+                "nearest_horizon": int(nearest_horizon[frame]),
+                "overlap_l1": overlap_l1[frame],
+                "nearest_l1": nearest_l1[frame],
+                "overlap_contact_l1": overlap_contact_l1[frame],
+                "nearest_contact_l1": nearest_contact_l1[frame],
+            }
+            for sensor, sensor_name in enumerate(TACTILE_BUNDLE_ORDER):
+                row.update(
+                    {
+                        f"{sensor_name}_gt_resultant": overlap[
+                            "plot_gt_norm"
+                        ][frame, sensor],
+                        f"{sensor_name}_overlap_resultant": overlap[
+                            "plot_pred_norm"
+                        ][frame, sensor],
+                        f"{sensor_name}_nearest_resultant": nearest[
+                            "plot_pred_norm"
+                        ][frame, sensor],
+                        f"{sensor_name}_overlap_cosine": overlap[
+                            "plot_cosine"
+                        ][frame, sensor],
+                        f"{sensor_name}_nearest_cosine": nearest[
+                            "plot_cosine"
+                        ][frame, sensor],
+                    }
+                )
+            writer.writerow(row)
+    return resultant_path, error_path, csv_path
+
+
+def save_full_episode_montages(
+    output_dir: Path,
+    *,
+    prediction: np.ndarray,
+    target: np.ndarray,
+    covered: np.ndarray,
+    snapshot_count: int,
+) -> tuple[Path, Path]:
+    """Save evenly spaced GT/pred tactile-field snapshots for all sensors."""
+    valid_indices = np.flatnonzero(covered)
+    if valid_indices.size == 0:
+        raise ValueError("cannot visualize an episode without covered predictions")
+    count = min(int(snapshot_count), int(valid_indices.size))
+    positions = np.linspace(0, valid_indices.size - 1, num=count, dtype=np.int64)
+    frames = valid_indices[positions]
+
+    def render(kind: str) -> Path:
+        fig, axes = plt.subplots(
+            4,
+            count * 2,
+            figsize=(3.0 * count, 10),
+            squeeze=False,
+            constrained_layout=True,
+        )
+        for sensor, sensor_name in enumerate(TACTILE_BUNDLE_ORDER):
+            channel = slice(sensor * 3, (sensor + 1) * 3)
+            for index, frame in enumerate(frames):
+                gt_sensor = target[frame, ..., channel]
+                pred_sensor = prediction[frame, ..., channel]
+                if kind == "tangent":
+                    gt_image = np.linalg.norm(gt_sensor[..., :2], axis=-1)
+                    pred_image = np.linalg.norm(pred_sensor[..., :2], axis=-1)
+                    vmax = max(
+                        float(np.quantile(np.concatenate([gt_image.ravel(), pred_image.ravel()]), 0.995)),
+                        1e-8,
+                    )
+                    cmap, vmin = "viridis", 0.0
+                else:
+                    gt_image = gt_sensor[..., 2]
+                    pred_image = pred_sensor[..., 2]
+                    vmax = _symmetric_limit(gt_image, pred_image)
+                    cmap, vmin = "coolwarm", -vmax
+                for offset, (image, label) in enumerate(
+                    ((gt_image, "GT"), (pred_image, "Pred"))
+                ):
+                    axis = axes[sensor, index * 2 + offset]
+                    axis.imshow(image, cmap=cmap, vmin=vmin, vmax=vmax)
+                    axis.set_xticks([])
+                    axis.set_yticks([])
+                    if sensor == 0:
+                        axis.set_title(f"{label}\nt={frame / 30.0:.1f}s", fontsize=8)
+                    if index == 0 and offset == 0:
+                        axis.set_ylabel(sensor_name, fontsize=8)
+        path = output_dir / f"full_episode_{kind}_montage.png"
+        fig.savefig(path, dpi=130)
+        plt.close(fig)
+        return path
+
+    return render("tangent"), render("dz")
+
+
 def _metric_row(
     episode: int,
     num_windows: int,
     stage2: ErrorAccumulator,
     oracle: ErrorAccumulator,
+    stage2_physical_metrics: PhysicalTactileMetricAccumulator,
+    oracle_physical_metrics: PhysicalTactileMetricAccumulator,
 ) -> dict[str, Any]:
     stage2_summary = stage2.summary()
     oracle_summary = oracle.summary()
+    stage2_resultant = stage2_physical_metrics.summary()
+    oracle_resultant = oracle_physical_metrics.summary()
     return {
         "episode": int(episode),
         "num_windows": int(num_windows),
         "stage2_mse": stage2_summary["mse"],
         "stage2_mae": stage2_summary["mae"],
+        "stage2_contact_l1": stage2_resultant["contact_l1"],
+        "stage2_resultant_cosine": stage2_resultant["resultant_cosine"],
+        "stage2_valid_resultant_frames": stage2_resultant[
+            "valid_resultant_frames"
+        ],
         "ae_oracle_mse": oracle_summary["mse"],
         "ae_oracle_mae": oracle_summary["mae"],
+        "ae_oracle_contact_l1": oracle_resultant["contact_l1"],
+        "ae_oracle_resultant_cosine": oracle_resultant["resultant_cosine"],
+        "ae_oracle_valid_resultant_frames": oracle_resultant[
+            "valid_resultant_frames"
+        ],
     }
 
 
@@ -965,8 +1585,12 @@ def evaluate_mode(
     seed: int,
     output_dir: Path,
     plot_samples: int,
+    plot_window_keys: set[tuple[int, int]] | None,
     plot_horizons: Sequence[int],
     save_arrays: bool,
+    contact_dz_threshold: float,
+    visualize_full_episodes: bool,
+    full_episode_snapshot_count: int,
     context: DistributedContext,
 ) -> ModeEvaluation:
     # The same rank seed is reused for original/remove so paired modes receive
@@ -977,8 +1601,31 @@ def evaluate_mode(
     ae_raw = ErrorAccumulator()
     ae_normalized = ErrorAccumulator()
     latent_error = ScalarErrorAccumulator()
+    stage2_physical_metrics = PhysicalTactileMetricAccumulator(
+        num_horizons=source.action_horizon,
+        contact_dz_threshold=contact_dz_threshold,
+    )
+    ae_physical_metrics = PhysicalTactileMetricAccumulator(
+        num_horizons=source.action_horizon,
+        contact_dz_threshold=contact_dz_threshold,
+    )
     per_episode: dict[int, dict[str, Any]] = {}
     plotted = 0
+    episode_reconstructions: dict[int, EpisodeReconstructionAccumulator] = {}
+    if visualize_full_episodes:
+        tactile_shape = (
+            int(source.data["tactile"].shape[1]),
+            int(source.data["tactile"].shape[2]),
+            len(TACTILE_BUNDLE_ORDER) * CHANNELS_PER_SENSOR,
+        )
+        for episode in sorted({int(window.episode) for window in windows}):
+            episode_length = int(
+                source.episode_ends[episode] - source.episode_starts[episode]
+            )
+            episode_reconstructions[episode] = EpisodeReconstructionAccumulator(
+                episode_length=episode_length,
+                tactile_shape=tactile_shape,
+            )
 
     pbar = tqdm(
         range(0, len(windows), int(batch_size)),
@@ -1044,14 +1691,36 @@ def evaluate_mode(
         ae_raw.update(oracle_np, target_raw)
         ae_normalized.update(oracle_normalized_np, target_normalized)
         latent_error.update(predicted_latent_np, target_latent_np)
+        stage2_physical_metrics.update(prediction_np, target_raw)
+        ae_physical_metrics.update(oracle_np, target_raw)
 
         for item_index, window in enumerate(batch_windows):
+            reconstruction = episode_reconstructions.get(int(window.episode))
+            if reconstruction is not None:
+                target_global_start = (
+                    int(window.anchor) + int(source.tactile_target_offset)
+                )
+                reconstruction.update(
+                    prediction_np[item_index],
+                    local_start=(
+                        target_global_start
+                        - int(source.episode_starts[int(window.episode)])
+                    ),
+                )
             record = per_episode.setdefault(
                 int(window.episode),
                 {
                     "num_windows": 0,
                     "stage2": ErrorAccumulator(),
                     "oracle": ErrorAccumulator(),
+                    "stage2_physical_metrics": PhysicalTactileMetricAccumulator(
+                        num_horizons=source.action_horizon,
+                        contact_dz_threshold=contact_dz_threshold,
+                    ),
+                    "oracle_physical_metrics": PhysicalTactileMetricAccumulator(
+                        num_horizons=source.action_horizon,
+                        contact_dz_threshold=contact_dz_threshold,
+                    ),
                 },
             )
             record["num_windows"] += 1
@@ -1063,8 +1732,22 @@ def evaluate_mode(
                 oracle_np[item_index : item_index + 1],
                 target_raw[item_index : item_index + 1],
             )
+            record["stage2_physical_metrics"].update(
+                prediction_np[item_index : item_index + 1],
+                target_raw[item_index : item_index + 1],
+            )
+            record["oracle_physical_metrics"].update(
+                oracle_np[item_index : item_index + 1],
+                target_raw[item_index : item_index + 1],
+            )
 
-            if context.is_main and plotted < int(plot_samples):
+            window_key = (int(window.episode), int(window.anchor))
+            should_plot = (
+                window_key in plot_window_keys
+                if plot_window_keys is not None
+                else context.is_main and plotted < int(plot_samples)
+            )
+            if should_plot:
                 sample_name = (
                     f"ep{window.episode:04d}_anchor{window.anchor:07d}_{mode}"
                 )
@@ -1083,6 +1766,13 @@ def evaluate_mode(
                     target=target_raw[item_index],
                     title=sample_name,
                 )
+                save_resultant_temporal_curves(
+                    sample_dir / "stage2_resultant_curves.png",
+                    prediction=prediction_np[item_index],
+                    target=target_raw[item_index],
+                    title=sample_name,
+                    contact_dz_threshold=contact_dz_threshold,
+                )
                 if save_arrays:
                     np.savez_compressed(
                         sample_dir / "reconstruction.npz",
@@ -1100,15 +1790,45 @@ def evaluate_mode(
         current = stage2_raw.summary()
         pbar.set_postfix(mae=f"{current['mae']:.6g}")
 
+    full_episode_plots = 0
+    for episode, reconstruction in sorted(episode_reconstructions.items()):
+        overlap_prediction, nearest_prediction, covered, nearest_horizon = (
+            reconstruction.finalize()
+        )
+        target = source.gather_episode_ground_truth(episode)
+        episode_dir = output_dir / "episodes" / f"episode_{episode:04d}"
+        save_full_episode_curves(
+            episode_dir,
+            episode=episode,
+            overlap_prediction=overlap_prediction,
+            nearest_prediction=nearest_prediction,
+            target=target,
+            covered=covered,
+            prediction_count=reconstruction.prediction_count,
+            nearest_horizon=nearest_horizon,
+            contact_dz_threshold=contact_dz_threshold,
+        )
+        save_full_episode_montages(
+            episode_dir,
+            prediction=nearest_prediction,
+            target=target,
+            covered=covered,
+            snapshot_count=full_episode_snapshot_count,
+        )
+        full_episode_plots += 1
+
     return ModeEvaluation(
         stage2_raw=stage2_raw,
         stage2_normalized=stage2_normalized,
         ae_raw=ae_raw,
         ae_normalized=ae_normalized,
         latent_error=latent_error,
+        stage2_physical_metrics=stage2_physical_metrics,
+        ae_physical_metrics=ae_physical_metrics,
         per_episode=per_episode,
         num_windows=len(windows),
         num_plots=int(plotted),
+        num_full_episode_plots=int(full_episode_plots),
     )
 
 
@@ -1126,6 +1846,8 @@ def reduce_and_summarize_mode(
         evaluation.ae_raw,
         evaluation.ae_normalized,
         evaluation.latent_error,
+        evaluation.stage2_physical_metrics,
+        evaluation.ae_physical_metrics,
     ):
         _all_reduce_accumulator(
             accumulator,
@@ -1138,13 +1860,17 @@ def reduce_and_summarize_mode(
         context=context,
     )
     count_tensor = torch.tensor(
-        [evaluation.num_windows, evaluation.num_plots],
+        [
+            evaluation.num_windows,
+            evaluation.num_plots,
+            evaluation.num_full_episode_plots,
+        ],
         dtype=torch.int64,
         device=device,
     )
     if context.enabled:
         dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
-    total_windows, total_plots = (
+    total_windows, total_plots, total_full_episode_plots = (
         int(value) for value in count_tensor.cpu().tolist()
     )
     if not context.is_main:
@@ -1156,6 +1882,8 @@ def reduce_and_summarize_mode(
             int(record["num_windows"]),
             record["stage2"],
             record["oracle"],
+            record["stage2_physical_metrics"],
+            record["oracle_physical_metrics"],
         )
         for episode, record in sorted(merged_per_episode.items())
     ]
@@ -1167,6 +1895,14 @@ def reduce_and_summarize_mode(
         writer.writeheader()
         writer.writerows(rows)
 
+    stage2_resultant = evaluation.stage2_physical_metrics.summary()
+    oracle_resultant = evaluation.ae_physical_metrics.summary()
+    horizon_csv, horizon_plot = save_horizon_metrics(
+        output_dir,
+        stage2=stage2_resultant,
+        oracle=oracle_resultant,
+    )
+
     return {
         "base_mode": mode,
         "num_windows": total_windows,
@@ -1176,8 +1912,13 @@ def reduce_and_summarize_mode(
         "stage2_latent_normalized": evaluation.latent_error.summary(),
         "ae_oracle_physical": evaluation.ae_raw.summary(),
         "ae_oracle_normalized": evaluation.ae_normalized.summary(),
+        "stage2_contact_and_resultant": stage2_resultant,
+        "ae_oracle_contact_and_resultant": oracle_resultant,
         "per_episode_csv": str(csv_path),
+        "per_horizon_csv": str(horizon_csv),
+        "per_horizon_plot": str(horizon_plot),
         "num_visualized_samples": total_plots,
+        "num_visualized_full_episodes": total_full_episode_plots,
     }
 
 
@@ -1214,7 +1955,35 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--amp", choices=("none", "bf16", "fp16"), default="bf16")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--plot-samples", type=int, default=4)
+    parser.add_argument(
+        "--plot-episode-ids",
+        default="",
+        help=(
+            "Comma-separated processed episode IDs to visualize deterministically. "
+            "When set, overrides --plot-samples."
+        ),
+    )
+    parser.add_argument("--plot-samples-per-episode", type=int, default=1)
     parser.add_argument("--plot-horizons", default="0,7,31,63,127")
+    parser.add_argument(
+        "--visualize-full-episodes",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Stitch overlapping predictions onto the complete episode time axis "
+            "and visualize every selected episode."
+        ),
+    )
+    parser.add_argument("--full-episode-snapshot-count", type=int, default=8)
+    parser.add_argument(
+        "--contact-dz-threshold",
+        type=float,
+        default=0.005,
+        help=(
+            "GT abs(dz) threshold for contact-only L1 and XY resultant cosine. "
+            "The resultant is an uncalibrated force proxy."
+        ),
+    )
     parser.add_argument(
         "--save-arrays", action=argparse.BooleanOptionalAction, default=True
     )
@@ -1235,6 +2004,12 @@ def main() -> None:
         raise ValueError("batch sizes must be positive")
     if args.plot_samples < 0:
         raise ValueError("--plot-samples must be non-negative")
+    if args.plot_samples_per_episode <= 0:
+        raise ValueError("--plot-samples-per-episode must be positive")
+    if args.full_episode_snapshot_count <= 0:
+        raise ValueError("--full-episode-snapshot-count must be positive")
+    if args.contact_dz_threshold < 0:
+        raise ValueError("--contact-dz-threshold must be non-negative")
 
     context = initialize_distributed(dry_run=bool(args.dry_run))
     try:
@@ -1313,6 +2088,30 @@ def run_evaluation(
     if "remove" in modes:
         source.validate_remove_hand(range(episode_start, episode_end))
     rank_windows = shard_windows(windows, context)
+    plot_episode_ids = (
+        _parse_int_list(args.plot_episode_ids)
+        if str(args.plot_episode_ids).strip()
+        else []
+    )
+    invalid_plot_episodes = [
+        episode
+        for episode in plot_episode_ids
+        if not episode_start <= episode < episode_end
+    ]
+    if invalid_plot_episodes:
+        raise ValueError(
+            "plot episode IDs are outside the selected episode range: "
+            f"{invalid_plot_episodes} not in [{episode_start}, {episode_end})"
+        )
+    plot_window_keys = (
+        select_plot_window_keys(
+            windows,
+            episode_ids=plot_episode_ids,
+            samples_per_episode=int(args.plot_samples_per_episode),
+        )
+        if plot_episode_ids
+        else None
+    )
 
     selection = {
         "run_dir": str(run_dir),
@@ -1328,15 +2127,28 @@ def run_evaluation(
         "num_windows": len(windows),
         "distributed_world_size": context.world_size,
         "windows_per_rank": [
-            len(windows[rank :: context.world_size])
+            sum(
+                int(window.episode) % int(context.world_size) == rank
+                for window in windows
+            )
             for rank in range(context.world_size)
         ],
+        "distributed_partition": "whole episodes by episode_id modulo world_size",
         "base_modes": modes,
         "window_size": source.window_size,
         "tactile_obs_steps": source.tactile_obs_steps,
         "tactile_condition_encoder_type": source.tactile_condition_encoder_type,
         "action_horizon": source.action_horizon,
         "tactile_target_offset": source.tactile_target_offset,
+        "contact_dz_threshold": float(args.contact_dz_threshold),
+        "visualize_full_episodes": bool(args.visualize_full_episodes),
+        "full_episode_snapshot_count": int(args.full_episode_snapshot_count),
+        "plot_episode_ids": plot_episode_ids,
+        "plot_window_keys": (
+            sorted([list(key) for key in plot_window_keys])
+            if plot_window_keys is not None
+            else None
+        ),
         "subtask_path": args.subtask_path,
         "subtask_counts": subtask_counts,
     }
@@ -1412,8 +2224,12 @@ def run_evaluation(
             seed=int(args.seed),
             output_dir=mode_dir,
             plot_samples=int(args.plot_samples),
+            plot_window_keys=plot_window_keys,
             plot_horizons=plot_horizons,
             save_arrays=bool(args.save_arrays),
+            contact_dz_threshold=float(args.contact_dz_threshold),
+            visualize_full_episodes=bool(args.visualize_full_episodes),
+            full_episode_snapshot_count=int(args.full_episode_snapshot_count),
             context=context,
         )
         metrics = reduce_and_summarize_mode(
@@ -1431,7 +2247,7 @@ def run_evaluation(
         return
 
     payload = {
-        "format": "stage2_tactile_reconstruction_eval/v2",
+        "format": "stage2_tactile_reconstruction_eval/v4",
         "selection": selection,
         "checkpoint": str(checkpoint),
         "checkpoint_epoch": int(checkpoint_state.get("epoch", -1)),
@@ -1441,7 +2257,7 @@ def run_evaluation(
             "enabled": context.enabled,
             "world_size": context.world_size,
             "backend": context.backend,
-            "partition": "global_window_list[rank::world_size]",
+            "partition": "whole episodes by episode_id modulo world_size",
         },
         "amp": str(args.amp),
         "num_inference_steps": num_inference_steps,
@@ -1453,14 +2269,27 @@ def run_evaluation(
         json.dump(payload, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
     print(f"[complete] metrics={metrics_path}")
+
+    def display_metric(value: Any) -> str:
+        return "N/A" if value is None else f"{float(value):.8g}"
+
     for mode, metrics in mode_metrics.items():
         stage2 = metrics["stage2_physical"]
         oracle = metrics["ae_oracle_physical"]
+        stage2_resultant = metrics["stage2_contact_and_resultant"]
+        oracle_resultant = metrics["ae_oracle_contact_and_resultant"]
         print(
             f"[{mode}] stage2_mae={stage2['mae']:.8g} "
             f"stage2_mse={stage2['mse']:.8g} "
+            f"stage2_contact_l1={display_metric(stage2_resultant['contact_l1'])} "
+            "stage2_resultant_cosine="
+            f"{display_metric(stage2_resultant['resultant_cosine'])} "
             f"ae_oracle_mae={oracle['mae']:.8g} "
-            f"ae_oracle_mse={oracle['mse']:.8g}"
+            f"ae_oracle_mse={oracle['mse']:.8g} "
+            "ae_oracle_contact_l1="
+            f"{display_metric(oracle_resultant['contact_l1'])} "
+            "ae_oracle_resultant_cosine="
+            f"{display_metric(oracle_resultant['resultant_cosine'])}"
         )
 
 

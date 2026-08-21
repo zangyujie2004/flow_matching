@@ -7,17 +7,17 @@ runtime:
     timeout_s: 3600
 
 output:
-  root_dir: outputs/egg_fm1
-  run_name: egg
+  root_dir: outputs/plate_64_fm1
+  run_name: plate
 
 data:
-  root_dir: /mnt/workspace/lyc/data/egg/egg_0820_1136
+  root_dir: /mnt/workspace/lyc/data/plate/plate_0821_1045
 
   # window
   window_size: 8
   stride: 1
   n_image_steps: 1
-  action_horizon: 128
+  action_horizon: 64
   # robot
   action_type: joint
   action_representation: absolute # relative

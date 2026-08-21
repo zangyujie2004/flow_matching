@@ -1,0 +1,32 @@
+runtime:
+  device: cuda
+
+data:
+  root_dir: /mnt/workspace/lyc/data/egg_val/egg_val_0821_1124
+  latent_cache_root_dir: /mnt/workspace/lyc/data/egg_val/egg_val_0821_1124/latent_cache/dinov2_s14
+  camera_key: camera
+  state_key: state_30hz
+  camera_views:
+    - base_0
+    - left_wrist_0
+    - right_wrist_0
+  image_size: 224
+  image_as_uint8: true
+
+models:
+  fm:
+    image_encoder_name: dinov2_small
+    dino_model_name: vit_small_patch14_dinov2.lvd142m
+    image_feat_dim: 256
+    image_pretrained: true
+    freeze_image_encoder: true
+
+precompute:
+  batch_size: 256
+  num_workers: 8
+  prefetch_batches: 8
+  multi_gpu: true
+  device: cuda
+  overwrite: false
+  output_path: null
+  token_mode: cls
