@@ -6,10 +6,13 @@ cd "$ROOT"
 
 PEEL_DATA_ROOT="/mnt/workspace/lyc/data/peel_cucumber_val/peel_cucumber_val_0821_1058"
 EGG_DATA_ROOT="/mnt/workspace/lyc/data/egg_val/egg_val_0821_1124"
+PLATE_DATA_ROOT="/mnt/workspace/lyc/data/plate_val/plate_val_0821_1142"
 PEEL_CACHE_CONFIG="configs/eval/peel_cucumber_val.yaml"
 EGG_CACHE_CONFIG="configs/eval/egg_val.yaml"
+PLATE_CACHE_CONFIG="configs/eval/plate_val.yaml"
 PEEL_RUN="outputs/peel_cucumber_fm3/peel_cucumber"
 EGG_RUN="outputs/egg_fm3/egg"
+PLATE_RUN="outputs/plate_64_fm3/plate"
 OUTPUT_ROOT="outputs/tactile_reconstruction_eval"
 RUN_ID="${EVAL_RUN_ID:-full_eval_$(date +%Y%m%d_%H%M%S)}"
 TARGET="both"
@@ -30,7 +33,7 @@ Usage:
   ./scripts/eval_tactile_reconstruction_validation.sh [options]
 
 Options:
-  --target NAME                   peel | egg | both (default: both)
+  --target NAME                   peel | egg | plate | both | all (default: both)
   --gpus IDS                     CUDA_VISIBLE_DEVICES (default: current or 0)
   --output-root PATH             Root for separate validation outputs
   --run-id NAME                  Output subdirectory (default: full_eval_DATE_TIME)
@@ -47,8 +50,11 @@ Options:
 Each checkpoint is evaluated only on its matching validation dataset:
   peel_cucumber_fm3 -> peel_cucumber_val_0821_1058
   egg_fm3           -> egg_val_0821_1124
+  plate_64_fm3      -> plate_val_0821_1142
 
-The two metric sets are intentionally kept separate because scores from different
+"both" keeps its original meaning (peel + egg); use "all" for all three tasks.
+
+The metric sets are intentionally kept separate because scores from different
 validation distributions are not a direct model ranking.
 EOF
 }
@@ -83,8 +89,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$TARGET" in
-  peel|egg|both) ;;
-  *) echo "--target must be peel, egg, or both; got: $TARGET" >&2; exit 1 ;;
+  peel|egg|plate|both|all) ;;
+  *) echo "--target must be peel, egg, plate, both, or all; got: $TARGET" >&2; exit 1 ;;
 esac
 
 export CUDA_VISIBLE_DEVICES="$GPUS"
@@ -145,7 +151,7 @@ run_one() {
     "${eval_args[@]}"
 }
 
-if [[ "$TARGET" == peel || "$TARGET" == both ]]; then
+if [[ "$TARGET" == peel || "$TARGET" == both || "$TARGET" == all ]]; then
   run_one \
     peel \
     peel_cucumber_fm3 \
@@ -155,7 +161,7 @@ if [[ "$TARGET" == peel || "$TARGET" == both ]]; then
     peel_cucumber_val_0821_1058
 fi
 
-if [[ "$TARGET" == egg || "$TARGET" == both ]]; then
+if [[ "$TARGET" == egg || "$TARGET" == both || "$TARGET" == all ]]; then
   run_one \
     egg \
     egg_fm3 \
@@ -163,6 +169,16 @@ if [[ "$TARGET" == egg || "$TARGET" == both ]]; then
     "$EGG_DATA_ROOT" \
     "$EGG_CACHE_CONFIG" \
     egg_val_0821_1124
+fi
+
+if [[ "$TARGET" == plate || "$TARGET" == all ]]; then
+  run_one \
+    plate \
+    plate_64_fm3 \
+    "$PLATE_RUN" \
+    "$PLATE_DATA_ROOT" \
+    "$PLATE_CACHE_CONFIG" \
+    plate_val_0821_1142
 fi
 
 echo "[complete] separate validation outputs: $OUTPUT_ROOT"
