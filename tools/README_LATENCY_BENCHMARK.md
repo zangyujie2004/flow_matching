@@ -6,6 +6,36 @@
 工具只调用仓库现有的 `FMInferenceRuntime`、DINO、MemoryEncoder 和
 FlowMatchingPolicy，不会复制模型实现或修改 checkpoint。
 
+## Prometheus 真机 rollout
+
+Prometheus 的 `rollout_fm_sync.yaml` 通过 `user.timing: true` 启用在线 timing
+trace。实际运行时会在 `${run.runtime_dir}` 中写入 `data_timing.jsonl` 和各相机的
+`camera_publish_timing_*.jsonl`，并在 rollout 清理完成后自动生成
+`runtime/latency_summary.json`。如需重新汇总已有 trace，可在 Prometheus 项目根目录执行：
+
+```bash
+python scripts/summarize_rollout_timing.py /path/to/rollout/output_dir
+```
+
+汇总文件为 `runtime/latency_summary.json`，包含输入等待与新鲜度、numpy decode、
+预处理、模型 forward、后处理、完整 policy 推理、动作调度间隔/抖动、控制请求
+往返、robot owner 处理以及同步 action chunk 执行时间的 mean、p50、p95、p99 和 max。
+
+当前 `plate_64_fm3/plate` checkpoint 的 `data.memory.enabled=false`，因此可直接运行
+`dino` 与 `policy` benchmark；`memory`、`full_pipeline` 和 `concurrent` 仅适用于
+训练配置中启用了 Memory 的 checkpoint。当前 checkpoint 的完整离线命令示例：
+
+```bash
+python -m tools.bench_policy_latency \
+    --run-dir outputs/plate_64_fm3/plate \
+    --checkpoint outputs/plate_64_fm3/plate/checkpoints/epoch_0200.pt \
+    --device cuda:0
+```
+
+若 checkpoint 同时预测触觉，`runtime_predict_with_tactile_decode_ms` 是最接近当前
+同步真机 policy 路径的离线指标，包含输入转 tensor、32-step solver、动作后处理和
+触觉解码；最终判断实时性仍应以真机 trace 的 wall p95/p99 为准。
+
 ## 两种运行模式
 
 默认是 checkpoint 模式，必须提供兼容的 Flow Matching `--run-dir`，配置、

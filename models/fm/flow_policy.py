@@ -720,6 +720,116 @@ class FlowMatchingPolicy(nn.Module):
                 trajectory = trajectory + dt * velocity
         return trajectory
 
+    def conditional_sample_rtc(
+        self,
+        obs: Dict[str, torch.Tensor],
+        *,
+        prev_actions: torch.Tensor,
+        inference_delay: int,
+        prefix_attention_horizon: int,
+        prefix_attention_schedule: str = "exp",
+        max_guidance_weight: float = 5.0,
+        num_inference_steps: int | None = None,
+        solver: str | None = None,
+    ) -> torch.Tensor:
+        """Sample actions with RTC guidance from a previously planned prefix."""
+        if self.predict_tactile:
+            raise RuntimeError("RTC inference does not support predict_tactile=true")
+        solver_name = self.solver if solver is None else str(solver).lower()
+        if solver_name != "euler":
+            raise ValueError(
+                "RTC inference currently requires solver='euler', "
+                f"got {solver_name!r}"
+            )
+        steps = (
+            self.num_inference_steps
+            if num_inference_steps is None
+            else int(num_inference_steps)
+        )
+        if steps <= 0:
+            raise ValueError("num_inference_steps must be positive")
+        if int(prefix_attention_horizon) <= 0:
+            raise ValueError("RTC prefix_attention_horizon must be positive")
+
+        with torch.no_grad():
+            global_cond, condition_tokens = self._build_condition(obs)
+        global_cond = global_cond.detach()
+        if condition_tokens is not None:
+            condition_tokens = condition_tokens.detach()
+
+        bsz = global_cond.shape[0]
+        device = global_cond.device
+        dtype = global_cond.dtype
+        prev_actions = prev_actions.to(device=device, dtype=dtype)
+        if prev_actions.ndim == 2:
+            prev_actions = prev_actions.unsqueeze(0)
+        if prev_actions.ndim != 3:
+            raise ValueError(
+                "prev_actions must be [B,T,A] or [T,A], "
+                f"got {tuple(prev_actions.shape)}"
+            )
+        if prev_actions.shape[0] == 1 and bsz > 1:
+            prev_actions = prev_actions.expand(bsz, -1, -1)
+        if prev_actions.shape[0] != bsz:
+            raise ValueError(
+                f"prev_actions batch {prev_actions.shape[0]} != "
+                f"observation batch {bsz}"
+            )
+        if prev_actions.shape[2] != self.action_dim:
+            raise ValueError(
+                f"prev_actions dim {prev_actions.shape[2]} != "
+                f"action_dim {self.action_dim}"
+            )
+
+        from infer.rtc import guided_velocity, prefix_weights
+
+        weights = prefix_weights(
+            inference_delay=int(inference_delay),
+            prefix_attention_horizon=int(prefix_attention_horizon),
+            action_horizon=self.action_horizon,
+            schedule=prefix_attention_schedule,
+            device=device,
+            dtype=dtype,
+        )
+        trajectory = torch.randn(
+            bsz,
+            self.action_horizon,
+            self.action_dim,
+            device=device,
+            dtype=dtype,
+        )
+        times = torch.linspace(
+            0.0,
+            1.0,
+            steps + 1,
+            device=device,
+            dtype=dtype,
+        )
+        for index in range(steps):
+            t0 = times[index]
+            dt = times[index + 1] - t0
+            t_value = float(t0.item())
+            t_batch = t0.expand(bsz)
+
+            def denoise(value: torch.Tensor) -> torch.Tensor:
+                return self._model_forward(
+                    value,
+                    t_batch,
+                    global_cond=global_cond,
+                    condition_tokens=condition_tokens,
+                )
+
+            velocity = guided_velocity(
+                x_t=trajectory,
+                time=t_value,
+                denoise_fn=denoise,
+                prev_actions=prev_actions,
+                weights=weights,
+                max_guidance_weight=max_guidance_weight,
+            )
+            trajectory = (trajectory + dt * velocity).detach()
+        return trajectory
+
     @torch.no_grad()
     def predict_action(
         self,
@@ -746,6 +856,33 @@ class FlowMatchingPolicy(nn.Module):
                     tactile_latent
                 )
         return result
+
+    def predict_action_rtc(
+        self,
+        obs: Dict[str, torch.Tensor],
+        *,
+        prev_actions: torch.Tensor,
+        inference_delay: int,
+        prefix_attention_horizon: int,
+        prefix_attention_schedule: str = "exp",
+        max_guidance_weight: float = 5.0,
+        num_inference_steps: int | None = None,
+        solver: str | None = None,
+    ) -> Dict[str, torch.Tensor]:
+        action_norm = self.conditional_sample_rtc(
+            obs,
+            prev_actions=prev_actions,
+            inference_delay=inference_delay,
+            prefix_attention_horizon=prefix_attention_horizon,
+            prefix_attention_schedule=prefix_attention_schedule,
+            max_guidance_weight=max_guidance_weight,
+            num_inference_steps=num_inference_steps,
+            solver=solver,
+        )
+        return {
+            "action_normalized": action_norm[:, : self.n_action_steps],
+            "action_pred_normalized": action_norm,
+        }
 
     def forward(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         return self.compute_loss(batch)

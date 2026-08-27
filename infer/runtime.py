@@ -258,6 +258,104 @@ class FMInferenceRuntime:
         pred_abs = self.normalizer.unnormalize_action_np(pred_norm, state_raw)
         return as_float32_array(pred_abs, name="pred_abs")
 
+    def predict_rot6d_abs_realtime(
+        self,
+        obs: Mapping[str, Any],
+        *,
+        state_raw: np.ndarray,
+        prev_actions_abs: np.ndarray | None,
+        inference_delay: int,
+        prefix_attention_horizon: int | None,
+        rtc_config: Mapping[str, Any],
+        num_inference_steps: int | None = None,
+        solver: str | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return absolute and normalized action chunks, optionally with RTC."""
+        state_raw = as_float32_array(state_raw, name="state_raw")
+        if state_raw.shape != (self.window_size, self.action_dim):
+            raise ValueError(
+                f"state_raw shape {state_raw.shape} != "
+                f"({self.window_size}, {self.action_dim})"
+            )
+        obs_torch = numpy_obs_to_torch(
+            obs,
+            self.device,
+            use_tactile=self.use_tactile,
+            normalizer=self.normalizer,
+            window_size=self.window_size,
+        )
+        if self.policy.memory_enabled:
+            memory_obs = self._get_async_memory_obs()
+            if memory_obs is None:
+                raise RuntimeError(
+                    "memory not ready: DINO buffer needs its first processed sample"
+                )
+            obs_torch.update(memory_obs)
+
+        steps = (
+            self.num_inference_steps
+            if num_inference_steps is None
+            else int(num_inference_steps)
+        )
+        solver_name = self.solver if solver is None else str(solver)
+        rtc = dict(rtc_config)
+
+        if prev_actions_abs is None or not bool(rtc.get("enabled", True)):
+            with torch.inference_mode():
+                result = self.policy.predict_action(
+                    obs_torch,
+                    num_inference_steps=steps,
+                    solver=solver_name,
+                )
+        else:
+            prev_abs = as_float32_array(prev_actions_abs, name="prev_actions_abs")
+            if prev_abs.ndim != 2 or prev_abs.shape[1] != self.action_dim:
+                raise ValueError(
+                    "prev_actions_abs must be "
+                    f"[T,{self.action_dim}], got {prev_abs.shape}"
+                )
+            if prev_abs.shape[0] <= 0:
+                raise ValueError("prev_actions_abs must be non-empty")
+            if prefix_attention_horizon is None:
+                raise ValueError(
+                    "prefix_attention_horizon is required for RTC inference"
+                )
+            prefix_horizon = min(
+                int(prefix_attention_horizon),
+                int(prev_abs.shape[0]),
+                self.action_horizon,
+            )
+            if prefix_horizon <= 0:
+                raise ValueError("prefix_attention_horizon must be positive")
+            if int(inference_delay) > prefix_horizon:
+                raise RuntimeError(
+                    f"estimated inference delay {inference_delay} exceeds the "
+                    f"available RTC prefix horizon {prefix_horizon}"
+                )
+            prev_norm = self.normalizer.normalize_action_np(prev_abs, state_raw)
+            prev_torch = torch.from_numpy(
+                as_float32_array(prev_norm, name="prev_actions_norm")
+            ).unsqueeze(0).to(self.device)
+            result = self.policy.predict_action_rtc(
+                obs_torch,
+                prev_actions=prev_torch,
+                inference_delay=int(inference_delay),
+                prefix_attention_horizon=prefix_horizon,
+                prefix_attention_schedule=str(
+                    rtc.get("prefix_attention_schedule", "exp")
+                ),
+                max_guidance_weight=float(rtc.get("max_guidance_weight", 5.0)),
+                num_inference_steps=steps,
+                solver=solver_name,
+            )
+
+        pred_norm = result["action_pred_normalized"].detach().cpu().numpy()
+        if pred_norm.ndim == 3:
+            pred_norm = pred_norm[0]
+        pred_norm = as_float32_array(pred_norm, name="pred_norm")
+        pred_abs = self.normalizer.unnormalize_action_np(pred_norm, state_raw)
+        return as_float32_array(pred_abs, name="pred_abs"), pred_norm
+
     @torch.inference_mode()
     def _get_async_memory_obs(
         self,

@@ -50,9 +50,28 @@ def _create_timm_backbone(model_name: str, *, pretrained: bool):
     }
     if pretrained and local_path is not None and local_path.is_file():
         create_kwargs["pretrained_cfg_overlay"] = {"file": str(local_path)}
-    elif pretrained and local_path is not None and not local_path.is_file():
-        pass
+    elif pretrained:
+        cached_path = _cached_huggingface_weights(model_name)
+        if cached_path is not None:
+            create_kwargs["pretrained_cfg_overlay"] = {"file": str(cached_path)}
     return timm.create_model(**create_kwargs)
+
+
+def _cached_huggingface_weights(model_name: str) -> Path | None:
+    """Return cached timm weights without contacting the Hugging Face Hub."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+    except ImportError:
+        return None
+
+    cached = try_to_load_from_cache(
+        repo_id=f"timm/{model_name}",
+        filename="model.safetensors",
+    )
+    if not isinstance(cached, str):
+        return None
+    path = Path(cached)
+    return path if path.is_file() else None
 
 
 class DinoV2SmallEncoder(nn.Module):

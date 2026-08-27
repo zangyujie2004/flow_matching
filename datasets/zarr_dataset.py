@@ -245,12 +245,33 @@ class ZarrDataset(Dataset):
 
         memory_cfg = dict(memory or {})
         self.memory_enabled = bool(memory_cfg.get("enabled", False))
-        self.memory_history_frames = max(1, int(memory_cfg.get("history_frames", 64)))
-        self.memory_sample_stride = max(1, int(memory_cfg.get("sample_stride", 4)))
-        self.memory_recent_frame = max(1, int(memory_cfg.get("recent_frame", 2)))
+        self.memory_history_frames = max(1, int(memory_cfg.get("history_frames", 128)))
+        self.memory_sample_stride = max(1, int(memory_cfg.get("sample_stride", 8)))
+        self.memory_recent_frame = max(0, int(memory_cfg.get("recent_frame", 0)))
+        self.memory_visual_history_length = max(
+            1,
+            int(
+                memory_cfg.get(
+                    "visual_history_length",
+                    self.memory_history_frames,
+                )
+            ),
+        )
+        self.memory_visual_recent_frame = max(
+            0,
+            int(memory_cfg.get("visual_recent_frame", self.memory_recent_frame)),
+        )
+        if self.memory_enabled and (
+            self.memory_history_frames != self.memory_visual_history_length
+            or self.memory_recent_frame != self.memory_visual_recent_frame
+        ):
+            raise ValueError(
+                "visual and state Memory must share history length and recent frame"
+            )
         # Locked: pad_first only (ignore any start_mode in config).
         self.memory_start_mode = "pad_first"
         self.memory_visual_offsets = self._build_memory_visual_offsets()
+        self.memory_state_offsets = self.memory_visual_offsets
 
         if self.camera_augmentation and self.use_camera_latent:
             raise ValueError(
@@ -1084,9 +1105,12 @@ class ZarrDataset(Dataset):
         return windows
 
     def _build_memory_visual_offsets(self) -> np.ndarray:
-        n_tokens = max(1, int(np.ceil(self.memory_history_frames / self.memory_sample_stride)))
-        start = -self.memory_recent_frame - self.memory_sample_stride * (n_tokens - 1)
-        stop = -self.memory_recent_frame + 1
+        n_tokens = max(1, int(self.memory_visual_history_length))
+        recent_frame = int(
+            getattr(self, "memory_visual_recent_frame", self.memory_recent_frame)
+        )
+        start = -recent_frame - self.memory_sample_stride * (n_tokens - 1)
+        stop = -recent_frame + 1
         return np.arange(start, stop, self.memory_sample_stride, dtype=np.int64)
 
     def _clamp_memory_indices(self, indices: np.ndarray, ep_idx: int) -> np.ndarray:
@@ -1104,18 +1128,18 @@ class ZarrDataset(Dataset):
 
     def memory_visual_valid(self, anchor_t: int, ep_idx: int) -> np.ndarray:
         raw = int(anchor_t) + self.memory_visual_offsets
+        if getattr(self, "memory_start_mode", "pad_first") == "pad_first":
+            return np.ones(raw.shape, dtype=np.bool_)
         return self._memory_index_valid(raw, ep_idx)
 
     def memory_state_indices(self, anchor_t: int, ep_idx: int) -> np.ndarray:
-        end = int(anchor_t) - self.memory_recent_frame + 1
-        start = end - self.memory_history_frames
-        raw = np.arange(start, end, dtype=np.int64)
+        raw = int(anchor_t) + self.memory_state_offsets
         return self._clamp_memory_indices(raw, ep_idx)
 
     def memory_state_valid(self, anchor_t: int, ep_idx: int) -> np.ndarray:
-        end = int(anchor_t) - self.memory_recent_frame + 1
-        start = end - self.memory_history_frames
-        raw = np.arange(start, end, dtype=np.int64)
+        raw = int(anchor_t) + self.memory_state_offsets
+        if getattr(self, "memory_start_mode", "pad_first") == "pad_first":
+            return np.ones(raw.shape, dtype=np.bool_)
         return self._memory_index_valid(raw, ep_idx)
 
     def _obs_window_indices(self, anchor_t: int, ep_idx: int) -> Tuple[int, int]:

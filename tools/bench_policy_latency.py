@@ -37,10 +37,7 @@ def main() -> None:
         if args.num_inference_steps is None
         else int(args.num_inference_steps)
     )
-    if not policy.memory_enabled:
-        raise RuntimeError("benchmark policy does not enable Memory")
-
-    obs_numpy, _state_raw = random_smoke_obs(runtime, seed=args.seed)
+    obs_numpy, state_raw = random_smoke_obs(runtime, seed=args.seed)
     if args.batch_size > 1:
         obs_numpy["image"] = np.repeat(obs_numpy["image"], args.batch_size, axis=0)
         obs_numpy["state"] = np.repeat(obs_numpy["state"][None], args.batch_size, axis=0)
@@ -57,19 +54,22 @@ def main() -> None:
     )
 
     b = args.batch_size
-    t = int(runtime.memory_visual_offsets.numel())
     v = runtime.n_image_views
     c = int(
         policy.condition_encoder.image_encoder.encoder.head[0].normalized_shape[0]
     )
-    memory_obs = {
-        "memory_image_backbone_feat": torch.randn(b, t, v, c, device=device),
-        "memory_state": torch.randn(
-            b, policy.memory_history_frames, policy.state_dim, device=device
-        ),
-        "memory_visual_offsets": runtime.memory_visual_offsets,
-    }
-    obs.update(memory_obs)
+    memory_obs = {}
+    if policy.memory_enabled:
+        offsets = runtime.memory_visual_offsets
+        t = int(offsets.numel())
+        memory_obs = {
+            "memory_image_backbone_feat": torch.randn(b, t, v, c, device=device),
+            "memory_state": torch.randn(
+                b, policy.memory_history_frames, policy.state_dim, device=device
+            ),
+            "memory_visual_offsets": offsets,
+        }
+        obs.update(memory_obs)
     cached_obs = {name: value for name, value in obs.items() if name != "image"}
     cached_obs["image_backbone_feat"] = torch.randn(
         b, 1, v, c, device=device
@@ -79,18 +79,26 @@ def main() -> None:
             raise AssertionError(f"{name} is on {tensor.device}, expected {device}")
 
     obs_cond = policy._build_obs_condition(obs)
-    memory_tokens, memory_global = policy._build_memory(obs)
-    if policy.memory_injection == "concat_global_cond":
+    memory_tokens = None
+    memory_global = None
+    if not policy.memory_enabled:
+        global_cond = obs_cond
+        condition_tokens = None
+        fusion_function = None
+    elif policy.memory_injection == "concat_global_cond":
+        memory_tokens, memory_global = policy._build_memory(obs)
         # Raw [obs_cond ; memory_global] at 2*cond_dim; no compression MLP.
         global_cond = torch.cat([obs_cond, memory_global], dim=-1)
         condition_tokens = None
         fusion_function = lambda: torch.cat([obs_cond, memory_global], dim=-1)
     else:
+        memory_tokens, memory_global = policy._build_memory(obs)
         global_cond = obs_cond
         condition_tokens = memory_tokens
         fusion_function = lambda: (obs_cond, memory_tokens)
 
-    sample = torch.randn(b, policy.action_horizon, policy.action_dim, device=device)
+    trajectory_dim = int(getattr(policy, "trajectory_dim", policy.action_dim))
+    sample = torch.randn(b, policy.action_horizon, trajectory_dim, device=device)
     timestep = torch.full((b,), 0.5, device=device)
     velocity = policy._model_forward(
         sample,
@@ -134,8 +142,9 @@ def main() -> None:
         rows.extend(samples)
 
     run("condition_encoder_ms", lambda: policy._build_obs_condition(obs))
-    run("memory_encoder_ms", lambda: policy._build_memory(obs))
-    run("condition_fusion_ms", fusion_function)
+    if policy.memory_enabled:
+        run("memory_encoder_ms", lambda: policy._build_memory(obs))
+        run("condition_fusion_ms", fusion_function)
     run(
         "single_velocity_forward_ms",
         lambda: policy._model_forward(
@@ -174,6 +183,35 @@ def main() -> None:
         ),
         iterations=full_iterations,
     )
+    if args.batch_size == 1:
+        run(
+            "runtime_predict_action_total_ms",
+            lambda: runtime.predict_rot6d_abs(
+                obs_numpy,
+                state_raw=state_raw,
+                num_inference_steps=inference_steps,
+                solver=policy.solver,
+            ),
+            iterations=full_iterations,
+        )
+        predict_with_tactile = getattr(
+            runtime,
+            "predict_rot6d_abs_with_tactile",
+            None,
+        )
+        if bool(getattr(policy, "predict_tactile", False)) and callable(
+            predict_with_tactile
+        ):
+            run(
+                "runtime_predict_with_tactile_decode_ms",
+                lambda: predict_with_tactile(
+                    obs_numpy,
+                    state_raw=state_raw,
+                    num_inference_steps=inference_steps,
+                    solver=policy.solver,
+                ),
+                iterations=full_iterations,
+            )
 
     shapes = {
         "current_image": list(obs["image"].shape),
@@ -181,17 +219,26 @@ def main() -> None:
             cached_obs["image_backbone_feat"].shape
         ),
         "current_state": list(obs["state"].shape),
-        "memory_image_backbone_feat": list(memory_obs["memory_image_backbone_feat"].shape),
-        "memory_state": list(memory_obs["memory_state"].shape),
-        "memory_visual_offsets": list(memory_obs["memory_visual_offsets"].shape),
         "obs_cond": list(obs_cond.shape),
-        "memory_tokens": list(memory_tokens.shape),
-        "memory_global": list(memory_global.shape),
         "global_cond": list(global_cond.shape),
         "single_velocity_output": list(velocity.shape),
         "action_pred_normalized": list(prediction["action_pred_normalized"].shape),
         "action_normalized": list(prediction["action_normalized"].shape),
     }
+    if policy.memory_enabled:
+        shapes.update(
+            {
+                "memory_image_backbone_feat": list(
+                    memory_obs["memory_image_backbone_feat"].shape
+                ),
+                "memory_state": list(memory_obs["memory_state"].shape),
+                "memory_visual_offsets": list(
+                    memory_obs["memory_visual_offsets"].shape
+                ),
+                "memory_tokens": list(memory_tokens.shape),
+                "memory_global": list(memory_global.shape),
+            }
+        )
     metadata = runtime_metadata(
         runtime,
         args,
@@ -202,13 +249,16 @@ def main() -> None:
     metadata.update(
         {
             "velocity_model": policy.velocity_model,
+            "memory_enabled": bool(policy.memory_enabled),
             "memory_method": policy.memory_method,
             "memory_injection": policy.memory_injection,
             "number_of_solver_steps": inference_steps,
             "solver": policy.solver,
             "number_of_action_steps": policy.n_action_steps,
             "action_horizon": policy.action_horizon,
+            "trajectory_dim": trajectory_dim,
             "solver_total_excludes_condition_build": True,
+            "runtime_predict_includes_tensor_conversion_and_postprocess": True,
             "one_forward_cached_current_DINO_scope": (
                 "cached current DINO feature + observation/state condition + Memory "
                 "+ condition fusion + one velocity-model forward; excludes DINO "

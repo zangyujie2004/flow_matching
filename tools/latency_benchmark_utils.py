@@ -327,8 +327,16 @@ def load_runtime(args: argparse.Namespace) -> tuple[FMInferenceRuntime, float, l
         warmup=False,
     )
     load_seconds = time.perf_counter() - start
+    load_cuda_memory = dict(getattr(runtime, "load_cuda_memory", {}) or {})
     for stage in ("after_model_load", "after_checkpoint_load"):
-        snapshots.append({"stage": stage, **runtime.load_cuda_memory[stage]})
+        stage_memory = load_cuda_memory.get(stage)
+        if stage_memory is None:
+            stage_memory = {
+                key: value
+                for key, value in cuda_memory(stage, device).items()
+                if key != "stage"
+            }
+        snapshots.append({"stage": stage, **stage_memory})
     if args.num_views is not None and args.num_views != runtime.n_image_views:
         raise ValueError(
             f"--num-views={args.num_views} but checkpoint/config expects "
@@ -336,6 +344,10 @@ def load_runtime(args: argparse.Namespace) -> tuple[FMInferenceRuntime, float, l
         )
     runtime.policy.eval()
     assert_model_device(runtime.policy, device)
+    if not hasattr(runtime, "load_timing_ms"):
+        runtime.load_timing_ms = {"runtime_total": load_seconds * 1000.0}
+    if not hasattr(runtime, "load_cuda_memory"):
+        runtime.load_cuda_memory = load_cuda_memory
     print(f"runtime_load_timing_ms = {runtime.load_timing_ms}")
     return runtime, load_seconds, snapshots
 
